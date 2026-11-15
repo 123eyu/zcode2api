@@ -338,6 +338,11 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 			return nil, failure
 		}
 		req.Header = a.upstreamHeaders(token, session, requestID)
+		// Keep the source header and metadata tied to the account's existing
+		// device identity, as the official 3.18.2 client does.
+		if device := str(account["device_mid"]); device != "" {
+			req.Header.Set("X-Device-Mid", device)
+		}
 		for key, values := range verification.Headers {
 			req.Header[key] = values
 		}
