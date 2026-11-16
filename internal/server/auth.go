@@ -1,15 +1,23 @@
 package server
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
+	"encoding/hex"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 	settings "zcode2api/internal/server/config"
 	"zcode2api/internal/server/fault"
 	wire "zcode2api/internal/server/protocol"
 	"zcode2api/internal/server/shared"
 )
+
+const adminSessionTTL = 24 * time.Hour
 
 func bearer(r *http.Request) string {
 	s := r.Header.Get("Authorization")
@@ -19,19 +27,44 @@ func bearer(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
 
-func (a *App) adminAuth(r *http.Request) bool {
+func adminSessionToken(r *http.Request) string {
 	token := bearer(r)
 	if token == "" {
 		token = r.URL.Query().Get("token")
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	expiry := a.sessions[token]
-	if expiry <= shared.NowMS() {
-		delete(a.sessions, token)
-		return false
+	return token
+}
+
+func (a *App) adminCredentialHash() string {
+	mac := hmac.New(sha256.New, []byte(a.secret))
+	_, _ = mac.Write([]byte(shared.Str(a.configValue("admin_password"))))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (a *App) newAdminSession(ctx context.Context) (string, int64, error) {
+	now, credentialHash := shared.NowMS(), a.adminCredentialHash()
+	if _, err := a.db.ExecContext(ctx, "DELETE FROM admin_sessions WHERE expires_at<=? OR credential_hash<>?", now, credentialHash); err != nil {
+		return "", 0, err
 	}
-	return true
+	token, expiry := shared.Random(24), now+adminSessionTTL.Milliseconds()
+	_, err := a.db.ExecContext(ctx, "INSERT INTO admin_sessions(token_hash,credential_hash,expires_at) VALUES(?,?,?)", shared.Hash(token), credentialHash, expiry)
+	if err != nil {
+		return "", 0, err
+	}
+	return token, expiry, nil
+}
+
+func (a *App) adminAuth(r *http.Request) (bool, error) {
+	token := adminSessionToken(r)
+	if token == "" {
+		return false, nil
+	}
+	var expiry int64
+	err := a.db.QueryRowContext(r.Context(), "SELECT expires_at FROM admin_sessions WHERE token_hash=? AND credential_hash=?", shared.Hash(token), a.adminCredentialHash()).Scan(&expiry)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil && expiry > shared.NowMS(), err
 }
 
 func (a *App) password(v any) bool {

@@ -66,13 +66,31 @@ const ICONS = {
 const icon = (name, size = 16) =>
   `<svg class="lucide" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ''}</svg>`;
 
-let TOKEN = sessionStorage.getItem('z2a_token') || localStorage.getItem('z2a_token') || '';
+const TOKEN_KEY = 'z2a_token';
+let TOKEN = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY) || '';
+saveToken(TOKEN);
 let RUNTIME = null;
 let currentPage = 'dashboard';
 const UI = globalThis.Z2AUI;
 let settingsDirty = false;
 let settingsSaving = false;
 let routeURL = location.hash;
+
+function saveToken(token) {
+  TOKEN = token || '';
+  if (TOKEN) localStorage.setItem(TOKEN_KEY, TOKEN);
+  else localStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(TOKEN_KEY);
+}
+
+window.addEventListener('storage', event => {
+  if (event.storageArea !== localStorage || (event.key !== TOKEN_KEY && event.key !== null)) return;
+  const token = localStorage.getItem(TOKEN_KEY) || '';
+  if (token === TOKEN) return;
+  TOKEN = token;
+  if (TOKEN) void boot();
+  else showLogin();
+});
 
 async function api(path, { token = TOKEN, body, method = 'GET', reauthenticate = true, ...options } = {}) {
   const hasBody = body !== undefined;
@@ -84,9 +102,14 @@ async function api(path, { token = TOKEN, body, method = 'GET', reauthenticate =
     },
     body: hasBody ? JSON.stringify(body) : undefined,
   });
-  if (res.status === 401 && reauthenticate) { showLogin(); throw new Error('未登录'); }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw Object.assign(new Error(data.error || data.msg || `HTTP ${res.status}`), { status: res.status });
+  if (!res.ok) {
+    if (res.status === 401 && reauthenticate && token === TOKEN && token === (localStorage.getItem(TOKEN_KEY) || '')) {
+      saveToken('');
+      showLogin();
+    }
+    throw Object.assign(new Error(data.error || data.msg || `HTTP ${res.status}`), { status: res.status });
+  }
   return data;
 }
 
@@ -136,9 +159,8 @@ $('#login-form').addEventListener('submit', async (e) => {
   const btn = $('#login-form button[type=submit]');
   btn.classList.add('loading');
   try {
-    const r = await api('/api/auth/login', { method: 'POST', body: { password: $('#login-password').value } });
-    TOKEN = r.token;
-    localStorage.setItem('z2a_token', TOKEN);
+    const r = await api('/api/auth/login', { token: '', reauthenticate: false, method: 'POST', body: { password: $('#login-password').value } });
+    saveToken(r.token);
     $('#login-error').textContent = '';
     boot();
   } catch (err) {
@@ -162,7 +184,7 @@ document.addEventListener('click', async (e) => {
   if (logout) {
     if (!await mayLeaveSettings()) return;
     try { await api('/api/auth/logout', { method: 'POST' }); } catch { }
-    TOKEN = ''; localStorage.removeItem('z2a_token'); sessionStorage.removeItem('z2a_token'); showLogin();
+    saveToken(''); showLogin();
     return;
   }
   const themeBtn = e.target.closest('#theme-btn');
@@ -1814,11 +1836,19 @@ async function pageLogs(main, options = {}) {
 }
 async function boot() {
   if (!TOKEN) return showLogin();
+  const session = TOKEN;
   try {
-    RUNTIME = await api('/api/runtime-info');
-  } catch {
-    TOKEN = ''; localStorage.removeItem('z2a_token');
-    return showLogin();
+    const runtime = await api('/api/runtime-info', { token: session });
+    if (session !== TOKEN) return;
+    RUNTIME = runtime;
+  } catch (error) {
+    if (session !== TOKEN || error.status === 401) return;
+    $('#login-view').classList.add('hidden');
+    $('#app-view').classList.remove('hidden');
+    const notice = h(`<section class="page-error" role="alert">${icon('zap', 20)}<div><h2>暂时无法连接服务</h2><p>${esc(error.message)}</p></div><button type="button" class="btn" data-retry-session>${icon('refresh', 14)}重试</button></section>`);
+    $('#main').replaceChildren(notice);
+    $('[data-retry-session]', notice).addEventListener('click', () => boot());
+    return;
   }
   $('#login-view').classList.add('hidden');
   $('#app-view').classList.remove('hidden');

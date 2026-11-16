@@ -28,6 +28,9 @@ func (a *App) AdminHandler() http.Handler {
 			files.ServeHTTP(w, r)
 			return
 		}
+		if strings.HasPrefix(r.URL.Path, "/api/auth/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		b := shared.M{}
 		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
 			var e error
@@ -44,20 +47,23 @@ func (a *App) AdminHandler() http.Handler {
 				writeJSON(w, 401, shared.M{"ok": false, "error": "密码错误"})
 				return
 			}
-			token := shared.Random(24)
-			a.mu.Lock()
-			for k, v := range a.sessions {
-				if v < shared.NowMS() {
-					delete(a.sessions, k)
-				}
+			token, expiresAt, err := a.newAdminSession(r.Context())
+			if err != nil {
+				a.log.Printf("create admin session: %v", err)
+				writeJSON(w, http.StatusServiceUnavailable, shared.M{"ok": false, "error": "暂时无法保存登录状态，请重试"})
+				return
 			}
-			a.sessions[token] = shared.NowMS() + 7*86400000
-			a.mu.Unlock()
 			a.audit("admin", "login.ok", "", a.ip(r))
-			writeJSON(w, 200, shared.M{"ok": true, "token": token})
+			writeJSON(w, 200, shared.M{"ok": true, "token": token, "expires_at": expiresAt})
 			return
 		}
-		if !a.adminAuth(r) {
+		authorized, err := a.adminAuth(r)
+		if err != nil {
+			a.log.Printf("check admin session: %v", err)
+			writeJSON(w, http.StatusServiceUnavailable, shared.M{"ok": false, "error": "暂时无法验证登录状态，请重试"})
+			return
+		}
+		if !authorized {
 			writeJSON(w, 401, shared.M{"ok": false, "error": "未登录或会话过期"})
 			return
 		}
@@ -109,10 +115,8 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 	wrap := func(v any, e error) (any, int, error) { return v, 200, e }
 	switch method + " " + p {
 	case "POST /api/auth/logout":
-		a.mu.Lock()
-		delete(a.sessions, bearer(r))
-		a.mu.Unlock()
-		return ok, 200, nil
+		_, err := a.db.ExecContext(ctx, "DELETE FROM admin_sessions WHERE token_hash=?", shared.Hash(adminSessionToken(r)))
+		return wrap(ok, err)
 	case "GET /api/runtime-info":
 		cfg := a.config("host", "app_version", "poll_interval_sec")
 		return shared.M{"web_port": a.webPort, "gateway_port": a.gatewayPort, "host": cfg["host"], "app_version": cfg["app_version"], "version": a.version, "inference_driver": "http", "backend": "go", "poll_interval_sec": cfg["poll_interval_sec"]}, 200, nil
