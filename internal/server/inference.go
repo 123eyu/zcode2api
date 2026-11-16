@@ -307,13 +307,11 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			remainingBudget -= time.Since(attemptStart)
 			continue
 		case "auth":
-			_ = a.updateAccount(id, M{"status": "needs_relogin", "fail_streak": integer(account["fail_streak"]) + 1, "last_error": "推理鉴权失效"})
-			a.mu.Lock()
-			a.state(id).Cooldown = nowMS() + 86400000
-			a.mu.Unlock()
+			if a.updateAccountStatusIfCurrent(account, nil, M{"status": "needs_relogin", "fail_streak": integer(account["fail_streak"]) + 1, "last_error": "ZCode 登录鉴权失效，请重新授权"}) {
+				a.background(func() { _, _ = a.startOAuth(a.ctx, a.accountLoginProvider(account), id, false) })
+			}
 			excluded[id] = true
 			clearThrottle(id)
-			a.background(func() { _, _ = a.startOAuth(a.ctx, str(account["family"]), id, false) })
 			continue
 		case "quota":
 			excluded[id] = true
@@ -323,7 +321,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 					if truth(b["ok"]) {
 						a.applyBalance(account, b, true)
 					} else if truth(b["authFailed"]) {
-						_ = a.updateAccount(id, M{"status": "needs_relogin"})
+						a.updateAccountStatusIfCurrent(account, b, M{"status": "needs_relogin"})
 					}
 				}
 			})

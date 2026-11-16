@@ -272,6 +272,8 @@ async function renderPage(opts = {}) {
   const refreshStartedAt = Date.now();
   const main = $('#main');
   const page = currentPage;
+  if (openSelection && main.contains(openSelection.wrapper)) openSelection.close();
+  if (activeHint && main.contains(activeHint)) closeHint();
   main.querySelector('.page-error')?.remove();
   const previous = main.dataset.page === page ? [...main.childNodes] : [];
   if (!previous.length) main.innerHTML = `${pagehead(PAGES.find(p => p[0] === page)?.[1] || '控制台', '正在加载…')}<div class="page-skeleton" aria-hidden="true"><div class="skeleton-block"></div><div class="skeleton-block"></div><div class="skeleton-block"></div></div>`;
@@ -321,18 +323,49 @@ function enhanceTables(root) {
 $('.skip-link')?.addEventListener('click', e => { e.preventDefault(); $('#main').tabIndex = -1; $('#main').focus(); });
 
 const selectControls = new WeakMap();
-let openSelect = null;
+let openSelection = null;
 let selectId = 0;
 function syncSelect(select) { selectControls.get(select)?.sync(); }
+
+// Both menus and hints stay inside the visible viewport, including short
+// windows and the on-screen keyboard. Dimensions come from the shared tokens.
+function positionFloatingPanel(panel, trigger, matchWidth = false) {
+  panel.style.width = panel.style.maxHeight = panel.style.maxWidth = '';
+  const styles = getComputedStyle(panel), rect = trigger.getBoundingClientRect();
+  const edge = parseFloat(styles.getPropertyValue('--popover-edge'));
+  const gap = parseFloat(styles.getPropertyValue('--popover-gap'));
+  const viewport = window.visualViewport;
+  const left = viewport?.offsetLeft || 0, top = viewport?.offsetTop || 0;
+  const width = viewport?.width || innerWidth, height = viewport?.height || innerHeight;
+  const availableWidth = Math.max(0, width - edge * 2);
+  const availableHeight = Math.max(0, height - edge * 2);
+  const naturalWidth = panel.getBoundingClientRect().width;
+  panel.style.maxWidth = `${availableWidth}px`;
+  panel.style.width = `${Math.min(availableWidth, matchWidth ? Math.max(rect.width, naturalWidth) : naturalWidth)}px`;
+  const preferredHeight = panel.getBoundingClientRect().height;
+  const below = Math.max(0, Math.min(availableHeight, top + height - rect.bottom - gap - edge));
+  const above = Math.max(0, Math.min(availableHeight, rect.top - top - gap - edge));
+  const up = below < preferredHeight && above > below;
+  panel.style.maxHeight = `${Math.min(preferredHeight, up ? above : below)}px`;
+  const size = panel.getBoundingClientRect();
+  panel.style.left = `${Math.max(left + edge, Math.min(rect.left, left + width - size.width - edge))}px`;
+  panel.style.top = `${Math.max(top + edge, Math.min(up ? rect.top - size.height - gap : rect.bottom + gap, top + height - size.height - edge))}px`;
+}
+
 function enhanceSelects(root) {
   root.querySelectorAll('select:not([multiple])').forEach((select) => {
-    if (selectControls.has(select)) return;
-    const label = select.getAttribute('aria-label') || select.labels?.[0]?.childNodes[0]?.textContent.trim() || select.parentElement?.querySelector('b')?.textContent.trim() || '选择选项';
+    if (selectControls.has(select)) { syncSelect(select); return; }
+    // A help button can precede the select inside an implicit label, making
+    // select.labels empty. Retain that visible label when enhancing it.
+    const labels = [...new Set([...select.labels, select.closest('label')].filter(Boolean))];
+    const labelContent = labels[0]?.cloneNode(true);
+    labelContent?.querySelectorAll('select, input, button, small, .info-tip').forEach(node => node.remove());
+    const label = select.getAttribute('aria-label') || labelContent?.textContent.trim() || '选择选项';
     const wrapper = document.createElement('span');
-    wrapper.className = `select-control${select.classList.contains('round') ? ' select-control-round' : ''}`;
+    wrapper.className = `select-control${select.classList.contains('round') ? ' control-comfortable' : ''}`;
     const trigger = document.createElement('button');
     trigger.type = 'button';
-    trigger.className = 'select-trigger';
+    trigger.className = 'select-trigger control-trigger';
     trigger.setAttribute('role', 'combobox');
     trigger.setAttribute('aria-label', label);
     trigger.setAttribute('aria-haspopup', 'listbox');
@@ -340,6 +373,10 @@ function enhanceSelects(root) {
     const list = document.createElement('div');
     list.className = 'select-list';
     list.id = `select-list-${++selectId}`;
+    trigger.id = `${list.id}-trigger`;
+    trigger.innerHTML = '<span class="select-value"></span>';
+    const value = $('.select-value', trigger);
+    labels.forEach(label => { label.htmlFor = trigger.id; });
     list.setAttribute('role', 'listbox');
     list.setAttribute('aria-label', label);
     list.hidden = true;
@@ -352,11 +389,18 @@ function enhanceSelects(root) {
     select.setAttribute('aria-hidden', 'true');
     let active = select.selectedIndex;
     let typeahead = '', typedAt = 0;
-    const enabled = () => [...select.options].map((o, i) => o.disabled ? -1 : i).filter((i) => i >= 0);
+    const isDisabled = option => option.disabled || option.parentElement.matches('optgroup:disabled');
+    const enabled = () => [...select.options].map((o, i) => isDisabled(o) ? -1 : i).filter((i) => i >= 0);
     const sync = () => {
-      trigger.disabled = select.disabled;
-      trigger.innerHTML = `<span class="select-value"></span><svg class="select-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>`;
-      $('.select-value', trigger).textContent = select.selectedOptions[0]?.textContent || '请选择';
+      trigger.disabled = select.matches(':disabled');
+      value.textContent = select.selectedOptions[0]?.textContent || '请选择';
+      for (const name of ['aria-labelledby', 'aria-describedby', 'aria-invalid']) {
+        if (select.hasAttribute(name)) trigger.setAttribute(name, select.getAttribute(name));
+        else trigger.removeAttribute(name);
+      }
+      trigger.setAttribute('aria-required', String(select.required));
+      if (trigger.disabled) close();
+      else if (!list.hidden) { active = select.selectedIndex; paint(); }
     };
     const paint = () => {
       list.replaceChildren();
@@ -366,14 +410,14 @@ function enhanceSelects(root) {
         item.className = 'select-option';
         item.setAttribute('role', 'option');
         item.setAttribute('aria-selected', String(index === select.selectedIndex));
-        if (option.disabled) item.setAttribute('aria-disabled', 'true');
+        if (isDisabled(option)) item.setAttribute('aria-disabled', 'true');
         if (index === active) item.classList.add('is-active');
         const text = document.createElement('span');
         text.textContent = option.textContent;
         item.appendChild(text);
         if (index === select.selectedIndex) item.insertAdjacentHTML('beforeend', '<span class="select-check" aria-hidden="true">✓</span>');
         item.addEventListener('pointerdown', (e) => e.preventDefault());
-        item.addEventListener('click', () => { if (!option.disabled) choose(index); });
+        item.addEventListener('click', e => { e.preventDefault(); if (!isDisabled(option)) choose(index); });
         list.appendChild(item);
       });
       if (active >= 0) {
@@ -384,31 +428,33 @@ function enhanceSelects(root) {
       }
     };
     const close = () => {
-      if (list.hasAttribute('popover') && !list.hidden) list.hidePopover();
+      if (list.hasAttribute('popover') && list.matches(':popover-open')) list.hidePopover();
       list.hidden = true;
+      if (list.parentElement !== wrapper) wrapper.appendChild(list);
       trigger.setAttribute('aria-expanded', 'false');
       trigger.removeAttribute('aria-activedescendant');
-      if (openSelect?.trigger === trigger) openSelect = null;
+      if (openSelection?.trigger === trigger) openSelection = null;
     };
     const open = () => {
-      if (select.disabled || !enabled().length) return;
-      openSelect?.close();
-      active = select.selectedIndex >= 0 && !select.options[select.selectedIndex].disabled ? select.selectedIndex : enabled()[0];
+      if (select.matches(':disabled') || !enabled().length) return;
+      openSelection?.close();
+      closeHint();
+      active = enabled().includes(select.selectedIndex) ? select.selectedIndex : enabled()[0];
       list.hidden = false;
       if (list.hasAttribute('popover')) list.showPopover();
-      trigger.setAttribute('aria-expanded', 'true');
-      openSelect = { trigger, wrapper, close };
-      paint();
-      const rect = trigger.getBoundingClientRect(), height = Math.min(list.scrollHeight, 260);
-      const up = innerHeight - rect.bottom < height + 12 && rect.top > height + 12;
-      wrapper.classList.toggle('select-open-up', up);
-      if (list.hasAttribute('popover')) {
-        list.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - Math.max(rect.width, 180) - 8))}px`;
-        list.style.top = `${up ? Math.max(8, rect.top - height - 6) : rect.bottom + 6}px`;
-        list.style.width = `${Math.max(rect.width, 180)}px`;
+      else {
+        const styles = getComputedStyle(wrapper);
+        for (const name of ['--control-height', '--control-font-size', '--control-padding', '--control-gap']) list.style.setProperty(name, styles.getPropertyValue(name));
+        document.body.appendChild(list);
       }
+      trigger.setAttribute('aria-expanded', 'true');
+      openSelection = { trigger, wrapper, list, close };
+      paint();
+      positionFloatingPanel(list, trigger, true);
+      list.children[active]?.scrollIntoView({ block: 'nearest' });
     };
     const choose = (index) => {
+      if (!enabled().includes(index) || select.matches(':disabled')) return;
       const changed = select.selectedIndex !== index;
       select.selectedIndex = index;
       sync(); close(); trigger.focus();
@@ -426,7 +472,7 @@ function enhanceSelects(root) {
         paint(); return;
       }
       if ((e.key === 'Enter' || e.key === ' ') && !list.hidden) { e.preventDefault(); choose(active); return; }
-      if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing) {
+      if (e.key.length === 1 && e.key !== ' ' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.isComposing) {
         e.preventDefault();
         if (list.hidden) open();
         typeahead = performance.now() - typedAt > 700 ? e.key : typeahead + e.key;
@@ -440,9 +486,12 @@ function enhanceSelects(root) {
     sync();
   });
 }
-document.addEventListener('pointerdown', (e) => { if (openSelect && !openSelect.wrapper.contains(e.target)) openSelect.close(); });
-document.addEventListener('scroll', (e) => { if (openSelect && !openSelect.wrapper.contains(e.target)) openSelect.close(); }, true);
-window.addEventListener('resize', () => openSelect?.close());
+document.addEventListener('pointerdown', (e) => { if (openSelection && !openSelection.wrapper.contains(e.target) && !openSelection.list.contains(e.target)) openSelection.close(); });
+document.addEventListener('scroll', (e) => { if (openSelection && !openSelection.list.contains(e.target)) openSelection.close(); }, true);
+document.addEventListener('focusin', e => { if (openSelection && !openSelection.wrapper.contains(e.target) && !openSelection.list.contains(e.target)) openSelection.close(); });
+const closeFloatingPanels = () => { openSelection?.close(); closeHint(); };
+window.addEventListener('resize', closeFloatingPanels);
+window.visualViewport?.addEventListener('resize', closeFloatingPanels);
 
 function modal(title, contentEl, onClose, options = {}) {
   const bg = h('<div class="modal-bg"></div>');
@@ -454,7 +503,7 @@ function modal(title, contentEl, onClose, options = {}) {
     if (closing || contentEl.dataset.submitting === 'true' || !document.body.contains(bg)) return;
     closing = true;
     onClose?.();
-    if (openSelect && box.contains(openSelect.wrapper)) openSelect.close();
+    if (openSelection && box.contains(openSelection.wrapper)) openSelection.close();
     document.removeEventListener('keydown', onKey);
     bg.classList.add('closing');
     const finish = () => {
@@ -470,7 +519,7 @@ function modal(title, contentEl, onClose, options = {}) {
     if (options.externalFocus && !box.contains(e.target)) return;
     if (e.key === 'Escape' && !isImeComposing(e)) { e.preventDefault(); close(); return; }
     if (e.key !== 'Tab') return;
-    const focusable = [...box.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])')].filter((el) => el.getClientRects().length);
+    const focusable = [...box.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex]:not([tabindex="-1"])')].filter((el) => el.tabIndex >= 0 && el.getClientRects().length);
     if (!focusable.length) { e.preventDefault(); box.focus(); return; }
     const first = focusable[0], last = focusable[focusable.length - 1];
     if (e.shiftKey && (document.activeElement === first || !box.contains(document.activeElement))) { e.preventDefault(); last.focus(); }
@@ -528,9 +577,7 @@ function showHint(trigger) {
   tip.setAttribute('popover', 'manual');
   tip.showPopover();
   activeHint = tip;
-  const rect = trigger.getBoundingClientRect(), size = tip.getBoundingClientRect();
-  tip.style.left = `${Math.max(12, Math.min(rect.left, innerWidth - size.width - 12))}px`;
-  tip.style.top = `${rect.bottom + size.height + 8 < innerHeight ? rect.bottom + 6 : Math.max(12, rect.top - size.height - 6)}px`;
+  positionFloatingPanel(tip, trigger);
 }
 document.addEventListener('pointerover', e => { const trigger = e.target.closest('.info-trigger'); if (trigger) showHint(trigger); });
 document.addEventListener('focusin', e => { if (e.target.matches('.info-trigger')) showHint(e.target); });
@@ -539,7 +586,7 @@ document.addEventListener('pointerout', e => {
   if (wrapper && !wrapper.contains(e.relatedTarget) && !wrapper.contains(document.activeElement)) closeHint();
 });
 document.addEventListener('focusout', e => { if (e.target.matches('.info-trigger') && !e.target.parentElement.contains(e.relatedTarget)) closeHint(); });
-document.addEventListener('scroll', closeHint, true);
+document.addEventListener('scroll', e => { if (activeHint && !activeHint.contains(e.target)) closeHint(); }, true);
 document.addEventListener('pointerdown', e => { if (!e.target.closest('.info-tip')) closeHint(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && activeHint) { closeHint(); e.preventDefault(); e.stopImmediatePropagation(); } }, true);
 
@@ -600,10 +647,16 @@ function bindAccountPager(root, state, paint) {
   });
 }
 
+const ACCOUNT_FAMILY_LABELS = { bigmodel: '国内账号', zai: '国际账号' };
+
+function loginProviderLabel(provider) {
+  return ({ zai_cn: 'Z.ai 国内', zai: 'Z.ai 国际', bigmodel: 'BigModel（旧版）' })[provider] || 'ZCode';
+}
+
 function accountNameMarkup(a, action = 'detail') {
   const name = a.platform_name || '未获取官方名称';
   const officialID = a.customer_id == null || a.customer_id === '' ? '未获取官方 ID' : String(a.customer_id);
-  const family = a.family === 'zai' ? 'Z.ai' : a.family === 'bigmodel' ? 'BigModel' : 'ZCode';
+  const family = loginProviderLabel(a.login_provider || a.family);
   return `<button type="button" class="account-name-button" data-act="${action}" data-id="${esc(a.id)}" title="${esc(name)} · ${esc(officialID)}"><span class="avatar">${esc(Array.from(a.platform_name || '?')[0])}</span><span class="account-identity"><span class="account-row-name">${esc(name)}</span><span class="account-row-id">${esc(officialID)}</span></span><span class="account-row-family">${family}</span></button>`;
 }
 
@@ -686,7 +739,7 @@ function accountQuotaMarkup(account) {
   </div>`).join('');
   const remaining = account.remaining ?? (buckets.length ? buckets.reduce((sum, b) => sum + (Number(b.remaining) || 0), 0) : null);
   return `<div class="quota-summary"><strong title="${esc(fmtInt(remaining))} Token">${fmtQuota(remaining)}</strong><span>可用 Token</span>${pendingBuckets.length ? `<span class="badge">${pendingBuckets.length} 项待生效</span>` : ''}</div>
-    ${live || pending ? `<details class="quota-details"><summary>查看 ${buckets.length + pendingBuckets.length} 项额度</summary><div class="quota-ledger">${live}${pending}</div></details>` : `<p class="quiet-message">${account.has_zcode_jwt ? account.last_balance ? '暂无生效额度' : '等待余额查询' : '网页账号不参与推理'}</p>`}`;
+    ${live || pending ? `<details class="quota-details"><summary class="disclosure-link">查看 ${buckets.length + pendingBuckets.length} 项额度</summary><div class="quota-ledger">${live}${pending}</div></details>` : `<p class="quiet-message">${account.has_zcode_jwt ? account.last_balance ? '暂无生效额度' : '等待余额查询' : '网页账号不参与推理'}</p>`}`;
 }
 
 async function pageAccounts() {
@@ -744,16 +797,16 @@ function renderAccPage(accounts, groups) {
 
     const page = UI.paginate(list, f.page, f.size || 25);
     f.page = page.page;
-    tbl.innerHTML = `<p class="account-scroll-hint">窄屏可左右滚动查看各列，点击账号名称查看完整信息。</p><div class="tablecard account-table compact-account-table" tabindex="0" role="region" aria-label="账号管理横向列表"><table><colgroup><col class="account-name-col"><col style="width:95px"><col style="width:150px"><col style="width:115px"><col style="width:145px"><col style="width:100px"><col style="width:138px"></colgroup><thead>
-      <tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col" class="align-right">可用额度 <span class="table-hint">Token</span></th><th scope="col" class="align-right" title="来自上游余额快照差额，可能包含外部客户端请求">24 小时消耗</th><th scope="col">最近到期</th><th scope="col">分组</th><th scope="col">操作</th></tr></thead><tbody>
+    tbl.innerHTML = `<p class="account-scroll-hint">窄屏可左右滚动查看各列，点击账号名称查看完整信息。</p><div class="tablecard account-table compact-account-table" tabindex="0" role="region" aria-label="账号管理横向列表"><table><colgroup><col class="account-name-col"><col style="width:95px"><col style="width:150px"><col style="width:115px"><col style="width:145px"><col style="width:100px"><col style="width:160px"></colgroup><thead>
+      <tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">可用额度 <span class="table-hint">Token</span></th><th scope="col" class="align-right" title="来自上游余额快照差额，可能包含外部客户端请求">24 小时消耗</th><th scope="col">最近到期</th><th scope="col">分组</th><th scope="col">操作</th></tr></thead><tbody>
       ${page.items.map(a => `<tr data-acc-id="${esc(a.id)}">
         <td>${accountNameMarkup(a)}</td>
         <td><span class="badge ${esc(a.status)}" title="${esc(a.last_error || '')}">● ${esc(ACC_STATUS[a.status] || a.status)}</span></td>
-        <td class="align-right"><span class="account-row-quota"><strong title="${esc(fmtInt(a.remaining))} Token">${fmtQuota(a.remaining)}</strong><button type="button" class="text-action" data-act="detail" data-id="${esc(a.id)}" aria-label="查看${esc(a.platform_name || '未获取官方名称')}的额度明细">明细</button>${(a.pending_buckets || []).length ? `<span class="account-pending-dot" role="img" title="${fmtQuota(a.pending_total)} Token 待生效" aria-label="有额度待生效"></span>` : ''}</span></td>
+        <td><span class="cell-grid account-row-quota"><strong title="${esc(fmtInt(a.remaining))} Token">${fmtQuota(a.remaining)}</strong><button type="button" class="text-action" data-act="detail" data-id="${esc(a.id)}" aria-label="查看${esc(a.platform_name || '未获取官方名称')}的额度明细">明细</button>${(a.pending_buckets || []).length ? `<span class="account-pending-dot" role="img" title="${fmtQuota(a.pending_total)} Token 待生效" aria-label="有额度待生效"></span>` : ''}</span></td>
         <td class="align-right" title="${esc(fmtInt(a.delta24h))} Token">${fmtQuota(a.delta24h)}</td>
         <td class="account-row-expiry" title="${esc(a.card_expires_at ? fmtTime(a.card_expires_at) + '，' + fmtPlanRemaining(a.card_expires_at - Date.now()) : '到期时间未知')}">${a.card_expires_at ? esc(fmtCompactTime(a.card_expires_at)) : '未知'}</td>
         <td><span class="account-row-group" title="${esc(gmap[a.group_id] || '待分组')}">${esc(gmap[a.group_id] || '待分组')}</span></td>
-        <td><div class="account-action-row">
+        <td><div class="cell-inline cell-actions">
           <button class="ibtn" data-act="renew" data-id="${esc(a.id)}" aria-label="续期" title="更新账号凭据">${icon('refresh', 14)}</button>
           <button class="ibtn" data-act="verify" data-id="${esc(a.id)}" aria-label="验证连通性" title="验证连通性">${icon('zap', 14)}</button>
           <button class="ibtn" data-act="edit" data-id="${esc(a.id)}" aria-label="编辑账号" title="编辑账号">${icon('pencil', 14)}</button>
@@ -880,7 +933,7 @@ async function onAccountAction(e) {
   if (btn.dataset.act === 'detail') {
     const a = (window._accCache || []).find(item => item.id === id);
     if (!a) { toast('账号信息已更新，请刷新列表', 'err'); return; }
-    const form = h(`<div class="account-detail"><dl><div><dt>账号名称</dt><dd>${esc(a.platform_name || '未获取官方名称')}</dd></div><div><dt>备注</dt><dd>${esc(a.label)}</dd></div><div><dt>账号 ID</dt><dd>${esc(a.customer_id || '未获取')}${a.customer_id ? `<button type="button" class="text-action" data-act="copy" data-id="${esc(a.customer_id)}">复制</button>` : ''}</dd></div><div><dt>状态</dt><dd>${esc(ACC_STATUS[a.status] || a.status)}</dd></div>${a.has_web_jwt ? `<div><dt>网页会话到期</dt><dd>${esc(fmtTime(a.web_cookie_expires_at))}</dd></div>` : ''}<div><dt>最近额度卡到期</dt><dd>${esc(fmtTime(a.card_expires_at))}</dd></div></dl>${a.last_error ? `<p class="inline-notice error">${esc(a.last_error)}</p>` : ''}<section class="account-detail-quota"><h3>模型额度明细</h3>${accountQuotaMarkup(a)}</section></div>`);
+    const form = h(`<div class="account-detail"><dl><div><dt>账号名称</dt><dd>${esc(a.platform_name || '未获取官方名称')}</dd></div><div><dt>备注</dt><dd>${esc(a.label)}</dd></div><div><dt>登录渠道</dt><dd>${esc(loginProviderLabel(a.login_provider || a.family))}</dd></div><div><dt>ZCode ID</dt><dd>${esc(a.customer_id || '未获取')}${a.customer_id ? `<button type="button" class="text-action" data-act="copy" data-id="${esc(a.customer_id)}">复制</button>` : ''}</dd></div>${a.business_customer_id ? `<div><dt>业务账号 ID</dt><dd>${esc(a.business_customer_id)}</dd></div>` : ''}<div><dt>状态</dt><dd>${esc(ACC_STATUS[a.status] || a.status)}</dd></div>${a.zcode_jwt_expires_at ? `<div><dt>登录有效期 ${infoTip('主登录到期后需重新授权。业务 token 更新不会延长此有效期。', '登录有效期')}</dt><dd>${esc(fmtTime(a.zcode_jwt_expires_at))}</dd></div>` : ''}${a.has_web_jwt ? `<div><dt>网页会话到期</dt><dd>${esc(fmtTime(a.web_cookie_expires_at))}</dd></div>` : ''}<div><dt>最近额度卡到期</dt><dd>${esc(fmtTime(a.card_expires_at))}</dd></div></dl>${a.last_error ? `<p class="inline-notice error">${esc(a.last_error)}</p>` : ''}<section class="account-detail-quota"><h3>模型额度明细</h3>${accountQuotaMarkup(a)}</section></div>`);
     const details = form.querySelector('.quota-details'); if (details) details.open = true;
     form.addEventListener('click', onAccountAction);
     modal('账号详情', form);
@@ -927,45 +980,87 @@ async function onAccountAction(e) {
 function addAccountModal(target = null) {
   let watchTimer, flowGeneration = 0;
   const stopWatch = () => { clearInterval(watchTimer); watchTimer = null; flowGeneration++; };
-  const form = h(`<div>
+  const form = h(`<div class="account-import">
     <section class="import-option">
-      <div class="section-heading"><h2>从客户端导入</h2>${infoTip('读取运行服务的机器上的 ZCode 客户端凭据，并验证账号。', '客户端导入')}</div>
-      <div class="row"><button class="btn primary" id="i-local">导入账号</button></div>
+      <div class="client-import-heading">
+        <div class="section-heading"><h2>从客户端导入</h2>${infoTip('读取运行服务的机器上的 ZCode 登录账号。请使用登录客户端的同一系统用户运行服务；重复导入会更新该账号凭据，停用状态保持不变。', '客户端导入')}</div>
+        <button type="button" class="btn primary" id="i-local">${icon('import', 14)}读取并导入</button>
+      </div>
+      <details class="client-import-path disclosure">
+        <summary class="control-trigger">导入选项</summary>
+        <div class="disclosure-content">
+        <label class="dialog-field field-inline" for="i-client-type">客户端类型<select id="i-client-type"><option value="desktop">ZCode 桌面版</option><option value="cli">ZCode CLI</option></select></label>
+        <label class="dialog-field" for="i-local-path">凭据文件路径<input id="i-local-path" type="text" autocomplete="off" spellcheck="false" placeholder="留空自动查找 credentials.json"></label>
+        </div>
+      </details>
+      <div id="i-local-result" aria-live="polite" aria-atomic="true"></div>
     </section>
     <section class="import-option">
       <h2>账号授权</h2>
       <div class="row">
-        <select id="i-provider" aria-label="账号平台"><option value="bigmodel">国内 BigModel</option><option value="zai">国际 Z.ai</option></select>
+        <select id="i-provider" aria-label="登录渠道"><option value="zai_cn">Z.ai 国内</option><option value="zai">Z.ai 国际</option><option value="bigmodel">BigModel（旧版）</option></select>
         <button class="btn" id="i-oauth">开始授权</button>
       </div>
       <div id="oauth-box"></div><div id="oauth-pending"></div>
-    </section>
-    <details class="import-advanced"><summary>导入网页会话</summary><div class="import-credentials">
-      <p class="inline-notice">仅用于资料与活动查询，不可用于余额查询或推理。</p>
-      <label class="dialog-field">网页 JWT<input id="i-cookie" autocomplete="off" spellcheck="false" placeholder="粘贴 bigmodel_token_production 的值"></label>
-      <label class="dialog-field">会话到期时间（选填）<input id="i-cookie-expiry" type="datetime-local" title="按浏览器显示填写；留空时尝试读取 JWT 中的到期时间"></label>
-      <div class="row"><button class="btn" id="i-cookie-btn">导入会话</button></div>
-    </div></details></div>`);
+    </section></div>`);
   const m = modal(target ? '更新账号凭据：' + (target.platform_name || target.customer_id || '未获取官方名称') : '添加账号', form, stopWatch);
   if (target) {
     $('#i-local', form).closest('section').remove();
-    $('#i-provider', form).value = target.family;
+    $('#i-provider', form).value = target.login_provider || target.family;
     $('#i-provider', form).disabled = true;
     syncSelect($('#i-provider', form));
-    $('#i-cookie-btn', form).textContent = '更新网页会话';
     form.insertAdjacentHTML('afterbegin', '<p class="dialog-intro">重新授权将更新此账号凭据；验证不会延长上游会话有效期。</p>');
+    $('#i-oauth', form).focus();
   }
-  if (!target)
-  $('#i-local', form).addEventListener('click', event => buttonAction(event.currentTarget, async () => {
-    const r = await api('/api/accounts/import-local', { method: 'POST', body: {} });
-    if (r.ok) { toast(`已导入 ${r.imported} 个账号`, 'ok'); m.close(); render(); }
-    else toast(firstReason(r), 'err');
-  }));
+  if (!target) {
+    const button = $('#i-local', form), path = $('#i-local-path', form), clientType = $('#i-client-type', form), result = $('#i-local-result', form);
+    button.focus();
+    path.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !isImeComposing(event)) { event.preventDefault(); button.click(); }
+    });
+    button.addEventListener('click', () => buttonAction(button, async () => {
+      const controls = [path, clientType, $('#i-provider', form), $('#i-oauth', form)].map(control => [control, control.disabled]);
+      controls.forEach(([control]) => { control.disabled = true; });
+      syncSelect($('#i-provider', form));
+      syncSelect(clientType);
+      result.setAttribute('aria-busy', 'true');
+      result.innerHTML = '<div class="client-import-progress"><span class="spinner"></span>正在读取并验证账号…</div>';
+      try {
+        const r = await api('/api/accounts/import-local', { method: 'POST', body: { credentials_path: path.value.trim(), client_type: clientType.value } });
+        if (!r.ok) throw new Error(r.error || '客户端导入失败');
+        if (r.login_provider) $('#i-provider', form).value = r.login_provider;
+        const saved = r.updated ? '账号凭据已更新' : '账号已导入';
+        if (currentPage === 'accounts') {
+          delete $('#main').dataset.fp;
+          render({ swap: true }).catch(() => toast('账号已保存，请手动刷新列表', 'err'));
+        }
+        if (!form.isConnected || form.closest('.modal-bg')?.classList.contains('closing')) { toast(saved + (r.verified ? '，验证通过' : r.status === 'disabled' ? '，保持停用' : '，' + (ACC_STATUS[r.status] || '待验证')), r.verified ? 'ok' : ''); return; }
+        const title = saved + (r.verified ? '，验证通过' : r.status === 'disabled' ? '，保持停用' : '，' + (ACC_STATUS[r.status] || '待验证'));
+        const reason = r.status === 'needs_relogin' ? '客户端登录已失效，请在下方重新授权。' : r.reason || '暂时无法完成验证，可在账号列表重试。';
+        result.innerHTML = `<div class="client-import-result ${r.verified ? 'ok' : 'warn'}">
+          <strong>${icon(r.verified ? 'shield' : 'info', 16)}${esc(title)}</strong>
+          ${!r.verified && r.status !== 'disabled' ? `<p>${esc(reason)}</p>` : ''}
+          <div class="row"><button type="button" class="btn" data-local-view>查看账号</button><button type="button" class="btn primary" data-local-done>完成</button></div>
+        </div>`;
+        $('[data-local-done]', result).addEventListener('click', () => m.close());
+        $('[data-local-view]', result).addEventListener('click', () => m.close(() => viewAccount(r.id)));
+      } catch (error) {
+        if (!form.isConnected || form.closest('.modal-bg')?.classList.contains('closing')) { toast(error.message, 'err'); return; }
+        result.innerHTML = `<p class="inline-notice error" role="alert">${esc(error.message)}</p>`;
+      } finally {
+        result.removeAttribute('aria-busy');
+        controls.forEach(([control, disabled]) => { control.disabled = disabled; });
+        syncSelect($('#i-provider', form));
+        syncSelect(clientType);
+      }
+    }));
+  }
   const startOAuth = () => buttonAction($('#i-oauth', form), async () => {
     showOAuthFlow(await api('/api/accounts/oauth/start', { method: 'POST', body: { provider: $('#i-provider', form).value, account_id: target?.id } }));
   });
   $('#i-oauth', form).addEventListener('click', startOAuth);
   function showOAuthFlow(r) {
+    if (!r?.flow_id || !r.authorize_url) { toast(r?.error || '暂时无法开始授权，请重试', 'err'); return; }
     stopWatch();
     const generation = flowGeneration;
     let checking = false;
@@ -1010,9 +1105,13 @@ function addAccountModal(target = null) {
       const alreadyToasted = window._oauthSeen.has(r.flow_id);
       noteFlowSeen(r.flow_id);
       const accId = status.account_id || x.id || null;
+      if (currentPage === 'accounts') {
+        delete $('#main').dataset.fp;
+        render({ swap: true }).catch(() => toast('账号已保存，请手动刷新列表', 'err'));
+      }
       box.innerHTML = `
         <div class="oauth-result ${x.verified ? 'ok' : 'warn'}">
-          <p class="${x.verified ? 'ok-text' : 'error'}" style="margin:0 0 4px;font-weight:600">${x.verified ? '✓ 登录成功，账号已加入账号库' : '✓ 登录成功，但验证未通过'}</p>
+          <p class="${x.verified ? 'ok-text' : 'warn-text'}" style="margin:0 0 4px;font-weight:600">${x.updated ? '账号凭据已更新' : '账号已加入账号库'}${x.verified ? '，验证通过' : x.status === 'disabled' ? '，保持停用' : '，待验证'}</p>
           <p class="muted" style="margin:0 0 10px;font-size:12px">${x.updated ? '已有账号的凭据已更新' : '新账号已建档并开始额度轮询'}${x.verified ? '，balance 验证通过' : `，原因：${esc(String(x.reason || x.status || '未知'))}`}</p>
           <div class="row" style="gap:8px">
             <button class="btn primary" id="oauth-done">完成</button>
@@ -1022,8 +1121,8 @@ function addAccountModal(target = null) {
       if (!alreadyToasted) {
         toast(x.updated ? `账号凭据已更新${x.verified ? '，验证通过' : '，验证未通过'}` : (x.verified ? '登录成功，账号已加入账号库' : '账号已入库，但验证未通过'), x.verified ? 'ok' : 'err');
       }
-      $('#oauth-done', box).addEventListener('click', () => { m.close(); render(); });
-      $('#oauth-view', box)?.addEventListener('click', () => { m.close(); viewAccount(accId); });
+      $('#oauth-done', box).addEventListener('click', () => m.close());
+      $('#oauth-view', box)?.addEventListener('click', () => m.close(() => viewAccount(accId)));
     }
     function showOAuthFail(status) {
       stopWatch();
@@ -1043,20 +1142,9 @@ function addAccountModal(target = null) {
     const matching = flows.filter((x) => target ? x.target_id === target.id : !x.target_id);
     const pending = $('#oauth-pending', form);
     if (!matching.length) return;
-    pending.innerHTML = matching.map((f, i) => `<button class="btn" data-flow-index="${i}">继续未完成的 ${esc(f.provider)} 授权</button>`).join(' ');
+    pending.innerHTML = matching.map((f, i) => `<button class="btn" data-flow-index="${i}">继续 ${esc(loginProviderLabel(f.provider))} 授权</button>`).join(' ');
     pending.addEventListener('click', (e) => { const b = e.target.closest('[data-flow-index]'); if (b) showOAuthFlow(matching[Number(b.dataset.flowIndex)]); });
   }).catch(() => {});
-  $('#i-cookie-btn', form).addEventListener('click', event => buttonAction(event.currentTarget, async () => {
-    const r = await api(target ? `/api/accounts/${target.id}/refresh-cookie` : '/api/accounts/import-cookie', { method: 'POST', body: { webJwt: $('#i-cookie', form).value.trim(), family: $('#i-provider', form).value, expiresAt: $('#i-cookie-expiry', form).value ? new Date($('#i-cookie-expiry', form).value).getTime() : null } });
-    if (r.ok) { toast(target ? '网页会话已更新' : '已导入（web_only 受限账号）', 'ok'); m.close(); render(); }
-    else toast(r.error || r.reason || '导入失败', 'err');
-  }));
-}
-
-function firstReason(r) {
-  if (r.error) return r.error;
-  if (r.results?.length) return r.results.map((x) => x.reason || (x.ok ? '成功' : '失败')).join('; ');
-  return '导入失败';
 }
 
 window._oauthSeen = window._oauthSeen || new Set();
@@ -1085,7 +1173,7 @@ function startOauthWatcher() {
         toast((x.updated ? '账号凭据已更新' : '登录成功，新账号已加入账号库') + (x.verified ? '（验证通过）' : `（验证未通过：${x.reason || x.status || ''}）`), x.verified ? 'ok' : 'err');
         refresh = true;
       } else {
-        toast(`${f.provider} 授权未完成：${f.error || f.status}`, 'err');
+        toast(`${loginProviderLabel(f.provider)} 授权未完成：${f.error || f.status}`, 'err');
       }
     }
     if (refresh && ['dashboard', 'accounts'].includes(currentPage) && $('#main').dataset.loading !== '1') render({ swap: true }).catch(() => {});
@@ -1167,7 +1255,7 @@ async function pageUsage(main) {
     ${statcard('Token 用量', fmtInt(input + output), { tone: 'neutral', icon: 'zap', hint: `输入 ${fmtInt(input)} · 输出 ${fmtInt(output)}` })}
     ${statcard('首 Token 时间 P50 / P95', s.ttft ? `${fmtInt(s.ttft.p50)}<small> / ${fmtInt(s.ttft.p95)} ms</small>` : '—', { icon: 'timer', hint: '仅统计成功请求' })}
   </div></section>
-  <section><div class="usage-heading"><h2>${icon('trending', 15)}请求趋势</h2></div><div id="usage-chart" class="usage-chart"></div></section>
+  <section><h2>${icon('trending', 15)}请求趋势</h2><div id="usage-chart" class="usage-chart"></div></section>
   <section><h2>${icon('layers', 15)} 用量明细</h2><div id="usage-detail"></div></section>`;
   renderUsageChart($('#usage-chart', main), s);
   const detail = $('#usage-detail', main);
@@ -1179,7 +1267,7 @@ async function pageUsage(main) {
     pages[tab] = page;
     detail.innerHTML = `<nav class="section-tabs usage-tabs" role="tablist" aria-label="用量明细分类">${Object.entries(categories).map(([id, group]) => `<button type="button" class="tab${id === tab ? ' active' : ''}" role="tab" id="usage-tab-${id}" aria-selected="${id === tab}" aria-controls="usage-detail-panel" tabindex="${id === tab ? '0' : '-1'}" data-usage-tab="${id}">${group.label}<span class="cnt">${fmtInt(group.rows.length)}</span></button>`).join('')}</nav>
       <div class="usage-panel" role="tabpanel" id="usage-detail-panel" aria-labelledby="usage-tab-${tab}">
-        ${rows.length ? `<div class="tablecard"><table><thead><tr>${current.columns.map((col) => `<th>${col}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>` : '<p class="usage-empty">所选分类暂无数据</p>'}
+        ${rows.length ? `<div class="tablecard"><table class="table-metrics"><thead><tr>${current.columns.map((col) => `<th>${col}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>` : '<p class="usage-empty">所选分类暂无数据</p>'}
         <div class="pager usage-pager" aria-label="用量明细分页"><button type="button" data-usage-page="prev" aria-label="上一页" ${page === 1 ? 'disabled' : ''}>‹</button>${UI.pageNumbers(page, pageCount).map((n) => n === '…' ? '<span aria-hidden="true">…</span>' : `<button type="button" data-usage-page="${n}" aria-label="第 ${n} 页" ${n === page ? 'class="cur" aria-current="page"' : ''}>${n}</button>`).join('')}<button type="button" data-usage-page="next" aria-label="下一页" ${page === pageCount ? 'disabled' : ''}>›</button><span class="pinfo">共 ${fmtInt(total)} 条</span></div>
       </div>`;
     enhanceTables(detail);
@@ -1218,17 +1306,17 @@ async function pageKeys(main) {
   <div class="integration-note"><div class="example-line"><code>Authorization: Bearer &lt;密钥&gt;</code> → <code>POST http://127.0.0.1:${RUNTIME?.gateway_port || 6780}/v1/chat/completions</code>（OpenAI）或 <code>/v1/messages</code>（Anthropic）<button type="button" class="text-action" id="copy-gw">复制网关地址</button></div></div>
   <section style="animation-delay:50ms"><div id="key-table" class="fade-up"></div></section>`;
   $('#key-table').innerHTML = keys.length ? `<div class="tablecard"><table>
-    <tr><th>名称</th><th>尾号</th><th>配额</th><th>已用</th><th>分组链</th><th>默认档位</th><th>白名单</th><th>状态</th><th>操作</th></tr>
+    <tr><th>名称</th><th>尾号</th><th class="align-right">配额</th><th class="align-right">已用</th><th>分组链</th><th>默认档位</th><th>白名单</th><th>状态</th><th class="align-right">操作</th></tr>
     ${keys.map((k) => `<tr>
       <td><b style="font-size:13px">${esc(k.name)}</b><br><span class="muted" style="font-size:11px">${fmtTime(k.created_at)}</span></td>
       <td class="mono">…${esc(k.key_tail)}</td>
-      <td class="mono">${k.quota_limit === null ? '不限' : fmtInt(k.quota_limit)}</td>
-      <td class="mono">${fmtInt(k.used_units)}</td>
+      <td class="mono align-right">${k.quota_limit === null ? '不限' : fmtInt(k.quota_limit)}</td>
+      <td class="mono align-right">${fmtInt(k.used_units)}</td>
       <td style="font-size:12px">${esc((k.group_order || []).join(' → ') || '默认链')}</td>
       <td>${k.default_level ? `<span class="badge">${esc(({ low: '低', high: '高', max: '最高' })[k.default_level] || k.default_level)}</span>` : '<span class="muted">跟随全局</span>'}</td>
       <td style="font-size:11px">${k.model_whitelist.length ? k.model_whitelist.map((m) => `<span class="badge sm">${esc(m)}</span>`).join(' ') : '全部模型'}${k.ip_whitelist.length ? '<br>IP: ' + esc(k.ip_whitelist.join(',')) : ''}</td>
       <td>${k.enabled ? '<span class="ok-text">● 启用</span>' : '<span class="muted">禁用</span>'}</td>
-      <td><div class="row" style="gap:6px;justify-content:flex-end"><button class="btn" style="height:28px;padding:0 10px;font-size:12px" data-edit="${esc(k.id)}">编辑</button><button class="btn danger" style="height:28px;padding:0 10px;font-size:12px" data-del="${esc(k.id)}">删除</button></div></td></tr>`).join('')}
+      <td class="align-right"><div class="cell-inline cell-actions"><button class="btn" data-edit="${esc(k.id)}">编辑</button><button class="btn danger" data-del="${esc(k.id)}">删除</button></div></td></tr>`).join('')}
   </table></div>` : '<p class="muted">还没有密钥。</p>';
   $('#key-table').addEventListener('click', async (e) => {
     const del = e.target.closest('button[data-del]');
@@ -1294,14 +1382,14 @@ async function pageGroups(main) {
   ${pagehead('分组调度链', '按分组顺序选择账号池，再根据各组策略选择账号。',
     `<button class="btn primary" id="add-group">${icon('plus', 14)}新建分组</button>`)}
   <section id="group-list" style="animation-delay:50ms">
-  ${groups.length ? `<div class="tablecard fade-up"><table><tr><th>名称</th><th>角色</th><th>账号类型</th><th>调度策略</th><th>临期窗口</th><th>操作</th></tr>
+  ${groups.length ? `<div class="tablecard fade-up"><table><tr><th>名称</th><th>角色</th><th>账号类型</th><th>调度策略</th><th>临期窗口</th><th class="align-right">操作</th></tr>
     ${groups.map((g) => `<tr><td><div class="cell-name"><span class="avatar">${esc((g.name || '?').slice(0, 1))}</span><span class="nm"><b>${esc(g.name)}</b></span></div></td>
-      <td><span class="badge ${g.role === 'primary' ? 'active' : ''}">${esc(({ primary: '主力', backup: '备用' })[g.role] || g.role)}</span></td><td>${esc(({ zai: 'Z.ai', bigmodel: 'BigModel' })[g.family_filter] || g.family_filter || '全部类型')}</td>
+      <td><span class="badge ${g.role === 'primary' ? 'active' : ''}">${esc(({ primary: '主力', backup: '备用' })[g.role] || g.role)}</span></td><td>${esc(ACCOUNT_FAMILY_LABELS[g.family_filter] || g.family_filter || '全部类型')}</td>
       <td>${esc(policyLabel(g.policy))}</td><td>${g.urgent_window_min} 分钟</td>
-      <td><div class="row" style="justify-content:flex-end"><button class="btn danger" style="height:28px;padding:0 10px;font-size:12px" data-del="${esc(g.id)}">删除</button></div></td></tr>`).join('')}</table></div>`
+      <td class="align-right"><div class="cell-inline cell-actions"><button class="btn danger" data-del="${esc(g.id)}">删除</button></div></td></tr>`).join('')}</table></div>`
     : '<p class="muted">暂无分组。</p>'}</section>`;
   $('#add-group').addEventListener('click', () => {
-    const form = h(`<form class="dialog-form"><p class="dialog-intro">设置账号池的角色与调度顺序，创建后可将账号加入分组。</p><label class="dialog-field">分组名称<input name="name" maxlength="80" placeholder="例如：默认池" required></label><div class="dialog-grid"><label class="dialog-field">角色<select name="role"><option value="primary">主力</option><option value="backup">备用</option></select></label><label class="dialog-field">账号类型<select name="family"><option value="">全部类型</option><option value="bigmodel">国内 BigModel</option><option value="zai">国际 Z.ai</option></select></label></div><label class="dialog-field">调度策略<select name="policy"><option value="balanced">均衡调度</option><option value="expiring_first">临期优先</option><option value="remaining_desc">剩余额度优先</option></select></label><p class="dialog-error error" role="alert"></p><div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn primary">创建分组</button></div></form>`);
+    const form = h(`<form class="dialog-form"><p class="dialog-intro">设置账号池的角色与调度顺序，创建后可将账号加入分组。</p><label class="dialog-field">分组名称<input name="name" maxlength="80" placeholder="例如：默认池" required></label><div class="dialog-grid"><label class="dialog-field"><span class="field-label">角色</span><select name="role"><option value="primary">主力</option><option value="backup">备用</option></select></label><div class="dialog-field"><div class="field-label"><label for="group-family">账号类型</label>${infoTip('国内账号包含 Z.ai 国内及旧 BigModel；国际账号对应 Z.ai 国际。', '账号类型')}</div><select id="group-family" name="family"><option value="">全部类型</option>${Object.entries(ACCOUNT_FAMILY_LABELS).map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select></div></div><label class="dialog-field">调度策略<select name="policy"><option value="balanced">均衡调度</option><option value="expiring_first">临期优先</option><option value="remaining_desc">剩余额度优先</option></select></label><p class="dialog-error error" role="alert"></p><div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn primary">创建分组</button></div></form>`);
     const m = modal('新建分组', form);
     bindCreateForm(form, m, name => api('/api/groups', { method: 'POST', body: {
       name, role: form.elements.role.value, policy: form.elements.policy.value, family_filter: form.elements.family.value || null,
@@ -1333,16 +1421,16 @@ async function pageSettings(main) {
   main.innerHTML = `${pagehead('设置', '',
     '<button type="submit" form="settings-form" class="btn primary settings-save" id="s-save" aria-describedby="settings-state" disabled>保存设置</button>')}
     <p id="settings-state" class="visually-hidden" role="status" aria-live="polite"></p>
-    <form id="settings-form" class="settings-form" novalidate>
+    <form id="settings-form" class="settings-form control-comfortable" novalidate>
       <p id="settings-error" class="inline-notice error hidden" role="alert"></p>
       ${settingsUpdateMarkup()}
-      <details class="settings-section formcard" id="poll-panel"><summary class="settings-section-summary"><span><strong>额度轮询</strong></span></summary>
+      <details class="settings-section formcard" id="poll-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>额度轮询</strong></span></summary>
       <div class="settings-panel settings-section-body settings-section-content"><div class="settings-fields">
         <label class="f">轮询间隔（秒）<input id="s-poll" type="number" min="1" step="1" required value="${s.poll_interval_sec}"><small>两次余额检查之间的基础间隔</small></label>
         <label class="f">随机抖动（秒）<input id="s-jitter" type="number" min="0" step="1" required value="${s.poll_jitter_sec}"><small>分散多个账号的请求时间</small></label>
         <label class="f">轮询并发<input id="s-conc" type="number" min="1" step="1" required value="${s.poll_concurrency}"><small>同时检查余额的账号数量</small></label>
       </div></div></details>
-      <details class="settings-section formcard" id="captcha-panel"><summary class="settings-section-summary"><span><strong>上游安全验证</strong></span></summary>
+      <details class="settings-section formcard" id="captcha-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>上游安全验证</strong></span></summary>
       <div class="settings-panel settings-section-body settings-section-content"><div class="network-settings-fields">
         <div class="settings-subsection"><h3>模型 API 推理 · Node.js + jsdom</h3><div class="settings-fields">
           <label class="f">模型推理验证策略<select id="s-captcha-mode" aria-describedby="s-captcha-mode-hint"><option value="off">关闭模型推理验证</option><option value="auto">按上游要求验证</option><option value="always">每次推理前验证</option></select><small id="s-captcha-mode-hint" aria-live="polite"></small></label>
@@ -1350,7 +1438,7 @@ async function pageSettings(main) {
         </div><label class="settings-check"><input id="s-captcha-canvas" type="checkbox" ${captcha.simulate_canvas_webgl ? 'checked' : ''}><span>启用 jsdom 渲染接口模拟 ${infoTip('仅为 jsdom 验证补充 Canvas、WebGL 等兼容接口，不影响真实浏览器，也不保证通过上游验证。', '渲染接口模拟')}</span></label></div>
         <div class="settings-subsection"><h3>领卡验证</h3><div class="settings-fields">
           <div class="field-group f"><span>定时领卡验证方式</span><strong>服务端真实浏览器（固定）</strong><small id="s-claim-browser-status" class="runtime-status" role="status" aria-live="polite">正在检测浏览器依赖…</small></div>
-          <label class="f"><span>手动领卡验证方式 ${infoTip('仅影响点击“立即领取”或“全部立即领取”时的服务端验证。需要人工操作时，仍可在当前网页完成验证；不改变定时领卡或模型推理的方式。', '手动领卡验证')}</span><select id="s-claim-runtime"><option value="jsdom">Node.js + jsdom</option><option value="browser">服务端真实浏览器</option></select></label>
+          <label class="f"><span>手动领卡验证方式 ${infoTip('仅影响点击“领取”或“全部领取”时的服务端验证。需要人工操作时，仍可在当前网页完成验证；不改变定时领卡或模型推理的方式。', '手动领卡验证')}</span><select id="s-claim-runtime"><option value="jsdom">Node.js + jsdom</option><option value="browser">服务端真实浏览器</option></select></label>
         </div><div class="settings-fields">
           <div class="mihomo-field" id="claim-browser-fields"><div class="mihomo-field-heading"><label for="s-browser-path">服务端浏览器路径</label><span>${infoTip('需要 Node.js、Playwright 及 Chromium 内核浏览器，支持 Chromium / Chrome / Edge。定时领取前 3 分钟预热，最晚保留至计划时间后 10 分钟，完成后提前退出。手动领取选择浏览器时按需启动，空闲 30 秒退出。不使用个人浏览器配置。', '领卡浏览器')} <button type="button" class="btn proxy-small-button" id="s-browser-install" disabled>检测中…</button></span></div><input id="s-browser-path" value="${esc(captcha.browser_path)}" placeholder="自动检测 Chromium / Chrome / Edge"><small id="s-browser-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></div>
           <label class="f"><span>Playwright 驱动目录 ${infoTip('定时领卡必需；手动领卡选择真实浏览器时也使用此驱动。可填写 playwright-core、playwright 包目录，或包含它的 node_modules / 项目目录。留空自动检测，指定后只使用该目录。', 'Playwright 搜索路径')}</span><input id="s-playwright-path" value="${esc(captcha.playwright_path)}" placeholder="自动检测，或填写已有 Playwright 目录"><small id="s-playwright-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
@@ -1361,7 +1449,7 @@ async function pageSettings(main) {
           <label class="f"><span>jsdom 票据预取有效期（毫秒） ${infoTip('仅用于模型推理和手动领卡的 jsdom 验证；连续验证成功后按需预取。真实浏览器按需取票，不使用预取。设为 0 关闭预取。', '票据预取')}</span><input id="s-captcha-ttl" type="number" min="0" max="90000" step="1" required value="${captcha.ticket_ttl_ms}"></label>
         </div></div>
       </div></div></details>
-      <details class="settings-section formcard" id="proxy-panel"><summary class="settings-section-summary"><span><strong>出站代理</strong></span><span class="pill" id="s-proxy-summary">${proxy.enabled ? '已启用' : '未启用'}</span></summary>
+      <details class="settings-section formcard" id="proxy-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>出站代理</strong></span><span class="pill" id="s-proxy-summary">${proxy.enabled ? '已启用' : '未启用'}</span></summary>
       <div class="settings-panel settings-section-body"><div class="network-settings-fields">
         <div class="settings-fields"><label class="settings-check"><input id="s-proxy-enabled" type="checkbox" ${proxy.enabled ? 'checked' : ''}><span>启用全局代理<small>关闭后全局使用直连</small></span></label>
           <label class="f">代理来源<select id="s-proxy-source"><option value="manual">HTTP / HTTPS 地址列表</option><option value="subscription">节点订阅（需要 Mihomo）</option></select></label></div>
@@ -1379,7 +1467,7 @@ async function pageSettings(main) {
         <div class="proxy-test-actions"><button type="button" class="btn" id="s-proxy-test">检测当前代理配置</button></div>
         <div id="s-proxy-result" class="proxy-test-results hidden" role="status" aria-live="polite"></div>
       </div></div></details>
-      <details class="settings-section formcard" id="gateway-panel"><summary class="settings-section-summary"><span><strong>网关与模型</strong></span></summary>
+      <details class="settings-section formcard" id="gateway-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>网关与模型</strong></span></summary>
       <div class="settings-panel settings-section-body settings-section-content"><div class="network-settings-fields">
         <label class="f">默认思考强度<select id="s-level" required aria-describedby="s-level-hint"><option value="low">低（low）</option><option value="high">高（high）</option><option value="max">最高（max）</option></select><small id="s-level-hint">优先级：客户端 → 密钥 → 此处设置。低强度仍开启思考；客户端关闭思考时不覆盖。始终思考的模型可能返回 1210，请在客户端开启思考。</small></label>
         <div class="settings-subsection"><div class="advanced-fields">
@@ -1681,7 +1769,7 @@ async function pageSettings(main) {
       const response = await api('/api/settings/proxy/test', { method: 'POST', body: { outbound_proxy: options } });
       if (tested !== JSON.stringify(outboundValues())) { result.textContent = '配置已修改，请重新检测。'; return; }
       const rows = response.results || [], reachable = rows.filter(row => row.reachable).length;
-      result.innerHTML = `<details class="proxy-test-details"><summary><strong>检测结果</strong><span>${rows.length} 个节点 · 可达 ${reachable} · 失败 ${rows.length - reachable}</span></summary><div class="proxy-test-body"><ul>${rows.map(row => `<li><strong>${esc(row.name)}</strong><span class="${row.reachable ? 'ok-text' : 'warn-text'}">${esc(row.reachable ? '出口可达' : row.message)}${row.status ? ` · HTTP ${Number(row.status)}` : ''} · ${Number(row.elapsed_ms)} ms</span></li>`).join('')}</ul></div></details>`;
+      result.innerHTML = `<details class="proxy-test-details"><summary class="disclosure-heading"><strong>检测结果</strong><span>${rows.length} 个节点 · 可达 ${reachable} · 失败 ${rows.length - reachable}</span></summary><div class="proxy-test-body"><ul>${rows.map(row => `<li><strong>${esc(row.name)}</strong><span class="${row.reachable ? 'ok-text' : 'warn-text'}">${esc(row.reachable ? '出口可达' : row.message)}${row.status ? ` · HTTP ${Number(row.status)}` : ''} · ${Number(row.elapsed_ms)} ms</span></li>`).join('')}</ul></div></details>`;
     } catch (error) { result.textContent = '检测失败：' + error.message; }
     finally { button.disabled = false; btnLoading(button, false); }
   });
@@ -1748,7 +1836,7 @@ async function boot() {
     const period = currentPage === 'logs' ? 1000 : ['dashboard', 'accounts'].includes(currentPage) ? 5000 : 0;
     if (!period || Date.now() - lastRefreshAt < period) return;
     const main = $('#main');
-    if (document.querySelector('.modal-bg') || main.dataset.loading === '1' || openSelect) return;
+    if (document.querySelector('.modal-bg') || main.dataset.loading === '1' || openSelection) return;
     if (currentPage === 'accounts' && (main.contains(document.activeElement) || main.querySelector('details[open]'))) return;
     if (currentPage === 'dashboard' && (main.querySelector('.dashboard-chart:hover') || main.contains(document.activeElement) || activeHint)) return;
     if (currentPage === 'logs' && (!Z2ALogs.canAutoRefresh(main) || activeHint)) return;

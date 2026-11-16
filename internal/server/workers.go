@@ -74,9 +74,9 @@ func (a *App) pollAccount(ctx context.Context, id string) {
 	if str(r["status"]) == "web_only" {
 		delay = time.Duration(num(cfg["web_only_ping_min"]) * float64(time.Minute))
 		if res, e := a.customer(ctx, r, tokens["web_jwt"]); e == nil && res.OK {
-			_ = a.updateAccount(id, M{"last_ok_at": nowMS(), "last_error": nil})
+			a.updateAccountStatusIfCurrent(r, nil, M{"last_ok_at": nowMS(), "last_error": nil})
 		} else {
-			_ = a.updateAccount(id, M{"last_error": "网页会话检查失败"})
+			a.updateAccountStatusIfCurrent(r, nil, M{"last_error": "网页会话检查失败"})
 		}
 		return
 	}
@@ -92,10 +92,10 @@ func (a *App) pollAccount(ctx context.Context, id string) {
 		}
 		if errors.As(e, &failure) && failure.RetryAfter > 0 && (failure.Kind == "rate_limit" || failure.Kind == "account_risk") {
 			delay = max(delay, failure.RetryAfter)
-			_ = a.updateAccount(id, M{"last_error": conciseFailureMessage(failure)})
+			a.updateAccountStatusIfCurrent(r, nil, M{"last_error": conciseFailureMessage(failure)})
 			return
 		}
-		_ = a.updateAccount(id, M{"fail_streak": integer(r["fail_streak"]) + 1, "last_error": "balance 异常: " + e.Error()})
+		a.updateAccountStatusIfCurrent(r, nil, M{"fail_streak": integer(r["fail_streak"]) + 1, "last_error": "balance 异常: " + e.Error()})
 		delay *= 3
 		return
 	}
@@ -104,17 +104,18 @@ func (a *App) pollAccount(ctx context.Context, id string) {
 		return
 	}
 	if truth(b["authFailed"]) {
-		_ = a.updateAccount(id, M{"status": "needs_relogin", "fail_streak": integer(r["fail_streak"]) + 1, "last_error": "balance 401"})
-		_, _ = a.startOAuth(ctx, str(r["family"]), id, false)
+		if a.updateAccountStatusIfCurrent(r, b, M{"status": "needs_relogin", "fail_streak": integer(r["fail_streak"]) + 1, "last_error": fallback(b["reason"], "ZCode 登录鉴权失效，请重新授权")}) {
+			_, _ = a.startOAuth(ctx, a.accountLoginProvider(r), id, false)
+		}
 		return
 	}
 	if b["failure_kind"] == "rate_limit" || b["failure_kind"] == "account_risk" {
 		delay = max(delay, ms(b["retry_after_ms"]))
-		_ = a.updateAccount(id, M{"last_error": conciseFailureMessage(&Failure{Kind: str(b["failure_kind"]), Code: str(b["error_code"])})})
+		a.updateAccountStatusIfCurrent(r, b, M{"last_error": conciseFailureMessage(&Failure{Kind: str(b["failure_kind"]), Code: str(b["error_code"])})})
 		return
 	}
 	streak := integer(r["fail_streak"]) + 1
-	_ = a.updateAccount(id, M{"fail_streak": streak, "last_error": fmt.Sprintf("balance HTTP %v", b["httpStatus"])})
+	a.updateAccountStatusIfCurrent(r, b, M{"fail_streak": streak, "last_error": fmt.Sprintf("balance HTTP %v", b["httpStatus"])})
 	delay = time.Duration(math.Min(3600, num(cfg["poll_interval_sec"])*math.Pow(2, float64(min(streak, 6))))) * time.Second
 }
 func (a *App) cookieNotice(r M, tokens map[string]string) {

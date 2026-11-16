@@ -100,6 +100,9 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 				c.skip = "excluded_for_request"
 			case str(r["status"]) != "active":
 				c.skip = "status=" + str(r["status"])
+			case loginJWTExpired(a.accountTokens(r)):
+				c.skip = "login_expired"
+				a.scheduleNext(str(r["id"]), 0)
 			case truth(r["card_expires_at"]) && integer(r["card_expires_at"])-now < minWindow:
 				c.skip = "card_expiring"
 			case truth(p.group["family_filter"]) && p.group["family_filter"] != r["family"]:

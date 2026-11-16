@@ -33,9 +33,9 @@ globalThis.Z2ACacheDetails = (() => {
     if (detail.body != null) {
       let body = String(detail.body);
       try { body = JSON.stringify(JSON.parse(body), null, 2); } catch { /* Preserve non-JSON upstream responses. */ }
-      response = `<details class="request-error-response" open><summary>上游响应</summary><pre>${esc(body || '（空响应体）')}</pre></details>`;
+      response = `<details class="request-error-response" open><summary class="disclosure-link">上游响应</summary><pre>${esc(body || '（空响应体）')}</pre></details>`;
     }
-    const headers = detail.response_headers && Object.keys(detail.response_headers).length ? `<details class="request-error-response"><summary>响应头</summary><pre>${esc(JSON.stringify(detail.response_headers, null, 2))}</pre></details>` : '';
+    const headers = detail.response_headers && Object.keys(detail.response_headers).length ? `<details class="request-error-response"><summary class="disclosure-link">响应头</summary><pre>${esc(JSON.stringify(detail.response_headers, null, 2))}</pre></details>` : '';
     const readError = detail.read_error ? `<p class="cache-detail-error">${esc(detail.read_error)}</p>` : '';
     return `${summary ? `<p class="cache-detail-error">${esc(summary)}</p>` : ''}${message}${response}${headers}${readError}`;
   }

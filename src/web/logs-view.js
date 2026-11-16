@@ -142,8 +142,7 @@ globalThis.Z2ALogs = (() => {
     const advanced = (tab === 'logs' ? select('model', '模型', choices.models || []) + select('account', '账号', choices.accounts || []) + select('key', '密钥', choices.keys || []) : tab === 'sched' ? select('account', '选中账号', choices.accounts || []) : select('ip', '来源 IP', choices.ips || [])) +
       `<label class="log-filter log-filter-date"><span>开始时间</span><input type="datetime-local" step="1" name="since" id="lf-since" value="${esc(f.since)}" aria-label="开始时间"></label><label class="log-filter log-filter-date"><span>结束时间</span><input type="datetime-local" step="1" name="until" id="lf-until" value="${esc(f.until)}" aria-label="结束时间"></label>`;
     const filterIcon = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h16M4 17h16M8 4v6M16 14v6"/></svg>';
-    const chevron = '<svg class="log-filter-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>';
-    const form = `<form id="log-filters" class="log-filter-card"><div class="log-filter-grid log-primary-filters">${common}${specific}</div><details id="log-advanced" class="log-advanced" ${showAdvanced ? 'open' : ''}><summary class="log-advanced-trigger" aria-expanded="${showAdvanced}" aria-controls="log-advanced-fields">${filterIcon}<span class="log-advanced-label">${showAdvanced ? '收起筛选' : '更多筛选'}</span>${selectedAdvanced ? `<span class="log-filter-count" title="已选 ${selectedAdvanced} 项">${selectedAdvanced}</span>` : ''}${chevron}</summary><div id="log-advanced-fields" class="log-filter-grid">${advanced}</div></details><div class="log-filter-actions"><span id="lf-error" role="alert"></span><button type="button" class="btn" id="lf-reset">重置</button><button type="submit" class="btn primary">筛选</button></div></form>`;
+    const form = `<form id="log-filters" class="log-filter-card control-compact"><div class="log-filter-grid log-primary-filters">${common}${specific}</div><details id="log-advanced" class="log-advanced disclosure" ${showAdvanced ? 'open' : ''}><summary class="log-advanced-trigger control-trigger" aria-expanded="${showAdvanced}" aria-controls="log-advanced-fields">${filterIcon}<span class="log-advanced-label">${showAdvanced ? '收起筛选' : '更多筛选'}</span>${selectedAdvanced ? `<span class="log-filter-count" title="已选 ${selectedAdvanced} 项">${selectedAdvanced}</span>` : ''}</summary><div id="log-advanced-fields" class="log-filter-grid">${advanced}</div></details><div class="log-filter-actions"><span id="lf-error" role="alert"></span><button type="button" class="btn" id="lf-reset">重置</button><button type="submit" class="btn primary">筛选</button></div></form>`;
     const pages = data.pages, page = data.page, total = data.total;
     const start = total ? (page - 1) * pageSize + 1 : 0, end = Math.min(page * pageSize, total);
     const pager = `<nav class="pager usage-pager" aria-label="${tabs.find(([id]) => id === tab)[1]}分页"><span class="pinfo">第 ${fmtInt(start)}–${fmtInt(end)} 条 / 共 ${fmtInt(total)} 条 · 每页 20 条</span><button type="button" data-pg="1" aria-label="首页" ${page === 1 ? 'disabled' : ''}>«</button><button type="button" data-pg="${page - 1}" aria-label="上一页" ${page === 1 ? 'disabled' : ''}>‹</button>${Z2AUI.pageNumbers(page, pages).map(n => n === '…' ? '<span aria-hidden="true">…</span>' : `<button type="button" data-pg="${n}" aria-label="第 ${n} 页" ${n === page ? 'class="cur" aria-current="page"' : ''}>${n}</button>`).join('')}<button type="button" data-pg="${page + 1}" aria-label="下一页" ${page === pages ? 'disabled' : ''}>›</button><button type="button" data-pg="${pages}" aria-label="末页" ${page === pages ? 'disabled' : ''}>»</button><form id="log-page-jump"><label>跳至 <input name="page" type="number" min="1" max="${pages}" value="${page}" required aria-label="跳转页码"> 页</label><button class="btn" type="submit">跳转</button></form></nav>`;
@@ -199,12 +198,9 @@ globalThis.Z2ALogs = (() => {
           const result = candidate.picked ? '已选中' : skipLabel(candidate.skip);
           return `<div class="log-candidate-item"><div class="log-candidate-head"><strong>${esc(label)}</strong><span class="badge ${candidate.picked ? 'ok' : candidate.skip === 'upstream_busy' ? 'busy' : 'plain'}">${esc(result)}</span></div>${candidate.account && candidate.label ? `<div class="log-candidate-id">${esc(candidate.account)}</div>` : ''}</div>`;
         }).join('')}</div>`;
-        panel.style.width = Math.min(360, innerWidth - 24) + 'px';
         panel.hidden = false;
         if (nativePopover) panel.showPopover();
-        const rect = button.getBoundingClientRect(), height = panel.getBoundingClientRect().height, width = panel.getBoundingClientRect().width;
-        panel.style.left = Math.max(12, Math.min(rect.right - width, innerWidth - width - 12)) + 'px';
-        panel.style.top = (rect.bottom + height + 20 <= innerHeight ? rect.bottom + 8 : Math.max(12, rect.top - height - 8)) + 'px';
+        positionFloatingPanel(panel, button);
         button.setAttribute('aria-expanded', 'true');
         const events = new AbortController();
         const close = restoreFocus => {
@@ -221,6 +217,7 @@ globalThis.Z2ALogs = (() => {
         doc.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(true); } }, { signal });
         view.addEventListener('scroll', event => { if (!panel.contains(event.target)) close(false); }, { capture: true, signal });
         view.addEventListener('resize', () => close(false), { signal });
+        view.visualViewport?.addEventListener('resize', () => close(false), { signal });
         panel.addEventListener('toggle', event => { if (event.newState === 'closed') close(false); }, { signal });
         panel.focus({ preventScroll: true });
       }));

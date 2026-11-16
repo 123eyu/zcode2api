@@ -72,6 +72,9 @@ type App struct {
 	claimReschedule        chan struct{}
 	claimScheduleCancel    context.CancelFunc
 	flowLocks              map[string]bool
+	localImportMu          sync.Mutex
+	credentialMu           sync.Mutex
+	businessRefreshes      map[string]*businessTokenFlight
 	reauth                 map[string]int64
 	pollDue                map[string]int64
 	polling                map[string]bool

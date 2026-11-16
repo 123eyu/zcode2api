@@ -242,10 +242,8 @@ func apiResponseFailure(r apiResult) *Failure {
 }
 func (a *App) customer(ctx context.Context, account M, token string) (apiResult, error) {
 	host := "https://bigmodel.cn"
-	authorization := token
 	if str(account["family"]) == "zai" {
 		host = "https://api.z.ai"
-		authorization = "Bearer " + token
 	}
-	return a.api(ctx, account, "GET", host+"/api/biz/customer/getCustomerInfo", "", nil, M{"Authorization": authorization}, nil)
+	return a.api(ctx, account, "GET", host+"/api/biz/customer/getCustomerInfo", "", nil, M{"Authorization": token}, nil)
 }

@@ -14,11 +14,11 @@ func TestUpstreamFingerprintMatchesOfficialClient(t *testing.T) {
 		"session-123",
 		"request-123",
 	)
-	testEqual(t, headers.Get("User-Agent"), "ZCode/3.17.2")
+	testEqual(t, headers.Get("User-Agent"), "ZCode/3.18.2")
 	testEqual(
 		t,
 		headers.Get("X-Zcode-App-Version"),
-		"3.17.2",
+		"3.18.2",
 	)
 	testEqual(t, headers.Get("X-Request-Id"), "request-123")
 	testEqual(t, headers.Get("X-Session-Id"), "session-123")

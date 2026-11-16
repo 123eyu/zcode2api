@@ -9,14 +9,14 @@ import (
 	"strings"
 )
 
-const defaultHTTPClientVersion = "3.17.2"
+const defaultHTTPClientVersion = "3.18.2"
 const defaultBalancePollInterval = 30
 const editableSettings = "poll_interval_sec poll_jitter_sec poll_concurrency daily_claim_enabled daily_claim_time conversation_affinity_minutes default_reasoning_level app_version zcode_version_auto_update zcode_version_check_interval_sec aliases retry inference_driver http outbound_proxy"
 
 func defaults() M {
 	return M{
 		"inference_driver": "http", "http": M{"client_version": defaultHTTPClientVersion, "first_token_timeout_ms": 60000, "idle_timeout_ms": 120000, "total_timeout_ms": 0, "captcha": M{"mode": "off", "claim_runtime": "jsdom", "playwright_path": "", "browser_path": "", "node_path": "node", "jsdom_path": "", "simulate_canvas_webgl": true, "timeout_ms": 30000, "ticket_ttl_ms": 75000}},
-		"web_port": 6789, "gateway_port": 6780, "host": "127.0.0.1", "admin_password": "", "poll_interval_sec": defaultBalancePollInterval, "poll_jitter_sec": 0, "poll_concurrency": 4, "web_only_ping_min": 30, "conversation_affinity_minutes": 10, "default_reasoning_level": "low", "app_version": "3.17.2",
+		"web_port": 6789, "gateway_port": 6780, "host": "127.0.0.1", "admin_password": "", "poll_interval_sec": defaultBalancePollInterval, "poll_jitter_sec": 0, "poll_concurrency": 4, "web_only_ping_min": 30, "conversation_affinity_minutes": 10, "default_reasoning_level": "low", "app_version": defaultHTTPClientVersion,
 		"daily_claim_enabled":              true,
 		"daily_claim_time":                 defaultDailyClaimTime,
 		"zcode_version_auto_update":        true,

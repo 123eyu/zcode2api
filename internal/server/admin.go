@@ -115,20 +115,18 @@ func (a *App) adminRoute(r *http.Request, b M) (any, int, error) {
 		return arr(a.summary(ctx)["accounts"]), 200, nil
 	case "POST /api/accounts/import-local":
 		return wrap(a.importLocal(ctx, b))
-	case "POST /api/accounts/import-cookie":
-		return wrap(a.importCookie(ctx, b, nil))
 	case "POST /api/accounts/export":
 		return a.exportAccounts(b)
 	case "POST /api/accounts/import":
 		return a.importAccounts(ctx, b)
 	case "POST /api/accounts/oauth/start":
 		provider := str(fallback(b["provider"], "bigmodel"))
-		if provider != "bigmodel" && provider != "zai" {
-			return adminError(400, "provider 须为 bigmodel|zai")
+		if !validLoginProvider(provider) {
+			return adminError(400, "provider 须为 zai_cn、zai 或 bigmodel")
 		}
 		if truth(b["account_id"]) {
 			target := a.account(str(b["account_id"]))
-			if target == nil || str(target["family"]) != provider {
+			if target == nil || a.accountLoginProvider(target) != provider {
 				return adminError(400, "账号不存在或授权平台不匹配")
 			}
 		}
@@ -437,7 +435,7 @@ func (a *App) adminRoute(r *http.Request, b M) (any, int, error) {
 	}
 	if strings.HasPrefix(p, "/api/accounts/oauth/cancel/") && method == "POST" {
 		id := strings.TrimPrefix(p, "/api/accounts/oauth/cancel/")
-		res, e := a.db.Exec("UPDATE oauth_flows SET status='cancelled',error='已取消',updated_at=? WHERE flow_id=? AND status='pending'", nowMS(), id)
+		res, e := a.db.Exec("UPDATE oauth_flows SET status='cancelled',poll_token_enc='',error='已取消',updated_at=? WHERE flow_id=? AND status='pending'", nowMS(), id)
 		if e != nil {
 			return nil, 500, e
 		}
@@ -502,9 +500,7 @@ func (a *App) adminRoute(r *http.Request, b M) (any, int, error) {
 			case "verify":
 				return wrap(a.verify(ctx, account))
 			case "reauth":
-				return wrap(a.startOAuth(ctx, str(account["family"]), id, true))
-			case "refresh-cookie":
-				return wrap(a.importCookie(ctx, b, account))
+				return wrap(a.startOAuth(ctx, a.accountLoginProvider(account), id, true))
 			}
 		}
 	}

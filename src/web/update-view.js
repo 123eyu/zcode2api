@@ -1,12 +1,12 @@
 function settingsUpdateMarkup() {
   return `<details class="settings-section formcard" id="update-panel">
-    <summary class="settings-section-summary"><span><strong>版本更新</strong></span><span class="pill" id="update-summary">${esc(RUNTIME?.version || '未读取')}</span></summary>
+    <summary class="settings-section-summary disclosure-heading"><span><strong>版本更新</strong></span><span class="pill" id="update-summary">${esc(RUNTIME?.version || '未读取')}</span></summary>
     <div class="settings-panel settings-section-body update-panel-body">
       <div class="update-versions"><div><span>当前版本</span><strong id="update-current">${esc(RUNTIME?.version || '—')}</strong></div><div><span>最新发行版本</span><strong id="update-latest">未检查</strong></div></div>
       <div class="update-toolbar"><a class="text-action update-repository" href="https://github.com/7sen1ot/zcode2api" target="_blank" rel="noopener noreferrer">7sen1ot/zcode2api ↗</a><div class="update-actions"><a class="btn" id="update-manual" href="https://github.com/7sen1ot/zcode2api/releases" target="_blank" rel="noopener noreferrer" hidden>下载发行包 ↗</a><button type="button" class="btn" id="update-check">${icon('refresh', 14)}检查更新</button><button type="button" class="btn primary" id="update-install" hidden>更新并重启</button></div></div>
       <progress id="update-progress" aria-label="发行包下载进度" hidden></progress>
       <p id="update-message" class="update-message" role="status" aria-live="polite"></p>
-      <details class="update-notes" id="update-notes" hidden><summary>发布说明</summary><pre id="update-notes-content"></pre><a id="update-release" class="text-action" href="https://github.com/7sen1ot/zcode2api/releases" target="_blank" rel="noopener noreferrer">在 GitHub 查看 ↗</a></details>
+      <details class="update-notes" id="update-notes" hidden><summary class="disclosure-link">发布说明</summary><pre id="update-notes-content"></pre><a id="update-release" class="text-action" href="https://github.com/7sen1ot/zcode2api/releases" target="_blank" rel="noopener noreferrer">在 GitHub 查看 ↗</a></details>
     </div>
   </details>`;
 }

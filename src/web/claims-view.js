@@ -263,7 +263,7 @@ function claimAccountMarkup(preview, account = {}) {
   return claimablePlans(preview).map(plan => `<div class="daily-claim-row">
     ${accountNameMarkup({ ...account, id: preview.account_id }, 'claim-account')}
     <div class="daily-claim-grants">${(plan.entitlements || []).map(entitlement => `<div><strong title="${esc(fmtInt(entitlement.grant_units))} ${esc(entitlement.unit_type || 'Token')}">${fmtQuota(entitlement.grant_units)}<small> ${esc(entitlement.unit_type || 'Token')}</small></strong><span>${esc(entitlement.show_name || entitlement.meter || '')}</span></div>`).join('') || '<span class="muted">额度以 ZCode 为准</span>'}</div>
-    <button type="button" class="btn primary" data-claim="${esc(preview.account_id)}" data-plan="${esc(plan.plan_id)}" aria-label="立即手动领取 ${esc(account.platform_name || '当前账号')} 的每日免费 Token">立即领取</button>
+    <button type="button" class="btn primary" data-claim="${esc(preview.account_id)}" data-plan="${esc(plan.plan_id)}" aria-label="领取 ${esc(account.platform_name || '当前账号')} 的每日免费 Token">领取</button>
   </div>`).join('');
 }
 
@@ -285,30 +285,48 @@ function setupTimeField(main, hooks) {
   const input = $('#claims-time', main);
   const trigger = $('#claims-time-trigger', main);
   const pop = $('#claims-time-pop', main);
+  if (typeof pop.showPopover === 'function') pop.setAttribute('popover', 'manual');
   for (const [unit, count] of [['hour', 24], ['minute', 60]]) {
     $(`.time-field-col[data-unit="${unit}"]`, pop).innerHTML = Array.from({ length: count }, (_, i) =>
       `<button type="button" class="time-option" data-value="${timePad2(i)}" aria-label="${i} ${unit === 'hour' ? '点' : '分'}">${timePad2(i)}</button>`).join('');
   }
-  const isOpen = () => pop.classList.contains('open');
+  const isOpen = () => !pop.hidden;
   const highlight = () => {
     const current = normalizeDailyTime(input.value, hooks.fallback()) || hooks.fallback();
     const [hour, minute] = current.split(':');
     for (const col of $$('.time-field-col', pop)) {
       const target = col.dataset.unit === 'hour' ? hour : minute;
-      for (const option of $$('.time-option', col)) option.classList.toggle('selected', option.dataset.value === target);
+      for (const option of $$('.time-option', col)) {
+        const selected = option.dataset.value === target;
+        option.classList.toggle('selected', selected);
+        option.setAttribute('aria-pressed', String(selected));
+        option.tabIndex = selected ? 0 : -1;
+      }
     }
   };
   function open() {
     if (trigger.disabled) return;
+    openSelection?.close();
+    closeHint();
+    pop.hidden = false;
+    if (pop.hasAttribute('popover')) pop.showPopover();
+    else document.body.appendChild(pop);
+    openSelection = { trigger, wrapper: field, list: pop, close };
+    trigger.setAttribute('aria-expanded', 'true');
     highlight();
+    positionFloatingPanel(pop, field, true);
     for (const option of $$('.time-option.selected', pop)) {
       const col = option.parentElement;
       col.scrollTop = option.offsetTop - (col.clientHeight - option.offsetHeight) / 2;
     }
-    pop.classList.add('open');
-    trigger.setAttribute('aria-expanded', 'true');
   }
-  const close = () => { pop.classList.remove('open'); trigger.setAttribute('aria-expanded', 'false'); };
+  function close() {
+    if (pop.hasAttribute('popover') && pop.matches(':popover-open')) pop.hidePopover();
+    pop.hidden = true;
+    if (pop.parentElement !== field) field.appendChild(pop);
+    trigger.setAttribute('aria-expanded', 'false');
+    if (openSelection?.trigger === trigger) openSelection = null;
+  }
   async function commit() {
     const time = normalizeDailyTime(input.value, hooks.fallback());
     if (!time) { input.value = hooks.fallback(); toast('时间须为 00:00–23:59', 'err'); return; }
@@ -328,9 +346,27 @@ function setupTimeField(main, hooks) {
     input.value = option.closest('.time-field-col').dataset.unit === 'hour'
       ? `${option.dataset.value}:${minute}` : `${hour}:${option.dataset.value}`;
     close();
+    trigger.focus();
     commit();
   });
-  pop.addEventListener('keydown', event => { if (event.key === 'Escape') { close(); input.focus(); } });
+  trigger.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && isOpen()) { event.preventDefault(); event.stopPropagation(); close(); }
+    else if (event.key === 'ArrowDown') { event.preventDefault(); if (!isOpen()) open(); $('.time-option.selected', pop)?.focus(); }
+  });
+  pop.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(); trigger.focus(); return; }
+    const option = event.target.closest('.time-option');
+    if (!option) return;
+    const col = option.parentElement, options = $$('.time-option', col), index = options.indexOf(option);
+    let next;
+    if (event.key === 'ArrowUp') next = options[Math.max(0, index - 1)];
+    else if (event.key === 'ArrowDown') next = options[Math.min(options.length - 1, index + 1)];
+    else if (event.key === 'Home') next = options[0];
+    else if (event.key === 'End') next = options.at(-1);
+    else if (event.key === 'ArrowRight') next = col.nextElementSibling?.querySelector('.selected');
+    else if (event.key === 'ArrowLeft') next = col.previousElementSibling?.querySelector('.selected');
+    if (next) { event.preventDefault(); next.focus(); }
+  });
   input.addEventListener('input', () => {
     const draft = formatTimeDraft(String(input.value).replace(/\D/g, '').slice(0, 4));
     if (input.value !== draft) input.value = draft;
@@ -348,11 +384,6 @@ function setupTimeField(main, hooks) {
     }
   });
   input.addEventListener('blur', () => { if (input.value !== hooks.fallback()) commit(); });
-  const dismiss = event => {
-    if (!main.contains(field)) { document.removeEventListener('pointerdown', dismiss); return; }
-    if (!field.contains(event.target)) close();
-  };
-  document.addEventListener('pointerdown', dismiss);
   return { highlight, close };
 }
 
@@ -364,7 +395,7 @@ async function pageClaims(main) {
   const pageSize = 8;
   main.innerHTML = `${pagehead('领卡中心', '', '<button type="button" class="btn" id="claims-refresh">' + icon('refresh', 14) + '刷新</button>')}
     <section class="daily-claim-card fade-up" aria-labelledby="daily-claim-title">
-      <header class="daily-claim-header"><div class="daily-claim-title"><span class="daily-claim-icon">${icon('gift', 22)}</span><div><h2 id="daily-claim-title">每日免费 Token</h2><span>每日 19:00 开放 · 北京时间</span></div></div><div class="daily-claim-actions"><div class="daily-claim-schedule"><span class="time-field" id="claims-time-field"><input id="claims-time" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="5" value="19:02" disabled aria-label="每日浏览器定时领取时间（北京时间）"><button type="button" class="time-field-trigger" id="claims-time-trigger" aria-label="选择定时领取时间" aria-expanded="false" aria-haspopup="dialog" disabled>${icon('timer', 13)}</button><span class="time-field-pop" id="claims-time-pop" role="dialog" aria-label="选择定时领取时间"><span class="time-field-col" data-unit="hour" role="group" aria-label="小时"></span><span class="time-field-col" data-unit="minute" role="group" aria-label="分钟"></span></span></span><label for="claims-schedule">浏览器定时领取<input id="claims-schedule" type="checkbox" role="switch" disabled></label><span id="claims-schedule-info">${infoTip('定时领卡固定使用服务端真实浏览器，需在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖。服务需保持运行，网页可关闭。“立即领取”和“全部立即领取”使用手动领卡设置。', '定时领取')}</span></div><button type="button" class="btn primary" id="claims-all" disabled>全部立即领取</button></div></header>
+      <header class="daily-claim-header"><div class="daily-claim-title"><span class="daily-claim-icon">${icon('gift', 22)}</span><div><h2 id="daily-claim-title">每日免费 Token</h2><span>每日 19:00 开放 · 北京时间</span></div></div><div class="daily-claim-actions"><div class="daily-claim-schedule"><span class="time-field control-compact" id="claims-time-field"><input id="claims-time" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="5" value="19:02" disabled aria-label="每日浏览器定时领取时间（北京时间）"><button type="button" class="time-field-trigger" id="claims-time-trigger" aria-label="选择定时领取时间" aria-expanded="false" aria-haspopup="dialog" aria-controls="claims-time-pop" disabled>${icon('timer', 13)}</button><span class="time-field-pop control-compact" id="claims-time-pop" hidden role="dialog" aria-label="选择定时领取时间"><span class="time-field-col" data-unit="hour" role="group" aria-label="小时"></span><span class="time-field-col" data-unit="minute" role="group" aria-label="分钟"></span></span></span><label for="claims-schedule">浏览器定时领取<input id="claims-schedule" type="checkbox" role="switch" disabled></label><span id="claims-schedule-info">${infoTip('定时领卡固定使用服务端真实浏览器，需在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖。服务需保持运行，网页可关闭。“领取”和“全部领取”使用手动领卡设置。', '定时领取')}</span></div><button type="button" class="btn primary" id="claims-all" disabled>全部领取</button></div></header>
       <div id="claims-content" aria-busy="true"><div class="skeleton-block"></div></div>
       <footer class="daily-claim-footer"><span id="claims-update" class="result-count" aria-live="polite">正在查询…</span><div id="claims-notice"></div><nav class="pager" id="claims-pages" aria-label="可领取账号分页" hidden></nav></footer>
     </section>`;
@@ -383,11 +414,11 @@ async function pageClaims(main) {
     $('#claims-time-trigger', main).disabled = busy || loading || scheduleSaving || !schedule;
     const allButton = $('#claims-all', main);
     allButton.disabled = busy || loading || scheduleSaving || !total;
-    allButton.textContent = busy ? `正在领取（剩余 ${pendingClaims.size}）` : total ? `全部立即领取（${total}）` : '全部立即领取';
+    allButton.textContent = busy ? `正在领取（剩余 ${pendingClaims.size}）` : total ? `全部领取（${total}）` : '全部领取';
     $$('button[data-claim]', content).forEach(button => {
       const entry = pendingClaims.get(claimKey({ account_id: button.dataset.claim, plan_id: button.dataset.plan }));
       button.disabled = loading || scheduleSaving || batchRunning || pendingAccounts.has(button.dataset.claim);
-      button.textContent = entry ? entry.running ? '正在领取…' : '等待领取…' : '立即领取';
+      button.textContent = entry ? entry.running ? '正在领取…' : '等待领取…' : '领取';
       button.setAttribute('aria-busy', String(!!entry?.running));
     });
   };
@@ -397,7 +428,7 @@ async function pageClaims(main) {
     const time = schedule?.time || '19:02';
     $('#claims-time', main).value = time;
     timeField.highlight();
-    const details = [`每日北京时间 ${time} 固定使用服务端真实浏览器领取；服务需保持运行，网页可关闭。请在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖，浏览器缺失或启动失败时不执行领取。`, '可重试的失败在计划时间起 10 分钟内恢复一次，仍失败则等待次日。需要人工验证时，请点击“立即领取”；“全部立即领取”也使用手动领卡设置。'];
+    const details = [`每日北京时间 ${time} 固定使用服务端真实浏览器领取；服务需保持运行，网页可关闭。请在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖，浏览器缺失或启动失败时不执行领取。`, '可重试的失败在计划时间起 10 分钟内恢复一次，仍失败则等待次日。需要人工验证时，请点击“领取”；“全部领取”也使用手动领卡设置。'];
     if (schedule?.browser_window) {
       const window = schedule.browser_window;
       const clock = value => new Date(value).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit' });

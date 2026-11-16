@@ -333,7 +333,11 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 		if err != nil {
 			return nil, &Failure{Message: err.Error()}
 		}
-		token := str(a.tokens(str(account["id"]))["zcode_jwt"])
+		tokens := a.tokens(str(account["id"]))
+		if loginJWTExpired(tokens) {
+			return nil, &Failure{Kind: "auth", Code: "login_expired", Status: 401, Message: "ZCode 登录已过期，请重新授权"}
+		}
+		token := tokens["zcode_jwt"]
 		if failure := validateCaptchaRequestToken(verification, account, token); failure != nil {
 			return nil, failure
 		}

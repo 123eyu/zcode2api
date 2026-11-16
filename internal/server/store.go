@@ -185,7 +185,12 @@ func decrypt(s, secret string) (string, error) {
 	if !strings.HasPrefix(s, "enc:v1:") {
 		return s, nil
 	}
-	parts := strings.Split(strings.TrimPrefix(s, "enc:v1:"), ".")
+	k := sha256.Sum256([]byte(secret))
+	return decryptCredentialPayload(strings.TrimPrefix(s, "enc:v1:"), k[:])
+}
+
+func decryptCredentialPayload(payload string, key []byte) (string, error) {
+	parts := strings.Split(payload, ".")
 	if len(parts) != 3 {
 		return "", errors.New("凭据格式无效")
 	}
@@ -205,9 +210,14 @@ func decrypt(s, secret string) (string, error) {
 	if len(iv) != 12 || len(tag) != 16 {
 		return "", fmt.Errorf("凭据长度无效")
 	}
-	k := sha256.Sum256([]byte(secret))
-	b, _ := aes.NewCipher(k[:])
-	g, _ := cipher.NewGCM(b)
+	b, e := aes.NewCipher(key)
+	if e != nil {
+		return "", e
+	}
+	g, e := cipher.NewGCM(b)
+	if e != nil {
+		return "", e
+	}
 	v, e := g.Open(nil, iv, append(ct, tag...), nil)
 	return string(v), e
 }

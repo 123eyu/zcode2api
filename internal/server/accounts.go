@@ -4,10 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"os"
-	"os/user"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -45,21 +41,15 @@ func (a *App) accountTokens(r M) map[string]string {
 	return out
 }
 func (a *App) setTokens(id string, m M) error {
+	a.credentialMu.Lock()
+	defer a.credentialMu.Unlock()
 	r := a.account(id)
 	if r == nil {
 		return fmt.Errorf("账号不存在")
 	}
-	enc := obj(parse(r["enc_tokens"], nil))
-	for k, v := range m {
-		if v == nil {
-			delete(enc, k)
-			continue
-		}
-		s, e := encrypt(str(v), a.secret)
-		if e != nil {
-			return e
-		}
-		enc[k] = s
+	enc, err := a.encryptedTokenChanges(r, m)
+	if err != nil {
+		return err
 	}
 	return a.updateAccount(id, M{"enc_tokens": enc})
 }
@@ -113,12 +103,6 @@ func jwtPayload(s string) M {
 	m, _ := v.(map[string]any)
 	return m
 }
-func family(v any) string {
-	if strings.Contains(lower(v), "zai") || lower(v) == "z.ai" {
-		return "zai"
-	}
-	return "bigmodel"
-}
 func (a *App) publicAccount(r M) M {
 	m := clone(r)
 	tokens := obj(parse(m["enc_tokens"], nil))
@@ -128,6 +112,10 @@ func (a *App) publicAccount(r M) M {
 		kinds = append(kinds, k)
 	}
 	m["token_kinds"] = kinds
+	plain := a.accountTokens(r)
+	m["login_provider"] = loginProvider(str(r["family"]), plain)
+	m["business_customer_id"] = nullable(plain["business_customer_id"])
+	m["zcode_jwt_expires_at"] = optionalExpiry(jwtExpiresAt(plain["zcode_jwt"]))
 	for _, k := range []string{"zcode_jwt", "web_jwt", "business_token"} {
 		m["has_"+k] = truth(tokens[k])
 	}
@@ -138,6 +126,9 @@ func (a *App) publicAccount(r M) M {
 }
 func (a *App) fetchBalanceUpstream(ctx context.Context, r M) (M, error) {
 	t := a.accountTokens(r)
+	if loginJWTExpired(t) {
+		return M{"ok": false, "authFailed": true, "httpStatus": 401, "failure_kind": "auth", "error_code": "login_expired", "reason": "ZCode 登录已过期，请重新授权"}, nil
+	}
 	res, e := a.api(ctx, r, "GET", "/api/v1/zcode-plan/billing/balance?app_version="+str(a.configValue("app_version")), str(t["zcode_jwt"]), nil, M{"X-Device-Mid": r["device_mid"], "X-Request-Id": uuid()}, a.jar(str(r["id"])))
 	if e != nil {
 		return nil, e
@@ -203,20 +194,20 @@ func secondsMS(v any) any {
 	}
 	return integer(v) * 1000
 }
-func (a *App) applyBalance(r, b M, snapshot bool) {
+func (a *App) applyBalance(r, b M, snapshot bool) bool {
 	if !truth(b["ok"]) {
-		return
+		return false
 	}
 	id := str(r["id"])
 	a.balances.applyMu.Lock()
 	defer a.balances.applyMu.Unlock()
 	r = a.account(id)
 	if r == nil || r["status"] == "disabled" || !a.balanceResultCurrent(r, b) {
-		return
+		return false
 	}
 	sequence := uint64(integer(b["_balance_sequence"]))
 	if sequence > 0 && sequence < a.balances.applied[id] {
-		return
+		return false
 	}
 	fields := M{"status": "active", "zcode_jwt_last_ok_at": nowMS(), "last_ok_at": nowMS(), "fail_streak": 0, "last_error": nil, "capabilities": b["capabilities"], "last_balance": b["raw"], "card_expires_at": nil}
 	if c := obj(b["card"]); len(c) > 0 {
@@ -235,7 +226,7 @@ func (a *App) applyBalance(r, b M, snapshot bool) {
 	}
 	if changed || nowMS()-integer(r["last_ok_at"]) >= balanceSnapshotBaseline.Milliseconds() {
 		if err := a.updateAccount(id, fields); err != nil {
-			return
+			return false
 		}
 	}
 	if sequence > 0 {
@@ -258,9 +249,13 @@ func (a *App) applyBalance(r, b M, snapshot bool) {
 			a.log.Printf("余额快照保存失败: %v", err)
 		}
 	}
+	return true
 }
 func (a *App) verify(ctx context.Context, r M) (M, error) {
 	id := str(r["id"])
+	if r["status"] == "disabled" {
+		return M{"ok": false, "status": "disabled", "reason": "账号已停用"}, nil
+	}
 	t := a.accountTokens(r)
 	if !truth(t["zcode_jwt"]) {
 		if truth(t["web_jwt"]) {
@@ -269,7 +264,7 @@ func (a *App) verify(ctx context.Context, r M) (M, error) {
 				return nil, e
 			}
 			if res.OK {
-				_ = a.updateAccount(id, M{"status": "web_only", "last_ok_at": nowMS(), "last_error": nil})
+				a.updateAccountStatusIfCurrent(r, nil, M{"status": "web_only", "last_ok_at": nowMS(), "last_error": nil})
 			}
 			return M{"ok": res.OK, "status": "web_only", "reason": "网页会话不可用于推理"}, nil
 		}
@@ -280,7 +275,9 @@ func (a *App) verify(ctx context.Context, r M) (M, error) {
 		return nil, e
 	}
 	if truth(bal["ok"]) {
-		a.applyBalance(r, bal, true)
+		if !a.applyBalance(r, bal, true) {
+			return M{"ok": false, "status": a.account(id)["status"], "reason": "账号已更新，请重新验证"}, nil
+		}
 		publicBalance := clone(bal)
 		delete(publicBalance, "_balance_scope")
 		delete(publicBalance, "_balance_generation")
@@ -294,113 +291,12 @@ func (a *App) verify(ctx context.Context, r M) (M, error) {
 	if truth(bal["authFailed"]) {
 		status = "needs_relogin"
 	}
-	reason := fmt.Sprintf("balance HTTP %v", bal["httpStatus"])
-	_ = a.updateAccount(id, M{"status": status, "last_error": reason, "fail_streak": integer(r["fail_streak"]) + 1})
+	reason := str(fallback(bal["reason"], fmt.Sprintf("balance HTTP %v", bal["httpStatus"])))
+	if !a.updateAccountStatusIfCurrent(r, bal, M{"status": status, "last_error": reason, "fail_streak": integer(r["fail_streak"]) + 1}) {
+		return M{"ok": false, "status": a.account(id)["status"], "reason": "账号已更新，请重新验证"}, nil
+	}
 	return M{"ok": false, "status": status, "reason": reason}, nil
 }
-func (a *App) importLocal(ctx context.Context, b M) (M, error) {
-	home, _ := os.UserHomeDir()
-	p := filepath.Join(home, ".zcode", "v2", "credentials.json")
-	data, e := os.ReadFile(p)
-	if e != nil {
-		return M{"ok": false, "error": "本机未找到客户端凭据 " + p, "results": []any{}}, nil
-	}
-	u, _ := user.Current()
-	username := "unknown"
-	if u != nil {
-		username = u.Username
-		if i := strings.LastIndex(username, "\\"); i >= 0 {
-			username = username[i+1:]
-		}
-	}
-	platform := runtime.GOOS
-	if platform == "windows" {
-		platform = "win32"
-	}
-	secret := "zcode-credential-fallback:" + platform + ":" + home + ":" + username
-	tokens := M{}
-	for k, v := range obj(parse(string(data), nil)) {
-		slot := map[string]string{"zcodejwttoken": "zcode_jwt", "oauth:bigmodel:access_token": "business_token", "oauth:zai:access_token": "business_token", "oauth:active_provider": "active_provider"}[k]
-		if slot == "" || !strings.HasPrefix(str(v), "enc:v1:") {
-			continue
-		}
-		if plain, e := decrypt(str(v), secret); e == nil {
-			tokens[slot] = plain
-		}
-	}
-	if !truth(tokens["zcode_jwt"]) {
-		return M{"ok": false, "results": []any{M{"ok": false, "reason": "凭据中无可解密的 zcodejwttoken"}}}, nil
-	}
-	customer := jwtPayload(str(tokens["zcode_jwt"]))["user_id"]
-	if dup := a.row("SELECT id FROM accounts WHERE customer_id=?", customer); dup != nil {
-		return M{"ok": false, "results": []any{M{"ok": false, "reason": "账号已存在", "existing": dup["id"]}}}, nil
-	}
-	device := uuid()
-	if d, e := os.ReadFile(filepath.Join(home, ".zcode", "v2", "telemetry-state.json")); e == nil {
-		device = str(fallback(obj(parse(string(d), nil))["deviceMid"], device))
-	}
-	r, e := a.insertAccount(M{"label": fallback(b["label"], "本机-"+family(tokens["active_provider"])), "family": family(tokens["active_provider"]), "customer_id": customer, "source": "local", "device_mid": device}, tokens)
-	if e != nil {
-		return nil, e
-	}
-	result, e := a.verify(ctx, r)
-	if e != nil {
-		result = M{"ok": false, "reason": e.Error(), "status": "unverified"}
-	}
-	result["id"] = r["id"]
-	a.scheduleNext(str(r["id"]), time.Second)
-	n := 0
-	if truth(result["ok"]) {
-		n = 1
-	}
-	return M{"ok": n > 0, "imported": n, "results": []any{result}}, nil
-}
-func (a *App) importCookie(ctx context.Context, b M, target M) (M, error) {
-	token := strings.TrimSpace(str(b["webJwt"]))
-	p := jwtPayload(token)
-	if p == nil || (p["user_id"] != nil && p["user_channel"] == nil) {
-		return M{"ok": false, "error": "请输入有效的网页会话 JWT；客户端凭据请使用本机导入/OAuth"}, nil
-	}
-	identity := nullable(first(p["customer_id"], p["user_id"]))
-	expiry := first(nullable(b["expiresAt"]), secondsMS(p["exp"]))
-	if expiry != nil && integer(expiry) <= nowMS() {
-		return M{"ok": false, "error": "Cookie 到期时间无效或已过期"}, nil
-	}
-	if truth(p["exp"]) && integer(p["exp"])*1000 <= nowMS() {
-		return M{"ok": false, "error": "网页 JWT 已过期"}, nil
-	}
-	f := family(b["family"])
-	if target != nil {
-		f = str(target["family"])
-		if !truth(target["customer_id"]) || identity == nil || str(identity) != str(target["customer_id"]) {
-			return M{"ok": false, "error": "Cookie 与账号身份不一致，未更新"}, nil
-		}
-	}
-	res, e := a.customer(ctx, M{"family": f, "proxy_url": target["proxy_url"]}, token)
-	if e != nil {
-		return nil, e
-	}
-	if !res.OK {
-		return M{"ok": false, "error": "网页会话验证失败"}, nil
-	}
-	if target != nil {
-		e = a.setTokens(str(target["id"]), M{"web_jwt": token})
-		if e == nil {
-			e = a.updateAccount(str(target["id"]), M{"web_cookie_expires_at": expiry, "last_ok_at": nowMS(), "last_error": nil})
-		}
-		return M{"ok": e == nil, "expires_at": expiry}, e
-	}
-	if identity != nil && a.row("SELECT id FROM accounts WHERE family=? AND customer_id=?", f, identity) != nil {
-		return M{"ok": false, "error": "账号已存在，请使用续期更新 Cookie"}, nil
-	}
-	r, e := a.insertAccount(M{"family": f, "label": fallback(b["label"], "Cookie-"+f), "customer_id": identity, "status": "web_only", "source": "cookie", "web_cookie_expires_at": expiry}, M{"web_jwt": token})
-	if e != nil {
-		return nil, e
-	}
-	a.scheduleNext(str(r["id"]), time.Second)
-	return M{"ok": true, "id": r["id"], "status": "web_only"}, nil
-}
-
 func balanceData(r M) M { return balancePayload(parse(r["last_balance"], nil)) }
 
 func balancePayload(value any) M {

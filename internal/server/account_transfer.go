@@ -98,6 +98,10 @@ func (entry *transferAccount) validate() error {
 	if entry.Family != "bigmodel" && entry.Family != "zai" {
 		return fmt.Errorf("账号平台无效")
 	}
+	provider := loginProvider(entry.Family, entry.Tokens)
+	if !validLoginProvider(provider) || loginFamily(provider) != entry.Family {
+		return fmt.Errorf("登录渠道与账号平台不匹配")
+	}
 	if len([]rune(entry.Label)) > 200 || len(entry.CustomerID) > 512 || len(entry.DeviceMid) > 512 || strings.ContainsAny(entry.DeviceMid, "\r\n\x00") {
 		return fmt.Errorf("账号信息格式无效")
 	}
@@ -105,7 +109,7 @@ func (entry *transferAccount) validate() error {
 		return fmt.Errorf("账号凭据无效")
 	}
 	for key, value := range entry.Tokens {
-		if key == "" || len(key) > 100 || len(value) > 128<<10 || strings.ContainsAny(value, "\r\n\x00") || strings.HasPrefix(value, "enc:v1:") {
+		if key == "" || len(key) > 100 || len(value) > 128<<10 || strings.ContainsAny(value, "\r\n\x00") || strings.HasPrefix(value, "enc:") {
 			return fmt.Errorf("账号凭据格式无效，请使用导出的 JSON 文件")
 		}
 	}
@@ -115,6 +119,9 @@ func (entry *transferAccount) validate() error {
 	identity := ""
 	if token := entry.Tokens["zcode_jwt"]; token != "" {
 		identity = str(jwtPayload(token)["user_id"])
+		if entry.Tokens["active_provider"] != "" && (identity == "" || len(strings.Split(token, ".")) != 3) {
+			return fmt.Errorf("缺少有效的 ZCode 登录身份")
+		}
 	} else {
 		payload := jwtPayload(entry.Tokens["web_jwt"])
 		identity = str(first(payload["customer_id"], payload["user_id"]))
@@ -124,6 +131,28 @@ func (entry *transferAccount) validate() error {
 			return fmt.Errorf("账号 ID 与凭据不一致")
 		}
 		entry.CustomerID = identity
+	}
+	if raw := entry.Tokens["provider_user_info"]; raw != "" {
+		var profile M
+		if json.Unmarshal([]byte(raw), &profile) != nil || profile == nil || truth(profile["user_id"]) && str(profile["user_id"]) != identity {
+			return fmt.Errorf("用户资料与登录身份不一致")
+		}
+		entry.Tokens["provider_user_info"] = js(loginProfile(profile))
+	}
+	if raw := entry.Tokens["linked_bigmodel"]; raw != "" {
+		var linked M
+		if json.Unmarshal([]byte(raw), &linked) != nil || identity == "" || str(linked["userId"]) != identity || str(linked["customerId"]) == "" || str(linked["accessToken"]) == "" {
+			return fmt.Errorf("BigModel 关联凭据与登录身份不一致")
+		}
+		if provider == "zai_cn" && (entry.Tokens["business_token"] != "" && entry.Tokens["business_token"] != str(linked["accessToken"]) || entry.Tokens["business_customer_id"] != "" && entry.Tokens["business_customer_id"] != str(linked["customerId"])) {
+			return fmt.Errorf("BigModel 关联与业务凭据不一致")
+		}
+	}
+	if kind := entry.Tokens["provider_access_kind"]; kind != "" && kind != "business" && kind != "oauth" {
+		return fmt.Errorf("渠道凭据类型无效")
+	}
+	if provider == "zai" && entry.Tokens["provider_access_kind"] == "oauth" && entry.Tokens["oauth_access"] != "" && entry.Tokens["oauth_access"] != entry.Tokens["provider_access_token"] {
+		return fmt.Errorf("Z.ai OAuth 凭据不一致")
 	}
 	for _, expiry := range []*int64{entry.WebCookieExpiresAt, entry.BusinessTokenExpiresAt} {
 		if expiry != nil && (*expiry < 0 || *expiry > 9007199254740991) {
@@ -135,12 +164,13 @@ func (entry *transferAccount) validate() error {
 
 func (entry transferAccount) identityKeys() []string {
 	keys := []string{}
+	provider := loginProvider(entry.Family, entry.Tokens)
 	if entry.CustomerID != "" {
-		keys = append(keys, entry.Family+":id:"+entry.CustomerID)
+		keys = append(keys, provider+":id:"+entry.CustomerID)
 	}
 	for _, kind := range []string{"zcode_jwt", "web_jwt", "business_token"} {
 		if token := entry.Tokens[kind]; token != "" {
-			keys = append(keys, entry.Family+":"+kind+":"+hash(token))
+			keys = append(keys, provider+":"+kind+":"+hash(token))
 		}
 	}
 	return keys
@@ -164,6 +194,8 @@ func (a *App) importAccounts(ctx context.Context, b M) (any, int, error) {
 		return adminError(400, "目标分组无效")
 	}
 	appVersion := str(a.configValue("app_version"))
+	a.credentialMu.Lock()
+	defer a.credentialMu.Unlock()
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, 500, err
