@@ -35,8 +35,10 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 	if o.Timing == nil {
 		o.Timing = newTiming()
 	}
+	o.Recovery = &poolRecoveryLease{}
+	defer a.releasePoolRecovery(o.Recovery)
 	p := a.retryParams()
-	remainingBudget := max(10*time.Second, shared.Ms(p["total_budget_ms"]))
+	budgetDeadline := time.Now().Add(max(10*time.Second, shared.Ms(p["total_budget_ms"])))
 	var throttleDeadline time.Time
 	excluded, round := map[string]bool{}, map[string]bool{}
 	throttled := map[string]time.Time{}
@@ -60,6 +62,10 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 		if ctx.Err() != nil {
 			f = &fault.Failure{Kind: "canceled", Code: "canceled", Message: "客户端已断开", Detail: fault.FailureDetail(f)}
 		}
+		if f.LocalOnly && last != nil && !last.LocalOnly {
+			f.Detail = fault.FailureDetail(f)
+			f.Detail["last_upstream_error"] = fault.FailureDetail(last)
+		}
 		f.Attempts = attempts
 		if len(throttled) > 0 && (f.Kind == "busy" || f.Kind == "rate_limit" || f.Kind == "overload") {
 			remaining := 24 * time.Hour
@@ -81,13 +87,16 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 		if ctx.Err() != nil {
 			return fail(nil)
 		}
-		deadline := time.Now().Add(remainingBudget)
+		deadline := budgetDeadline
 		if !throttleDeadline.IsZero() {
-			deadline = throttleDeadline
-			if !time.Now().Before(deadline) {
+			if throttleDeadline.Before(deadline) {
+				deadline = throttleDeadline
+			}
+			if !time.Now().Before(throttleDeadline) {
 				return fail(lastThrottle)
 			}
-		} else if remainingBudget <= 0 {
+		}
+		if !time.Now().Before(deadline) {
 			if last == nil {
 				last = &fault.Failure{Kind: "timeout", Code: "retry_budget_exhausted", Message: "故障重试超时"}
 			}
@@ -99,7 +108,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 		}
 		// A queued busy account must not hide another account's recovery or
 		// extend an already active throttle window.
-		o.RecheckAt = throttleDeadline
+		o.RecheckAt = deadline
 		now := time.Now()
 		for id, t := range throttled {
 			if throttleDeadline.IsZero() || t.After(now) || round[id] {
@@ -110,33 +119,32 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 			}
 		}
 		start := time.Now()
-		o.Admission = 0
-		if !throttleDeadline.IsZero() {
-			o.Admission = max(time.Millisecond, time.Until(throttleDeadline))
-		}
 		account, busy, candidates, policy, e := a.acquire(ctx, o, skip, max(0, min(busyWait(p), time.Until(deadline))))
 		o.Timing.queue += time.Since(start)
+		var picked any
+		if account != nil {
+			picked = account["id"]
+		}
+		_ = a.exec("INSERT INTO schedule_log(ts,request_id,chain,candidates,policy,picked) VALUES(?,?,?,?,?,?)", shared.NowMS(), o.ID, shared.JSON(a.keyChain(o.Key)), shared.JSON(candidates), policy, picked)
 		if e != nil {
 			if f, ok := e.(*fault.Failure); ok {
 				return fail(f)
 			}
 			return fail(nil)
 		}
-		var picked any
-		if account != nil {
-			picked = account["id"]
-		}
-		_ = a.exec("INSERT INTO schedule_log(ts,request_id,chain,candidates,policy,picked) VALUES(?,?,?,?,?,?)", shared.NowMS(), o.ID, shared.JSON(a.keyChain(o.Key)), shared.JSON(candidates), policy, picked)
-		if !throttleDeadline.IsZero() && !time.Now().Before(throttleDeadline) {
+		if !time.Now().Before(deadline) {
 			if account != nil {
 				a.finishAccountAttempt(account, nil, false, nil)
 			}
-			return fail(lastThrottle)
+			if last != nil {
+				return fail(last)
+			}
+			return fail(&fault.Failure{Kind: "timeout", Code: "retry_budget_exhausted", Message: "故障重试超时"})
 		}
 		if account == nil {
 			if len(throttled) > 0 {
 				if throttleDeadline.IsZero() {
-					throttleDeadline = time.Now().Add(10 * time.Second)
+					throttleDeadline = time.Now().Add(min(10*time.Second, time.Until(budgetDeadline)))
 					continue
 				}
 				if len(round) > 0 {
@@ -167,13 +175,11 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 			rotated = append(rotated, id)
 		}
 		lastAccount = account
-		attempts++
-		o.Admission = 0
-		if !throttleDeadline.IsZero() {
-			o.Admission = max(time.Millisecond, time.Until(throttleDeadline))
-		}
+		o.Admission = max(time.Millisecond, time.Until(deadline))
 		o.OnAdmitted = func() { a.admitAccount(account) }
-		attemptStart := time.Now()
+		// Count real model HTTP attempts, including verification resubmissions;
+		// scheduler/SDK admission refusals must not inflate usage statistics.
+		o.OnAttempt = func() { attempts++ }
 		result, f := a.inferHTTP(ctx, account, o)
 		if f != nil && fault.Classify(f).Kind == "quota" {
 			// Publish exhaustion before releasing the slot and waking queued requests.
@@ -206,12 +212,19 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 			return fail(f)
 		}
 		switch f.Kind {
+		case "risk":
+			if !f.ProxyFailover && (f.Code == "captcha_risk_blocked" || f.Code == "F001" || f.Code == "upstream_waf_blocked") {
+				// A different account may use an independent exit/SDK scope.
+				// Shared scopes are rejected locally by admission, never re-sent.
+				excluded[id] = true
+				clearThrottle(id)
+				continue
+			}
 		case "account_risk":
 			// Shared admission already cooled this account. It remains enabled;
 			// this request may use another account within its existing budget.
 			excluded[id] = true
 			clearThrottle(id)
-			remainingBudget -= time.Since(attemptStart)
 			continue
 		case "auth":
 			if a.updateAccountStatusIfCurrent(account, nil, shared.M{"status": "needs_relogin", "fail_streak": shared.Integer(account["fail_streak"]) + 1, "last_error": "ZCode 登录鉴权失效，请重新授权"}) {
@@ -234,7 +247,8 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 			})
 			continue
 		case "busy":
-			// Account concurrency does not consume the ordinary retry budget.
+			// Busy responses do not consume the ordinary attempt count, but
+			// still share the overall admission deadline.
 			clearThrottle(id)
 			continue
 		case "rate_limit", "overload":
@@ -250,8 +264,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 		if !f.Retryable {
 			return fail(f)
 		}
-		remainingBudget -= time.Since(attemptStart)
-		if remainingBudget <= 0 {
+		if !time.Now().Before(deadline) {
 			return fail(f)
 		}
 		regular++
@@ -271,11 +284,9 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 		if shared.Truth(p["jitter"]) {
 			delay *= 0.8 + rand.Float64()*0.4
 		}
-		delayStart := time.Now()
-		if wait(min(shared.Ms(delay), remainingBudget, max(0, time.Until(deadline)))) != nil {
+		if wait(min(shared.Ms(delay), max(0, time.Until(deadline)))) != nil {
 			return fail(f)
 		}
-		remainingBudget -= time.Since(delayStart)
 	}
 }
 

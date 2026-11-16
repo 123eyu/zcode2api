@@ -63,6 +63,7 @@ type App struct {
 	mu                     sync.Mutex
 	states                 map[string]*accountState
 	upstreamCooldowns      map[string]*upstreamCooldown
+	cooldownEpochs         map[string]uint64
 	cooldownGeneration     uint64
 	available              chan struct{}
 	scheduleMu             sync.Mutex
@@ -180,6 +181,7 @@ func New(root, data string, web fs.FS, buildVersion string) (*App, error) {
 	}
 	a.ensureGroups()
 	a.restoreProxyState()
+	a.restoreUpstreamCooldowns()
 	a.background(a.runAccountQueue)
 	return a, nil
 }

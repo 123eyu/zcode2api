@@ -176,7 +176,7 @@ func (manager *outboundProxyManager) selectAvailableEndpointLocked(now time.Time
 
 // A route failure changes the shared selection, never an in-flight pinned exit.
 func (a *App) prepareProxyFailover(ctx context.Context, failure *fault.Failure) {
-	if failure == nil || ctx.Err() != nil {
+	if failure == nil || failure.LocalOnly || ctx.Err() != nil {
 		return
 	}
 	blocked := failure.Code == "upstream_waf_blocked"
@@ -226,7 +226,9 @@ func (a *App) markProxyRoute(ctx context.Context, blocked bool, retryAfter time.
 	reason := "代理连接失败"
 	if blocked {
 		reason = "上游安全网关拦截"
-		a.proxies.blocked[selection.Identity] = routing.ProxyCooldownUntil(a.proxies.blocked[selection.Identity], now, 10*time.Minute, 2*time.Hour, retryAfter)
+		// Shared admission owns the 1..64 minute backoff. Applying another
+		// exponential here would compound simultaneous refusals a second time.
+		a.proxies.blocked[selection.Identity] = shared.MaxTime(a.proxies.blocked[selection.Identity], now.Add(max(time.Minute, retryAfter)))
 	} else {
 		a.proxies.retryAt[selection.Identity] = routing.ProxyCooldownUntil(a.proxies.retryAt[selection.Identity], now, 30*time.Second, 5*time.Minute, retryAfter)
 	}

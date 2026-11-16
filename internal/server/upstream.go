@@ -31,9 +31,11 @@ type inferOptions struct {
 	Stream                                   bool
 	OnEvent                                  func(wire.Event) error
 	OnAdmitted                               func()
+	OnAttempt                                func()
 	Timing                                   *requestTiming
 	Admission                                time.Duration
 	RecheckAt                                time.Time
+	Recovery                                 *poolRecoveryLease
 }
 
 type requestTiming struct {
@@ -133,7 +135,7 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 	var admission *time.Timer
 	if o.Admission > 0 {
 		admission = time.AfterFunc(o.Admission, func() {
-			cancel(&fault.Failure{Kind: "rate_limit", Code: "throttle_window_exhausted", Message: "限流重试超时"})
+			cancel(&fault.Failure{Kind: "timeout", Code: "retry_budget_exhausted", Message: "故障重试超时"})
 		})
 		timers = append(timers, admission)
 	}
@@ -215,11 +217,13 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		return nil, routing.AsProxyFailure(e)
 	}
 	defer release()
-	defer func() { a.prepareProxyFailover(ctx, failure) }()
-	ctx, finish, gateFailure := a.beginUpstreamRequest(ctx, a.upstreamScope(ctx, account, a.origin, true))
+	scope := a.upstreamScope(ctx, account, a.origin, true)
+	scope.inference = true
+	ctx, finish, gateFailure := a.beginUpstreamRequest(ctx, scope)
 	if gateFailure != nil {
 		return nil, gateFailure
 	}
+	defer func() { a.prepareProxyFailover(ctx, failure) }()
 	defer func() { finish(failure) }()
 	var verification captchaVerification
 	defer func() {
@@ -261,6 +265,9 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		requestDetail = shared.M{"request_id": req.Header.Get("X-Request-Id"), "trace_id": req.Header.Get("X-Zcode-Trace-Id"), "query_id": req.Header.Get("X-Query-Id"), "session_id": session}
 		requestSecrets = append(requestSecrets, token, req.Header.Get("X-Aliyun-Captcha-Verify-Param"))
 		r.TraceID = req.Header.Get("X-Zcode-Trace-Id")
+		if o.OnAttempt != nil {
+			o.OnAttempt()
+		}
 		res, e = client.Do(req)
 		if e != nil {
 			return nil, routing.TransportFailure(ctx, e)

@@ -44,6 +44,7 @@ var failureCodeMessages = map[string]string{
 	"account_busy":                               "本地排队超时",
 	"queue_full":                                 "本地等待队列已满",
 	"no_account":                                 "无可用账号",
+	"account_pool_cooling":                       "账号池风控冷却中",
 	"proxy_auth_failed":                          "代理认证失败",
 	"proxy_connection_failed":                    "代理连接失败",
 	"proxy_pool_exhausted":                       "代理池暂不可用",

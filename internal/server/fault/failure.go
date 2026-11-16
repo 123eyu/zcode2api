@@ -15,6 +15,7 @@ type Failure struct {
 	RetryAfter           time.Duration
 	Attempts             int
 	CooldownRecorded     bool `json:"-"`
+	LocalOnly            bool `json:"-"` // Admission refused without new upstream evidence.
 }
 
 func (e *Failure) Error() string { return e.Message }

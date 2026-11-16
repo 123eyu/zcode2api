@@ -156,3 +156,12 @@ CREATE TABLE IF NOT EXISTS proxy_state (
   blocked_until INTEGER, -- WAF 拦截冷却截止（epoch ms）
   retry_at INTEGER -- 连接失败冷却截止（epoch ms）
 );
+CREATE TABLE IF NOT EXISTS upstream_cooldowns (
+  scope TEXT PRIMARY KEY,
+  until_ms INTEGER NOT NULL,
+  failures INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  code TEXT NOT NULL,
+  verify_code TEXT NOT NULL,
+  inference INTEGER NOT NULL DEFAULT 0
+);

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	rand "math/rand/v2"
+	"sort"
 	"strings"
 	"time"
 	accountdata "zcode2api/internal/server/account"
@@ -19,6 +20,7 @@ type accountAssignment struct {
 	busy       bool
 	candidates []any
 	policy     string
+	failure    *fault.Failure
 }
 
 type accountWaiter struct {
@@ -38,6 +40,21 @@ type schedulingCandidate struct {
 type schedulingPool struct {
 	group    shared.M
 	accounts []schedulingCandidate
+}
+
+type poolRecoveryLease struct {
+	key        string
+	generation uint64
+}
+
+// Keep one serial recovery round across requests. A canceled caller releases
+// ownership, but the next caller continues with the accounts still unchecked.
+type poolRecoveryRound struct {
+	owner      *poolRecoveryLease
+	checked    map[string]bool
+	allBlocked bool
+	refused    bool
+	retryAt    time.Time
 }
 
 func (a *App) schedulingPools(key shared.M) []schedulingPool {
@@ -90,7 +107,7 @@ func (a *App) schedulingPools(key shared.M) []schedulingPool {
 	return out
 }
 
-func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M, bool, []any, string) {
+func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M, bool, []any, string, *fault.Failure) {
 	params := a.retryParams()
 	now := shared.NowMS()
 	minWindow := int64(shared.Num(shared.Fallback(params["min_request_window_sec"], 60)) * 1000)
@@ -101,8 +118,6 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 			c := &p.accounts[i]
 			r := c.row
 			switch {
-			case excluded[shared.Str(r["id"])]:
-				c.skip = "excluded_for_request"
 			case shared.Str(r["status"]) != "active":
 				c.skip = "status=" + shared.Str(r["status"])
 			case accountdata.LoginJWTExpired(a.accountTokens(r)):
@@ -143,8 +158,61 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	poolKey, poolCooldown := a.accountPoolCooldownLocked(pools, o.Model)
+	if o.Recovery != nil && o.Recovery.key != poolKey {
+		a.releasePoolRecoveryLocked(o.Recovery)
+	}
 	candidates := []any{}
 	busy := false
+	var cooling *fault.Failure
+	if poolCooldown != nil && (time.Now().Before(poolCooldown.until) || poolCooldown.probing && (poolCooldown.recovery == nil || poolCooldown.recovery.owner != o.Recovery)) {
+		for _, pool := range pools {
+			for _, c := range pool.accounts {
+				reason := c.skip
+				if reason == "" {
+					reason = "account_pool_cooling"
+				}
+				candidates = append(candidates, shared.M{"account": c.row["id"], "label": c.row["label"], "skip": reason, "picked": false})
+			}
+		}
+		return nil, false, candidates, "", poolCooldown.refusal()
+	}
+	if poolCooldown != nil {
+		if poolCooldown.recovery == nil {
+			poolCooldown.recovery = &poolRecoveryRound{checked: map[string]bool{}, allBlocked: true}
+		}
+		round := poolCooldown.recovery
+		eligible := map[string]bool{}
+		for _, pool := range pools {
+			for _, c := range pool.accounts {
+				id := shared.Str(c.row["id"])
+				if c.skip == "" && !a.state(id).QuotaExhausted {
+					eligible[id] = true
+					if _, exists := round.checked[id]; !exists {
+						round.checked[id] = false
+					}
+				}
+			}
+		}
+		for id := range round.checked {
+			if !eligible[id] {
+				delete(round.checked, id)
+			}
+		}
+		if a.completePoolRecoveryLocked(poolKey, poolCooldown) {
+			return nil, false, candidates, "risk_probe", poolCooldown.refusal()
+		}
+		round.owner, poolCooldown.probing = o.Recovery, true
+		if o.Recovery != nil {
+			o.Recovery.key, o.Recovery.generation = poolKey, poolCooldown.generation
+		}
+		// Check every eligible account at most once, including backup groups.
+		probePool := schedulingPool{group: shared.M{"policy": "risk_probe"}}
+		for _, pool := range pools {
+			probePool.accounts = append(probePool.accounts, pool.accounts...)
+		}
+		pools = []schedulingPool{probePool}
+	}
 	for _, p := range pools {
 		usable := make([]schedulingCandidate, 0, len(p.accounts))
 		for _, c := range p.accounts {
@@ -152,6 +220,21 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 			id := shared.Str(c.row["id"])
 			if reason == "" && a.state(id).QuotaExhausted {
 				reason = "quota_remaining=0"
+			}
+			if reason == "" && poolCooldown != nil && poolCooldown.recovery.checked[id] {
+				reason = "checked_for_pool_recovery"
+			}
+			if reason == "" {
+				if entry := a.upstreamCooldowns[a.accountCooldownKey(id)]; entry != nil && (time.Now().Before(entry.until) || entry.probing) {
+					reason = "upstream_cooldown"
+					failure := entry.refusal()
+					if cooling == nil || failure.RetryAfter < cooling.RetryAfter {
+						cooling = failure
+					}
+				}
+			}
+			if reason == "" && excluded[id] {
+				reason = "excluded_for_request"
 			}
 			if reason == "" {
 				s := a.state(id)
@@ -171,6 +254,9 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 		urgentWindow := int64(shared.Num(shared.Fallback(p.group["urgent_window_min"], 180)) * 60000)
 		preferred := func(x, y schedulingCandidate) bool {
 			xs, ys := a.state(shared.Str(x.row["id"])), a.state(shared.Str(y.row["id"]))
+			if poolCooldown != nil {
+				return xs.LastUsed < ys.LastUsed
+			}
 			if stickyValid {
 				xp, yp := shared.Str(x.row["id"]) == sticky.Account, shared.Str(y.row["id"]) == sticky.Account
 				if xp != yp {
@@ -215,6 +301,10 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 			a.state(id).Inflight++
 			picked.row["_busy_generation"] = a.state(id).BusyGeneration
 			picked.row["_busy_probe"] = a.state(id).BusyUntil != 0
+			if poolCooldown != nil {
+				picked.row["_risk_pool"] = poolKey
+				picked.row["_risk_generation"] = poolCooldown.generation
+			}
 			if a.state(id).BusyUntil != 0 {
 				a.state(id).BusyProbe = true
 			}
@@ -223,10 +313,127 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 					m["picked"] = true
 				}
 			}
-			return picked.row, busy, candidates, policy
+			return picked.row, busy, candidates, policy, nil
 		}
 	}
-	return nil, busy, candidates, ""
+	if busy {
+		cooling = nil
+	}
+	return nil, busy, candidates, "", cooling
+}
+
+func (a *App) accountCooldownKey(id string) string { return "account|" + a.origin + "|" + id }
+
+// Pool identity is the authorized group set and model, independent of API key
+// and ordering. Quota/card expiry must not reset a pool's backoff progression.
+// Call with a.mu held, after the scheduler's ordinary eligibility filters.
+func (a *App) accountPoolCooldownLocked(pools []schedulingPool, model string) (string, *upstreamCooldown) {
+	groups := make([]string, 0, len(pools))
+	eligible := 0
+	allBlocked := true
+	recovered := false
+	var until time.Time
+	for _, pool := range pools {
+		groups = append(groups, shared.Str(pool.group["id"]))
+		for _, c := range pool.accounts {
+			id := shared.Str(c.row["id"])
+			if c.skip != "" || a.state(id).QuotaExhausted {
+				continue
+			}
+			eligible++
+			entry := a.upstreamCooldowns[a.accountCooldownKey(id)]
+			if entry == nil {
+				recovered = true
+			}
+			if entry == nil || entry.failure.Kind != "account_risk" {
+				allBlocked = false
+			} else {
+				until = shared.MaxTime(until, entry.until)
+			}
+		}
+	}
+	if eligible == 0 {
+		return "", nil
+	}
+	sort.Strings(groups)
+	key := "inference-pool|" + a.origin + "|" + shared.Hash(shared.JSON([]any{strings.ToLower(model), groups}))
+	entry := a.upstreamCooldowns[key]
+	if entry != nil && recovered {
+		// A recovered or newly added account is usable even when the pool's
+		// other accounts are still cooling down.
+		a.clearUpstreamCooldownLocked(key)
+		entry = nil
+	}
+	if entry == nil && allBlocked {
+		// Start at the last actual refusal, not the next client's arrival.
+		entry = &upstreamCooldown{until: until, failures: 1, inference: true, generation: a.advanceCooldownEpochLocked(key), failure: fault.Failure{Kind: "risk", Code: "account_pool_cooling", Message: "账号池风控冷却中"}}
+		a.upstreamCooldowns[key] = entry
+		a.persistUpstreamCooldownLocked(key)
+	}
+	return key, entry
+}
+
+func (a *App) releasePoolRecovery(lease *poolRecoveryLease) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.releasePoolRecoveryLocked(lease)
+}
+
+func (a *App) releasePoolRecoveryLocked(lease *poolRecoveryLease) {
+	entry := a.upstreamCooldowns[lease.key]
+	if entry != nil && entry.generation == lease.generation && entry.recovery != nil && entry.recovery.owner == lease {
+		entry.recovery.owner, entry.probing = nil, false
+		a.notifyAvailableLocked()
+	}
+	lease.key, lease.generation = "", 0
+}
+
+// Advance only after the complete recovery round was blocked. Unrelated
+// failures retain the current step; cached refusals cannot advance it alone.
+func (a *App) completePoolRecoveryLocked(key string, entry *upstreamCooldown) bool {
+	round := entry.recovery
+	for _, checked := range round.checked {
+		if !checked {
+			return false
+		}
+	}
+	entry.probing = false
+	if len(round.checked) > 0 && round.allBlocked && round.refused {
+		refusal := entry.failure
+		refusal.RetryAfter = max(0, time.Until(round.retryAt))
+		a.recordUpstreamCooldownLocked(key, entry.generation, &refusal, time.Minute, true)
+	} else {
+		entry.recovery = nil
+		entry.until = shared.MaxTime(time.Now().Add(time.Second), round.retryAt)
+		a.persistUpstreamCooldownLocked(key)
+	}
+	return true
+}
+
+// Keep the round lease between attempts. Only successful inference establishes
+// recovery; one blocked account must not postpone checking the rest of the pool.
+func (a *App) finishPoolProbeLocked(account shared.M, failure *fault.Failure, completed bool) {
+	key := shared.Str(account["_risk_pool"])
+	entry := a.upstreamCooldowns[key]
+	if entry == nil || entry.generation != uint64(shared.Integer(account["_risk_generation"])) || entry.recovery == nil {
+		return
+	}
+	if completed && failure == nil {
+		a.clearUpstreamCooldownLocked(key)
+		return
+	}
+	if !completed || failure == nil || failure.Kind == "canceled" {
+		return
+	}
+	round := entry.recovery
+	round.checked[shared.Str(account["id"])] = true
+	blocked := failure.Kind == "account_risk" || failure.Code == "captcha_risk_blocked" || failure.Code == "F001" || failure.Code == "upstream_waf_blocked"
+	round.allBlocked = round.allBlocked && blocked
+	round.refused = round.refused || blocked && !failure.LocalOnly
+	round.retryAt = shared.MaxTime(round.retryAt, time.Now().Add(failure.RetryAfter))
+	if a.completePoolRecoveryLocked(key, entry) {
+		failure.RetryAfter = max(failure.RetryAfter, time.Until(entry.until))
+	}
 }
 
 func (a *App) availability() <-chan struct{} {
@@ -290,6 +497,9 @@ func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool,
 	case <-a.ctx.Done():
 		return nil, false, nil, "", a.ctx.Err()
 	case assigned := <-w.result:
+		if assigned.failure != nil {
+			return nil, assigned.busy, assigned.candidates, assigned.policy, assigned.failure
+		}
 		return assigned.account, assigned.busy, assigned.candidates, assigned.policy, nil
 	}
 }
@@ -337,7 +547,7 @@ func (a *App) dispatchAccounts() {
 		if w.ctx.Err() != nil {
 			continue
 		}
-		account, busy, candidates, policy := a.selectAccount(w.o, w.skip)
+		account, busy, candidates, policy, failure := a.selectAccount(w.o, w.skip)
 		if account == nil {
 			for _, candidate := range candidates {
 				if shared.Obj(candidate)["skip"] == "upstream_busy" {
@@ -351,7 +561,7 @@ func (a *App) dispatchAccounts() {
 		now := time.Now()
 		recheck := !w.o.RecheckAt.IsZero() && !now.Before(w.o.RecheckAt)
 		if account != nil || !busy || recheck || !w.deadline.IsZero() && !now.Before(w.deadline) {
-			w.result <- accountAssignment{account, busy, candidates, policy}
+			w.result <- accountAssignment{account, busy, candidates, policy, failure}
 		} else {
 			pending = append(pending, w)
 		}
@@ -386,6 +596,10 @@ func (a *App) admitAccount(account shared.M) {
 func (a *App) finishAccountAttempt(account shared.M, failure *fault.Failure, completed bool, params shared.M) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if failure != nil {
+		fault.Classify(failure)
+	}
+	a.finishPoolProbeLocked(account, failure, completed)
 	s := a.state(shared.Str(account["id"]))
 	s.Inflight = max(0, s.Inflight-1)
 	s.LastUsed = shared.NowMS()

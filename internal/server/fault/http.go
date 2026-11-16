@@ -64,7 +64,7 @@ func UpstreamHTTPFailure(res *http.Response, body []byte) *Failure {
 	}
 	page := strings.ToLower(string(body))
 	switch {
-	case (res.StatusCode == 403 || res.StatusCode == 405) && strings.Contains(page, "errors.aliyun.com/") && strings.Contains(page, "block_message"):
+	case (res.StatusCode == 403 || res.StatusCode == 405 || res.StatusCode == 503) && strings.Contains(page, "errors.aliyun.com/") && strings.Contains(page, "block_message"):
 		f.Kind, f.Code = "risk", "upstream_waf_blocked"
 		f.Message = "上游安全网关拦截"
 	case riskBlockMessage(page):

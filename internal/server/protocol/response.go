@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"math"
 	"strings"
 	"time"
 	"zcode2api/internal/server/fault"
@@ -126,5 +127,14 @@ func ErrorShape(f *fault.Failure, protocol string) (int, shared.M) {
 			typ = "api_error"
 		}
 	}
-	return status, shared.M{"type": typ, "code": shared.Fallback(f.Code, f.Kind), "message": f.Message}
+	if f.Code == "account_pool_cooling" {
+		status = 503
+	}
+	shape := shared.M{"type": typ, "code": shared.Fallback(f.Code, f.Kind), "message": f.Message}
+	if f.RetryAfter > 0 {
+		// Streaming headers are already committed. Carry the same delay in the
+		// error event so streaming clients can also avoid immediate retries.
+		shape["retry_after"] = max(1, int(math.Ceil(f.RetryAfter.Seconds())))
+	}
+	return status, shape
 }

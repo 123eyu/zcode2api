@@ -141,7 +141,6 @@ func (a *App) api(ctx context.Context, account shared.M, method, path, token str
 	defer release()
 	ctx, finish, failure := a.beginUpstreamRequest(ctx, a.upstreamScope(ctx, account, path, token != "" || shared.Str(headers["Authorization"]) != ""))
 	if failure != nil {
-		a.prepareProxyFailover(ctx, failure)
 		return fault.ApiResult{}, failure
 	}
 	defer func() {
