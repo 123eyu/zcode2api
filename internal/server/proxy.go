@@ -142,7 +142,7 @@ func (a *App) pinOutboundProxyMode(parent context.Context, account shared.M, rot
 		}
 		return parent, func() {}, routing.ProxyFailure("proxy_pool_exhausted", "无可用代理节点，请检查代理配置")
 	}
-	ctx = context.WithValue(ctx, routing.ProxySelectionKey{}, routing.ProxySelection{generation, endpoints[index].Identity()})
+	ctx = context.WithValue(ctx, routing.ProxySelectionKey{}, routing.ProxySelection{Generation: generation, Identity: endpoints[index].Identity()})
 	return routing.PinnedProxyContext(ctx, endpoints[index].URL), release, nil
 }
 

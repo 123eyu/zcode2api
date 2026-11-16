@@ -424,7 +424,7 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 			for _, endpoint := range a.proxies.endpoints {
 				if shared.Hash(endpoint.URL) == account.ExitHash && a.proxies.retryAt[endpoint.Identity()].IsZero() && a.proxies.blocked[endpoint.Identity()].IsZero() {
 					pinned = routing.PinnedProxyContext(pinned, endpoint.URL)
-					pinned = context.WithValue(pinned, routing.ProxySelectionKey{}, routing.ProxySelection{a.proxies.generation, endpoint.Identity()})
+					pinned = context.WithValue(pinned, routing.ProxySelectionKey{}, routing.ProxySelection{Generation: a.proxies.generation, Identity: endpoint.Identity()})
 					break
 				}
 			}
