@@ -9,10 +9,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"zcode2api/internal/server/fault"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
 type diskJar struct {
@@ -30,13 +32,14 @@ func (a *App) jar(id string) *diskJar {
 	}
 	j := &diskJar{path: filepath.Join(a.data, "cookies", id+".json"), cookies: map[string]string{}}
 	if b, e := os.ReadFile(j.path); e == nil {
-		for k, v := range obj(parse(string(b), nil)) {
-			j.cookies[k] = str(v)
+		for k, v := range shared.Obj(shared.Parse(string(b), nil)) {
+			j.cookies[k] = shared.Str(v)
 		}
 	}
 	a.jars[id] = j
 	return j
 }
+
 func (j *diskJar) header() string {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -46,6 +49,7 @@ func (j *diskJar) header() string {
 	}
 	return strings.Join(out, "; ")
 }
+
 func (j *diskJar) capture(res *http.Response) {
 	cookies := res.Cookies()
 	if len(cookies) == 0 {
@@ -65,9 +69,10 @@ func (j *diskJar) capture(res *http.Response) {
 		}
 	}
 	if j.dirty && os.MkdirAll(filepath.Dir(j.path), 0700) == nil {
-		j.dirty = os.WriteFile(j.path, []byte(js(j.cookies)), 0600) != nil
+		j.dirty = os.WriteFile(j.path, []byte(shared.JSON(j.cookies)), 0600) != nil
 	}
 }
+
 func platform() string {
 	p := runtime.GOOS
 	if p == "windows" {
@@ -79,8 +84,9 @@ func platform() string {
 	}
 	return p + "-" + arch
 }
+
 func (a *App) client(ctx context.Context) (*http.Client, error) {
-	proxy := selectedProxy(ctx)
+	proxy := routing.SelectedProxy(ctx)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if c := a.clients[proxy]; c != nil {
@@ -102,8 +108,8 @@ func (a *App) client(ctx context.Context) (*http.Client, error) {
 	t.ForceAttemptHTTP2 = true
 	if proxy != "" {
 		u, e := url.Parse(proxy)
-		if e != nil || !validProxy(proxy) {
-			return nil, invalid("proxy_url 仅支持 http(s)://host:port")
+		if e != nil || !routing.ValidProxy(proxy) {
+			return nil, fault.Invalid("proxy_url 仅支持 http(s)://host:port")
 		}
 		t.Proxy = http.ProxyURL(u)
 		// Record failures at the proxy dial itself, before DNS resolution loses
@@ -112,7 +118,7 @@ func (a *App) client(ctx context.Context) (*http.Client, error) {
 		t.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			connection, err := dial(ctx, network, address)
 			if err != nil {
-				return nil, &proxyDialError{err}
+				return nil, routing.NewDialError(err)
 			}
 			return connection, nil
 		}
@@ -122,27 +128,7 @@ func (a *App) client(ctx context.Context) (*http.Client, error) {
 	return c, nil
 }
 
-type apiResult struct {
-	Status  int
-	JSON    M
-	Header  http.Header
-	OK      bool
-	failure *Failure
-}
-
-func validProxy(s string) bool {
-	u, e := url.Parse(s)
-	if e != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || strings.ContainsAny(s, "\r\n\x00") {
-		return false
-	}
-	if port := u.Port(); port != "" {
-		n, err := strconv.Atoi(port)
-		return err == nil && n > 0 && n <= 65535
-	}
-	return !strings.HasSuffix(u.Host, ":")
-}
-
-func (a *App) api(ctx context.Context, account M, method, path, token string, body any, headers M, jar *diskJar) (result apiResult, err error) {
+func (a *App) api(ctx context.Context, account shared.M, method, path, token string, body any, headers shared.M, jar *diskJar) (result fault.ApiResult, err error) {
 	if !strings.HasPrefix(path, "https://") && !strings.HasPrefix(path, "http://") {
 		path = a.origin + path
 	}
@@ -150,36 +136,36 @@ func (a *App) api(ctx context.Context, account M, method, path, token string, bo
 	defer cancel()
 	ctx, release, err := a.pinOutboundProxy(ctx, account)
 	if err != nil {
-		return apiResult{}, err
+		return fault.ApiResult{}, err
 	}
 	defer release()
-	ctx, finish, failure := a.beginUpstreamRequest(ctx, a.upstreamScope(ctx, account, path, token != "" || str(headers["Authorization"]) != ""))
+	ctx, finish, failure := a.beginUpstreamRequest(ctx, a.upstreamScope(ctx, account, path, token != "" || shared.Str(headers["Authorization"]) != ""))
 	if failure != nil {
 		a.prepareProxyFailover(ctx, failure)
-		return apiResult{}, failure
+		return fault.ApiResult{}, failure
 	}
 	defer func() {
 		if err != nil {
 			failure := upstreamRequestFailure(ctx, err)
 			finish(failure)
 			a.prepareProxyFailover(ctx, failure)
-			if proxyExitFailure(failure) {
+			if routing.ProxyExitFailure(failure) {
 				err = failure
 			}
 		} else {
-			finish(result.failure)
-			a.prepareProxyFailover(ctx, result.failure)
+			finish(result.Failure)
+			a.prepareProxyFailover(ctx, result.Failure)
 		}
 	}()
 	var reader io.Reader
 	if body != nil {
-		reader = strings.NewReader(js(body))
+		reader = strings.NewReader(shared.JSON(body))
 	}
 	req, e := http.NewRequestWithContext(ctx, method, path, reader)
 	if e != nil {
-		return apiResult{}, e
+		return fault.ApiResult{}, e
 	}
-	version := str(a.configValue("app_version"))
+	version := shared.Str(a.configValue("app_version"))
 	req.Header.Set("User-Agent", "ZCode/"+version)
 	req.Header.Set("X-ZCode-App-Version", version)
 	req.Header.Set("X-Platform", platform())
@@ -191,7 +177,7 @@ func (a *App) api(ctx context.Context, account M, method, path, token string, bo
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range headers {
-		req.Header.Set(k, str(v))
+		req.Header.Set(k, shared.Str(v))
 	}
 	if jar != nil {
 		if s := jar.header(); s != "" {
@@ -200,11 +186,11 @@ func (a *App) api(ctx context.Context, account M, method, path, token string, bo
 	}
 	c, e := a.client(ctx)
 	if e != nil {
-		return apiResult{}, e
+		return fault.ApiResult{}, e
 	}
 	res, e := c.Do(req)
 	if e != nil {
-		return apiResult{}, e
+		return fault.ApiResult{}, e
 	}
 	defer res.Body.Close()
 	if jar != nil {
@@ -213,37 +199,25 @@ func (a *App) api(ctx context.Context, account M, method, path, token string, bo
 	b, e := io.ReadAll(io.LimitReader(res.Body, (32<<20)+1))
 	if e != nil {
 		if res.StatusCode == http.StatusTooManyRequests {
-			return apiResult{}, &Failure{Kind: "rate_limit", Code: "rate_limit_error", Status: res.StatusCode, Message: "请求频率受限", Retryable: true, RetryAfter: retryAfter(res.Header.Get("Retry-After"), time.Now())}
+			return fault.ApiResult{}, &fault.Failure{Kind: "rate_limit", Code: "rate_limit_error", Status: res.StatusCode, Message: "请求频率受限", Retryable: true, RetryAfter: fault.RetryAfter(res.Header.Get("Retry-After"), time.Now())}
 		}
-		return apiResult{}, e
+		return fault.ApiResult{}, e
 	}
 	if len(b) > 32<<20 {
-		return apiResult{}, invalid("上游响应超过 32MB")
+		return fault.ApiResult{}, fault.Invalid("上游响应超过 32MB")
 	}
-	j := obj(parse(string(b), nil))
-	result = apiResult{Status: res.StatusCode, JSON: j, Header: res.Header, OK: res.StatusCode == 200 && (codeIs(j["code"], 0) || codeIs(j["code"], 200))}
+	j := shared.Obj(shared.Parse(string(b), nil))
+	result = fault.ApiResult{Status: res.StatusCode, JSON: j, Header: res.Header, OK: res.StatusCode == 200 && (shared.CodeIs(j["code"], 0) || shared.CodeIs(j["code"], 200))}
 	if !result.OK {
-		result.failure = classify(upstreamHTTPFailure(res, b[:min(len(b), 64<<10)]))
+		result.Failure = fault.Classify(fault.UpstreamHTTPFailure(res, b[:min(len(b), 64<<10)]))
 	}
 	return result, nil
 }
-func apiFailure(r apiResult, label string) error {
-	failure := apiResponseFailure(r)
-	failure.Message = label + ": " + conciseFailureMessage(failure)
-	return failure
-}
 
-func apiResponseFailure(r apiResult) *Failure {
-	if r.failure != nil {
-		failure := *r.failure
-		return &failure
-	}
-	return classify(providerFailure(r.JSON, r.Status, r.Header.Get("Retry-After")))
-}
-func (a *App) customer(ctx context.Context, account M, token string) (apiResult, error) {
+func (a *App) customer(ctx context.Context, account shared.M, token string) (fault.ApiResult, error) {
 	host := "https://bigmodel.cn"
-	if str(account["family"]) == "zai" {
+	if shared.Str(account["family"]) == "zai" {
 		host = "https://api.z.ai"
 	}
-	return a.api(ctx, account, "GET", host+"/api/biz/customer/getCustomerInfo", "", nil, M{"Authorization": token}, nil)
+	return a.api(ctx, account, "GET", host+"/api/biz/customer/getCustomerInfo", "", nil, shared.M{"Authorization": token}, nil)
 }

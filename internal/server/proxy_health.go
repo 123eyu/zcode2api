@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"zcode2api/internal/server/fault"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
 type proxyProbeScope struct {
@@ -25,12 +28,12 @@ func (a *App) startProxyHealthProbes() {
 			for a.ctx.Err() == nil {
 				// Install cancellation before settings can replace this configuration.
 				a.configMu.RLock()
-				options := merge(proxyDefaults(), obj(a.cfg["outbound_proxy"]))
-				active := truth(options["enabled"]) && options["source"] == "manual"
+				options := shared.Merge(routing.ProxyDefaults(), shared.Obj(a.cfg["outbound_proxy"]))
+				active := shared.Truth(options["enabled"]) && options["source"] == "manual"
 				ctx, cancel := context.WithCancel(a.ctx)
 				a.proxies.mu.Lock()
 				if active {
-					a.proxies.configureLocked(options, manualProxyEndpoints(arr(options["urls"])))
+					a.proxies.configureLocked(options, routing.ManualProxyEndpoints(shared.Arr(options["urls"])))
 				}
 				scope := proxyProbeScope{a.proxies.key, a.proxies.generation}
 				a.proxies.probeCancel = cancel
@@ -54,13 +57,13 @@ func (a *App) startProxyHealthProbes() {
 	})
 }
 
-func (a *App) probeManualExits(ctx context.Context, options M, scope proxyProbeScope) {
-	endpoints := manualProxyEndpoints(arr(options["urls"]))
-	parallelFor(len(endpoints), 4, func(i int) {
+func (a *App) probeManualExits(ctx context.Context, options shared.M, scope proxyProbeScope) {
+	endpoints := routing.ManualProxyEndpoints(shared.Arr(options["urls"]))
+	shared.ParallelFor(len(endpoints), 4, func(i int) {
 		endpoint := endpoints[i]
-		if ctx.Err() == nil && validProxy(endpoint.URL) {
+		if ctx.Err() == nil && routing.ValidProxy(endpoint.URL) {
 			result := a.probeManualExit(ctx, endpoint.URL)
-			a.applyExitVerdict(ctx, scope, endpoint.identity(), result)
+			a.applyExitVerdict(ctx, scope, endpoint.Identity(), result)
 		}
 	})
 }
@@ -71,7 +74,7 @@ func (a *App) probeManualExit(parent context.Context, address string) proxyProbe
 	a.proxies.mu.Unlock()
 	status, failure, err := a.probeProxy(parent, address)
 	if err != nil {
-		if status == 0 && failure != nil && proxyExitFailure(failure) {
+		if status == 0 && failure != nil && routing.ProxyExitFailure(failure) {
 			return proxyProbeResult{verdict: "quarantine"}
 		}
 		return proxyProbeResult{}
@@ -79,7 +82,7 @@ func (a *App) probeManualExit(parent context.Context, address string) proxyProbe
 	switch {
 	case failure.Code == "upstream_waf_blocked":
 		return proxyProbeResult{verdict: "blocked", retryAfter: failure.RetryAfter}
-	case proxyExitFailure(failure):
+	case routing.ProxyExitFailure(failure):
 		return proxyProbeResult{verdict: "quarantine", retryAfter: failure.RetryAfter}
 	case status == http.StatusUnauthorized:
 		return proxyProbeResult{verdict: "reachable", observedRetry: observedRetry}
@@ -89,8 +92,8 @@ func (a *App) probeManualExit(parent context.Context, address string) proxyProbe
 }
 
 // Share anonymous probes without changing proxy state or sending credentials.
-func (a *App) probeProxy(parent context.Context, address string) (int, *Failure, error) {
-	ctx, cancel := context.WithTimeout(pinnedProxyContext(parent, address), 8*time.Second)
+func (a *App) probeProxy(parent context.Context, address string) (int, *fault.Failure, error) {
+	ctx, cancel := context.WithTimeout(routing.PinnedProxyContext(parent, address), 8*time.Second)
 	defer cancel()
 	client, err := a.client(ctx)
 	if err != nil {
@@ -103,11 +106,11 @@ func (a *App) probeProxy(parent context.Context, address string) (int, *Failure,
 	request.Header.Set("Content-Type", "application/json")
 	response, err := client.Do(request)
 	if err != nil {
-		return 0, transportFailure(ctx, err), err
+		return 0, routing.TransportFailure(ctx, err), err
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
-	return response.StatusCode, upstreamHTTPFailure(response, body), err
+	return response.StatusCode, fault.UpstreamHTTPFailure(response, body), err
 }
 
 func (a *App) applyExitVerdict(ctx context.Context, scope proxyProbeScope, identity string, result proxyProbeResult) {
@@ -116,8 +119,8 @@ func (a *App) applyExitVerdict(ctx context.Context, scope proxyProbeScope, ident
 	}
 	a.configMu.RLock()
 	defer a.configMu.RUnlock()
-	options := merge(proxyDefaults(), obj(a.cfg["outbound_proxy"]))
-	if !truth(options["enabled"]) || options["source"] != "manual" || hash(js(options)) != scope.key {
+	options := shared.Merge(routing.ProxyDefaults(), shared.Obj(a.cfg["outbound_proxy"]))
+	if !shared.Truth(options["enabled"]) || options["source"] != "manual" || shared.Hash(shared.JSON(options)) != scope.key {
 		return
 	}
 	a.proxies.mu.Lock()
@@ -128,7 +131,7 @@ func (a *App) applyExitVerdict(ctx context.Context, scope proxyProbeScope, ident
 	a.proxies.initStateLocked()
 	present := false
 	for _, endpoint := range a.proxies.endpoints {
-		present = present || endpoint.identity() == identity
+		present = present || endpoint.Identity() == identity
 	}
 	if !present {
 		return
@@ -140,8 +143,7 @@ func (a *App) applyExitVerdict(ctx context.Context, scope proxyProbeScope, ident
 		if a.proxies.retryAt[identity] != result.observedRetry {
 			return // A newer connection failure supersedes this probe.
 		}
-		changed = a.proxies.unavailable[identity] || !a.proxies.retryAt[identity].IsZero()
-		delete(a.proxies.unavailable, identity)
+		changed = !a.proxies.retryAt[identity].IsZero()
 		delete(a.proxies.retryAt, identity)
 	case "blocked":
 		until := now.Add(max(10*time.Minute, result.retryAfter))
@@ -152,7 +154,6 @@ func (a *App) applyExitVerdict(ctx context.Context, scope proxyProbeScope, ident
 	case "quarantine":
 		until := now.Add(max(time.Minute, result.retryAfter))
 		if until.After(a.proxies.retryAt[identity]) {
-			a.proxies.unavailable[identity] = true
 			a.proxies.retryAt[identity] = until
 			changed = true
 		}
@@ -162,15 +163,15 @@ func (a *App) applyExitVerdict(ctx context.Context, scope proxyProbeScope, ident
 	}
 }
 
-func (a *App) testOutboundProxies(parent context.Context, options M) (M, error) {
-	if err := validateOutboundProxy(options); err != nil {
+func (a *App) testOutboundProxies(parent context.Context, options shared.M) (shared.M, error) {
+	if err := routing.ValidateOutboundProxy(options); err != nil {
 		return nil, err
 	}
-	options = merge(proxyDefaults(), options)
+	options = shared.Merge(routing.ProxyDefaults(), options)
 	ctx, cancel := a.operationContext(parent, 45*time.Second)
 	defer cancel()
-	endpoints := []proxyEndpoint{{URL: "", Name: "直连"}}
-	if truth(options["enabled"]) {
+	endpoints := []routing.ProxyEndpoint{{URL: "", Name: "直连"}}
+	if shared.Truth(options["enabled"]) {
 		endpoints = nil
 		if options["source"] == "subscription" {
 			runtime, err := a.startManagedProxy(ctx, options)
@@ -180,19 +181,19 @@ func (a *App) testOutboundProxies(parent context.Context, options M) (M, error) 
 			defer runtime.stop()
 			endpoints = runtime.endpoints
 		} else {
-			endpoints = manualProxyEndpoints(arr(options["urls"]))
+			endpoints = routing.ManualProxyEndpoints(shared.Arr(options["urls"]))
 		}
 	}
 	results := make([]any, len(endpoints))
-	parallelFor(len(endpoints), 4, func(index int) {
+	shared.ParallelFor(len(endpoints), 4, func(index int) {
 		endpoint := endpoints[index]
 		started := time.Now()
-		result := M{"name": endpoint.Name, "reachable": false, "transport_reachable": false, "failure_kind": "network", "message": "连接失败或超时"}
+		result := shared.M{"name": endpoint.Name, "reachable": false, "transport_reachable": false, "failure_kind": "network", "message": "连接失败或超时"}
 		status, failure, _ := a.probeProxy(ctx, endpoint.URL)
 		if status != 0 {
 			result["transport_reachable"] = true
 			result["status"] = status
-			classify(failure)
+			fault.Classify(failure)
 			blocked := failure.Code == "upstream_waf_blocked" || failure.Kind == "account_risk"
 			reachable := status == 401 && !blocked
 			result["reachable"] = reachable
@@ -221,5 +222,43 @@ func (a *App) testOutboundProxies(parent context.Context, options M) (M, error) 
 		result["elapsed_ms"] = time.Since(started).Milliseconds()
 		results[index] = result
 	})
-	return M{"ok": true, "results": results, "note": "检测不保存设置、不发送账号令牌、不计模型用量；连通性通过不代表真实推理一定通过风控"}, nil
+	return shared.M{"ok": true, "results": results, "note": "检测不保存设置、不发送账号令牌、不计模型用量；连通性通过不代表真实推理一定通过风控"}, nil
+}
+
+// Listing a draft does not start Mihomo, select a route or save configuration.
+func (a *App) outboundProxyNodes(ctx context.Context, options shared.M) (shared.M, error) {
+	if err := routing.ValidateOutboundProxy(options); err != nil {
+		return nil, err
+	}
+	options = shared.Merge(routing.ProxyDefaults(), options)
+	var endpoints []routing.ProxyEndpoint
+	protocols := map[string]string{}
+	if options["source"] == "subscription" {
+		nodes, err := a.subscriptionNodes(ctx, options)
+		if err != nil {
+			return nil, err
+		}
+		for _, node := range nodes {
+			endpoint := routing.ProxyEndpoint{Name: node.Name, ID: node.Identity()}
+			endpoints = append(endpoints, endpoint)
+			protocols[endpoint.SelectionID()] = strings.ToUpper(shared.Str(node.Config["type"]))
+		}
+	} else {
+		endpoints = routing.ManualProxyEndpoints(shared.Arr(options["urls"]))
+	}
+	a.proxies.mu.Lock()
+	defer a.proxies.mu.Unlock()
+	active := a.proxies.key == shared.Hash(shared.JSON(options))
+	rows := []any{}
+	for _, endpoint := range endpoints {
+		blocked := active && time.Now().Before(a.proxies.blocked[endpoint.Identity()])
+		unavailable := active && time.Now().Before(a.proxies.retryAt[endpoint.Identity()])
+		rows = append(rows, shared.M{
+			"id": endpoint.SelectionID(), "name": endpoint.Name, "protocol": protocols[endpoint.SelectionID()],
+			"current":     active && endpoint.Identity() == a.proxies.selected && !unavailable && !blocked,
+			"unavailable": unavailable,
+			"blocked":     blocked,
+		})
+	}
+	return shared.M{"ok": true, "nodes": rows}, nil
 }

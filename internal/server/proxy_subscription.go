@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,16 +11,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
+	"zcode2api/internal/server/fault"
+	childproc "zcode2api/internal/server/process"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
 type managedProxyRuntime struct {
 	key        string
-	endpoints  []proxyEndpoint
+	endpoints  []routing.ProxyEndpoint
 	expires    time.Time
 	references int
 	retired    bool
@@ -31,6 +33,7 @@ type managedProxyRuntime struct {
 }
 
 func (runtime *managedProxyRuntime) stop() { runtime.stopOnce.Do(runtime.stopFn) }
+
 func (runtime *managedProxyRuntime) alive() bool {
 	select {
 	case <-runtime.done:
@@ -40,14 +43,14 @@ func (runtime *managedProxyRuntime) alive() bool {
 	}
 }
 
-func (a *App) acquireManagedProxy(ctx context.Context, options M) (*managedProxyRuntime, error) {
+func (a *App) acquireManagedProxy(ctx context.Context, options shared.M) (*managedProxyRuntime, error) {
 	manager := &a.proxies
 	manager.mu.Lock()
 	if manager.closing || ctx.Err() != nil {
 		manager.mu.Unlock()
-		return nil, proxyFailure("proxy_canceled", "代理准备已取消")
+		return nil, routing.ProxyFailure("proxy_canceled", "代理准备已取消")
 	}
-	key := hash(js(options))
+	key := shared.Hash(shared.JSON(options))
 	current := manager.current
 	if current != nil && current.key == key && current.alive() && time.Now().Before(current.expires) {
 		current.references++
@@ -100,149 +103,7 @@ func (a *App) releaseManagedProxy(runtime *managedProxyRuntime) {
 	}
 }
 
-type subscriptionNode struct {
-	name   string
-	config M
-}
-
-func (node subscriptionNode) identity() string {
-	config := clone(node.config)
-	delete(config, "name")
-	return hash(js(config))
-}
-
-func decodeSubscription(body []byte, filter string) ([]subscriptionNode, error) {
-	text := strings.TrimSpace(strings.TrimPrefix(string(body), "\ufeff"))
-	if !strings.Contains(text, "://") {
-		compact := strings.Join(strings.Fields(text), "")
-		var decoded []byte
-		var err error
-		for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-			decoded, err = encoding.DecodeString(compact)
-			if err == nil {
-				break
-			}
-		}
-		if err != nil {
-			return nil, proxyFailure("proxy_subscription_invalid", "订阅不是有效的 URI 或 Base64 URI 列表")
-		}
-		text = strings.TrimSpace(strings.TrimPrefix(string(decoded), "\ufeff"))
-	}
-	pattern, err := regexp.Compile(filter)
-	if err != nil {
-		return nil, proxyFailure("proxy_subscription_invalid", "节点筛选表达式无效")
-	}
-	seen := map[string]bool{}
-	nodes := []subscriptionNode{}
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		u, err := url.Parse(line)
-		if err != nil || u.Hostname() == "" {
-			continue
-		}
-		name := u.Fragment
-		if name == "" {
-			name = fmt.Sprintf("节点 %d", len(nodes)+1)
-		}
-		if !pattern.MatchString(name) || strings.ContainsAny(name, "\r\n\x00") {
-			continue
-		}
-		port := 443
-		if u.Port() != "" {
-			port, err = strconv.Atoi(u.Port())
-			if err != nil || port < 1 || port > 65535 {
-				continue
-			}
-		} else if u.Scheme == "http" {
-			port = 80
-		}
-		query := u.Query()
-		config := M{"server": u.Hostname(), "port": port, "udp": true}
-		flag := func(key string) bool { return query.Get(key) == "1" || strings.EqualFold(query.Get(key), "true") }
-		switch u.Scheme {
-		case "vless":
-			if u.User == nil || u.User.Username() == "" {
-				continue
-			}
-			config["type"], config["uuid"] = "vless", u.User.Username()
-			network := query.Get("type")
-			if network == "" || network == "raw" {
-				network = "tcp"
-			}
-			if network != "tcp" && network != "ws" {
-				continue
-			}
-			config["network"] = network
-			security := query.Get("security")
-			config["tls"] = security == "tls" || security == "reality"
-			config["skip-cert-verify"] = flag("insecure") || flag("allowInsecure")
-			for from, to := range map[string]string{"flow": "flow", "sni": "servername", "fp": "client-fingerprint"} {
-				if value := query.Get(from); value != "" {
-					config[to] = value
-				}
-			}
-			if security == "reality" {
-				if query.Get("pbk") == "" {
-					continue
-				}
-				config["reality-opts"] = M{"public-key": query.Get("pbk"), "short-id": query.Get("sid")}
-			}
-			if network == "ws" {
-				options := M{"path": fallback(query.Get("path"), "/")}
-				if host := query.Get("host"); host != "" {
-					options["headers"] = M{"Host": host}
-				}
-				config["ws-opts"] = options
-			}
-			if value := query.Get("alpn"); value != "" {
-				config["alpn"] = strings.Split(value, ",")
-			}
-		case "hysteria2", "hy2":
-			if u.User == nil || u.User.Username() == "" {
-				continue
-			}
-			password := u.User.Username()
-			if value, present := u.User.Password(); present {
-				password += ":" + value
-			}
-			config["type"], config["password"] = "hysteria2", password
-			config["sni"] = fallback(query.Get("sni"), fallback(query.Get("peer"), u.Hostname()))
-			config["skip-cert-verify"] = flag("insecure")
-			if pin := query.Get("pinSHA256"); pin != "" {
-				config["fingerprint"] = strings.ReplaceAll(pin, ":", "")
-			}
-			if obfs := query.Get("obfs"); obfs != "" {
-				config["obfs"], config["obfs-password"] = obfs, query.Get("obfs-password")
-			}
-		case "http", "https":
-			config["type"], config["tls"] = "http", u.Scheme == "https"
-			if u.User != nil {
-				config["username"] = u.User.Username()
-				config["password"], _ = u.User.Password()
-			}
-		default:
-			continue
-		}
-		identity := hash(js(config))
-		if !seen[identity] {
-			config["name"] = fmt.Sprintf("node-%d", len(nodes)+1)
-			nodes = append(nodes, subscriptionNode{name, config})
-			seen[identity] = true
-		}
-		if len(nodes) > 64 {
-			return nil, proxyFailure("proxy_subscription_too_large", "匹配节点超过 64 个，请收紧节点筛选条件")
-		}
-	}
-	if len(nodes) == 0 {
-		return nil, proxyFailure("proxy_subscription_empty", "没有匹配的受支持节点；支持 VLESS TCP/WS、Hysteria2 和 HTTP/HTTPS URI 订阅")
-	}
-	return nodes, nil
-}
-
-func (a *App) subscriptionNodes(ctx context.Context, options M) ([]subscriptionNode, error) {
+func (a *App) subscriptionNodes(ctx context.Context, options shared.M) ([]routing.SubscriptionNode, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil // Subscription bootstrap never recursively uses this pool.
 	defer transport.CloseIdleConnections()
@@ -252,18 +113,18 @@ func (a *App) subscriptionNodes(ctx context.Context, options M) ([]subscriptionN
 		}
 		return nil
 	}}
-	request, err := http.NewRequestWithContext(ctx, "GET", str(options["subscription_url"]), nil)
+	request, err := http.NewRequestWithContext(ctx, "GET", shared.Str(options["subscription_url"]), nil)
 	if err != nil {
-		return nil, proxyFailure("proxy_subscription_invalid", "订阅地址无效")
+		return nil, routing.ProxyFailure("proxy_subscription_invalid", "订阅地址无效")
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return nil, proxyFailure("proxy_subscription_unavailable", "拉取订阅失败，请检查服务器网络及订阅地址")
+		return nil, routing.ProxyFailure("proxy_subscription_unavailable", "拉取订阅失败，请检查服务器网络及订阅地址")
 	}
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
 	response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		failure := &Failure{Kind: "server", Code: "proxy_subscription_unavailable", Status: response.StatusCode,
+		failure := &fault.Failure{Kind: "server", Code: "proxy_subscription_unavailable", Status: response.StatusCode,
 			Message: fmt.Sprintf("代理订阅获取失败（HTTP %d）", response.StatusCode)}
 		// Recognize only known authentication errors; never expose response bodies
 		// or request errors, which can contain the private subscription URL.
@@ -276,18 +137,18 @@ func (a *App) subscriptionNodes(ctx context.Context, options M) ([]subscriptionN
 		return nil, failure
 	}
 	if readErr != nil {
-		return nil, proxyFailure("proxy_subscription_unavailable", "读取代理订阅响应失败，请稍后重试")
+		return nil, routing.ProxyFailure("proxy_subscription_unavailable", "读取代理订阅响应失败，请稍后重试")
 	}
 	if len(body) > 2<<20 {
-		return nil, proxyFailure("proxy_subscription_response_too_large", "代理订阅响应超过 2 MB")
+		return nil, routing.ProxyFailure("proxy_subscription_response_too_large", "代理订阅响应超过 2 MB")
 	}
-	return decodeSubscription(body, str(options["subscription_filter"]))
+	return routing.DecodeSubscription(body, shared.Str(options["subscription_filter"]))
 }
 
-func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRuntime, error) {
-	binary, err := a.resolveMihomo(str(options["mihomo_path"]))
+func (a *App) startManagedProxy(ctx context.Context, options shared.M) (*managedProxyRuntime, error) {
+	binary, err := a.resolveMihomo(shared.Str(options["mihomo_path"]))
 	if err != nil {
-		return nil, proxyFailure("proxy_runtime_missing", "未找到 Mihomo；可在设置中点击安装，或填写已有可执行文件路径")
+		return nil, routing.ProxyFailure("proxy_runtime_missing", "未找到 Mihomo；可在设置中点击安装，或填写已有可执行文件路径")
 	}
 	nodes, err := a.subscriptionNodes(ctx, options)
 	if err != nil {
@@ -295,11 +156,11 @@ func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRu
 	}
 	parent := filepath.Join(a.data, "runtime")
 	if err = os.MkdirAll(parent, 0700); err != nil {
-		return nil, proxyFailure("proxy_runtime_error", "无法创建代理运行目录")
+		return nil, routing.ProxyFailure("proxy_runtime_error", "无法创建代理运行目录")
 	}
 	directory, err := os.MkdirTemp(parent, "proxy-")
 	if err != nil {
-		return nil, proxyFailure("proxy_runtime_error", "无法创建代理运行目录")
+		return nil, routing.ProxyFailure("proxy_runtime_error", "无法创建代理运行目录")
 	}
 	defer func() {
 		if err != nil {
@@ -307,7 +168,7 @@ func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRu
 		}
 	}()
 	proxies, listeners := []any{}, []any{}
-	endpoints := []proxyEndpoint{}
+	endpoints := []routing.ProxyEndpoint{}
 	reserved := []net.Listener{}
 	for i, node := range nodes {
 		listener, listenErr := net.Listen("tcp4", "127.0.0.1:0")
@@ -315,26 +176,26 @@ func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRu
 			for _, open := range reserved {
 				open.Close()
 			}
-			err = proxyFailure("proxy_runtime_error", "无法分配本机代理端口")
+			err = routing.ProxyFailure("proxy_runtime_error", "无法分配本机代理端口")
 			return nil, err
 		}
 		reserved = append(reserved, listener)
 		address := listener.Addr().(*net.TCPAddr)
-		proxies = append(proxies, node.config)
+		proxies = append(proxies, node.Config)
 		// Each listener has one fixed outbound. A global load-balance listener
 		// would let the SDK and Go's separate CONNECTs pick different exits.
-		listeners = append(listeners, M{"name": fmt.Sprintf("in-%d", i), "type": "http", "listen": "127.0.0.1", "port": address.Port, "proxy": node.config["name"]})
+		listeners = append(listeners, shared.M{"name": fmt.Sprintf("in-%d", i), "type": "http", "listen": "127.0.0.1", "port": address.Port, "proxy": node.Config["name"]})
 		// Local ports change on refresh; node identity must survive that change.
-		endpoints = append(endpoints, proxyEndpoint{URL: fmt.Sprintf("http://127.0.0.1:%d", address.Port), Name: node.name, ID: node.identity()})
+		endpoints = append(endpoints, routing.ProxyEndpoint{URL: fmt.Sprintf("http://127.0.0.1:%d", address.Port), Name: node.Name, ID: node.Identity()})
 	}
-	config := M{"allow-lan": false, "mode": "rule", "log-level": "silent", "ipv6": false, "listeners": listeners, "proxies": proxies, "rules": []any{"MATCH,REJECT"}}
+	config := shared.M{"allow-lan": false, "mode": "rule", "log-level": "silent", "ipv6": false, "listeners": listeners, "proxies": proxies, "rules": []any{"MATCH,REJECT"}}
 	filename := filepath.Join(directory, "config.json")
 	encoded, _ := json.Marshal(config)
 	if err = os.WriteFile(filename, encoded, 0600); err != nil {
 		for _, open := range reserved {
 			open.Close()
 		}
-		err = proxyFailure("proxy_runtime_error", "无法写入代理运行配置")
+		err = routing.ProxyFailure("proxy_runtime_error", "无法写入代理运行配置")
 		return nil, err
 	}
 	for _, open := range reserved {
@@ -342,15 +203,15 @@ func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRu
 	}
 	processCtx, cancel := context.WithCancel(a.ctx)
 	command := exec.CommandContext(processCtx, binary, "-d", directory, "-f", filename)
-	hideChildWindow(command)
+	childproc.HideChildWindow(command)
 	command.Stdout, command.Stderr = io.Discard, io.Discard
 	command.WaitDelay = 2 * time.Second
 	if err = command.Start(); err != nil {
 		cancel()
-		err = proxyFailure("proxy_runtime_error", "无法启动 Mihomo，请检查可执行文件及平台架构")
+		err = routing.ProxyFailure("proxy_runtime_error", "无法启动 Mihomo，请检查可执行文件及平台架构")
 		return nil, err
 	}
-	runtime := &managedProxyRuntime{endpoints: endpoints, expires: time.Now().Add(time.Duration(num(options["refresh_interval_sec"])) * time.Second), done: make(chan struct{})}
+	runtime := &managedProxyRuntime{endpoints: endpoints, expires: time.Now().Add(time.Duration(shared.Num(options["refresh_interval_sec"])) * time.Second), done: make(chan struct{})}
 	go func() { command.Wait(); close(runtime.done) }()
 	runtime.stopFn = func() {
 		cancel()
@@ -368,7 +229,7 @@ func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRu
 	for {
 		if !runtime.alive() {
 			runtime.stop()
-			return nil, proxyFailure("proxy_runtime_error", "Mihomo 启动失败，请检查订阅节点是否受当前内核支持")
+			return nil, routing.ProxyFailure("proxy_runtime_error", "Mihomo 启动失败，请检查订阅节点是否受当前内核支持")
 		}
 		ready := true
 		for _, endpoint := range endpoints {
@@ -386,8 +247,62 @@ func (a *App) startManagedProxy(ctx context.Context, options M) (*managedProxyRu
 		select {
 		case <-readyCtx.Done():
 			runtime.stop()
-			return nil, proxyFailure("proxy_runtime_error", "Mihomo 代理端口未能就绪")
+			return nil, routing.ProxyFailure("proxy_runtime_error", "Mihomo 代理端口未能就绪")
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
+}
+
+func (a *App) managedMihomoPath() string {
+	name := "mihomo"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	binary := filepath.Join(a.data, "tools", "mihomo", routing.MihomoVersion, runtime.GOOS+"-"+runtime.GOARCH, name)
+	if absolute, err := filepath.Abs(binary); err == nil {
+		return absolute
+	}
+	return binary
+}
+
+func (a *App) resolveMihomo(configured string) (string, error) {
+	if configured == "" || configured == "mihomo" {
+		// Portable deployments may place Mihomo beside config.json.
+		return childproc.ResolveExecutable(a.root, "mihomo", a.managedMihomoPath(), filepath.Join(a.root, "mihomo"))
+	}
+	return childproc.ResolveExecutable(a.root, configured)
+}
+
+func (a *App) mihomoStatus() shared.M {
+	return a.mihomoStatusForPath(shared.Str(shared.Obj(a.configValue("outbound_proxy"))["mihomo_path"]))
+}
+
+func (a *App) mihomoStatusForPath(configured string) shared.M {
+	_, supported := routing.LookupMihomoAsset(runtime.GOOS + "/" + runtime.GOARCH)
+	binary, err := a.resolveMihomo(configured)
+	return shared.M{"installed": err == nil, "path": binary, "managed": binary == a.managedMihomoPath(), "version": routing.MihomoVersion, "platform": runtime.GOOS + "/" + runtime.GOARCH, "supported": supported}
+}
+
+func (a *App) installMihomo(parent context.Context) (shared.M, error) {
+	asset, supported := routing.LookupMihomoAsset(runtime.GOOS + "/" + runtime.GOARCH)
+	if !supported {
+		return nil, fmt.Errorf("当前平台暂不支持在线安装，请手动安装 Mihomo")
+	}
+	if !a.mihomoInstallMu.TryLock() {
+		return nil, fmt.Errorf("Mihomo 正在安装，请稍后检查安装状态")
+	}
+	defer a.mihomoInstallMu.Unlock()
+	ctx, cancel := a.operationContext(parent, 3*time.Minute)
+	defer cancel()
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 3 * time.Minute, CheckRedirect: routing.MihomoRedirect}
+	binary := a.managedMihomoPath()
+	if _, err := exec.LookPath(binary); err != nil {
+		if err = routing.InstallMihomoAsset(ctx, client, asset, binary); err != nil {
+			return nil, err
+		}
+	}
+	return shared.M{"ok": true, "installed": true, "path": binary, "version": routing.MihomoVersion}, nil
 }

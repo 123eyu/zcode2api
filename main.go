@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 	"zcode2api/internal/server"
+	"zcode2api/internal/server/update"
 )
 
 //go:embed src/web/*
@@ -33,7 +34,7 @@ func main() {
 		return
 	}
 	if *applyUpdate != "" {
-		if err := server.ApplyUpdate(*applyUpdate); err != nil {
+		if err := update.Apply(*applyUpdate); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

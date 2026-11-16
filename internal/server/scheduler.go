@@ -2,16 +2,20 @@ package server
 
 import (
 	"context"
-	"math/rand/v2"
+	rand "math/rand/v2"
 	"strings"
 	"time"
+	accountdata "zcode2api/internal/server/account"
+	"zcode2api/internal/server/fault"
+	"zcode2api/internal/server/shared"
 )
 
 const accountConcurrencyLimit = 3
+
 const maxQueuedRequests = 1024
 
 type accountAssignment struct {
-	account    M
+	account    shared.M
 	busy       bool
 	candidates []any
 	policy     string
@@ -26,18 +30,19 @@ type accountWaiter struct {
 }
 
 type schedulingCandidate struct {
-	row       M
+	row       shared.M
 	remaining float64
 	skip      string
 }
+
 type schedulingPool struct {
-	group    M
+	group    shared.M
 	accounts []schedulingCandidate
 }
 
-func (a *App) schedulingPools(key M) []schedulingPool {
+func (a *App) schedulingPools(key shared.M) []schedulingPool {
 	query := `SELECT a.*,g.id AS _gid,g.name AS _name,g.role AS _role,g.policy AS _policy,g.family_filter AS _family,g.urgent_window_min AS _urgent FROM groups g LEFT JOIN accounts a ON a.group_id=g.id WHERE g.enabled=1`
-	chain, explicit := parse(key["group_order"], nil).([]any)
+	chain, explicit := shared.Parse(key["group_order"], nil).([]any)
 	args := []any{}
 	if explicit {
 		if len(chain) == 0 {
@@ -50,11 +55,11 @@ func (a *App) schedulingPools(key M) []schedulingPool {
 	pools := map[string]*schedulingPool{}
 	order := []string{}
 	for _, v := range a.rows(query, args...) {
-		r := obj(v)
-		gid := str(r["_gid"])
+		r := shared.Obj(v)
+		gid := shared.Str(r["_gid"])
 		pool := pools[gid]
 		if pool == nil {
-			pool = &schedulingPool{group: M{"id": gid, "name": r["_name"], "role": r["_role"], "policy": r["_policy"], "family_filter": r["_family"], "urgent_window_min": r["_urgent"]}}
+			pool = &schedulingPool{group: shared.M{"id": gid, "name": r["_name"], "role": r["_role"], "policy": r["_policy"], "family_filter": r["_family"], "urgent_window_min": r["_urgent"]}}
 			pools[gid] = pool
 			order = append(order, gid)
 		}
@@ -66,7 +71,7 @@ func (a *App) schedulingPools(key M) []schedulingPool {
 		chain = []any{}
 		for _, role := range []string{"primary", "backup"} {
 			for _, id := range order {
-				if str(pools[id].group["role"]) == role {
+				if shared.Str(pools[id].group["role"]) == role {
 					chain = append(chain, id)
 					break
 				}
@@ -76,7 +81,7 @@ func (a *App) schedulingPools(key M) []schedulingPool {
 	out := make([]schedulingPool, 0, len(chain))
 	seen := map[string]bool{}
 	for _, id := range chain {
-		gid := str(id)
+		gid := shared.Str(id)
 		if p := pools[gid]; p != nil && !seen[gid] {
 			out = append(out, *p)
 			seen[gid] = true
@@ -85,10 +90,10 @@ func (a *App) schedulingPools(key M) []schedulingPool {
 	return out
 }
 
-func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, []any, string) {
+func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M, bool, []any, string) {
 	params := a.retryParams()
-	now := nowMS()
-	minWindow := int64(num(fallback(params["min_request_window_sec"], 60)) * 1000)
+	now := shared.NowMS()
+	minWindow := int64(shared.Num(shared.Fallback(params["min_request_window_sec"], 60)) * 1000)
 	pools := a.schedulingPools(o.Key)
 	for pi := range pools {
 		p := &pools[pi]
@@ -96,26 +101,26 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 			c := &p.accounts[i]
 			r := c.row
 			switch {
-			case excluded[str(r["id"])]:
+			case excluded[shared.Str(r["id"])]:
 				c.skip = "excluded_for_request"
-			case str(r["status"]) != "active":
-				c.skip = "status=" + str(r["status"])
-			case loginJWTExpired(a.accountTokens(r)):
+			case shared.Str(r["status"]) != "active":
+				c.skip = "status=" + shared.Str(r["status"])
+			case accountdata.LoginJWTExpired(a.accountTokens(r)):
 				c.skip = "login_expired"
-				a.scheduleNext(str(r["id"]), 0)
-			case truth(r["card_expires_at"]) && integer(r["card_expires_at"])-now < minWindow:
+				a.scheduleNext(shared.Str(r["id"]), 0)
+			case shared.Truth(r["card_expires_at"]) && shared.Integer(r["card_expires_at"])-now < minWindow:
 				c.skip = "card_expiring"
-			case truth(p.group["family_filter"]) && p.group["family_filter"] != r["family"]:
+			case shared.Truth(p.group["family_filter"]) && p.group["family_filter"] != r["family"]:
 				c.skip = "family_filter"
 			}
 			if c.skip != "" {
 				continue
 			}
-			caps := arr(parse(r["capabilities"], nil))
+			caps := shared.Arr(shared.Parse(r["capabilities"], nil))
 			if len(caps) > 0 {
 				allowed := false
 				for _, cap := range caps {
-					if strings.EqualFold(str(cap), o.Model) {
+					if strings.EqualFold(shared.Str(cap), o.Model) {
 						allowed = true
 						break
 					}
@@ -125,12 +130,12 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 					continue
 				}
 			}
-			data := balanceData(r)
+			data := accountdata.BalanceData(r)
 			if _, known := data["balances"].([]any); !known {
 				c.skip = "quota_unknown"
 				continue
 			}
-			c.remaining = remainingBalance(data, now)
+			c.remaining = accountdata.RemainingBalance(data, now)
 			if !(c.remaining > 0) {
 				c.skip = "quota_remaining=0"
 			}
@@ -144,12 +149,9 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 		usable := make([]schedulingCandidate, 0, len(p.accounts))
 		for _, c := range p.accounts {
 			reason := c.skip
-			id := str(c.row["id"])
+			id := shared.Str(c.row["id"])
 			if reason == "" && a.state(id).QuotaExhausted {
 				reason = "quota_remaining=0"
-			}
-			if reason == "" && a.state(id).Cooldown > now {
-				reason = "cooldown"
 			}
 			if reason == "" {
 				s := a.state(id)
@@ -158,19 +160,19 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 					busy = true
 				}
 			}
-			candidates = append(candidates, M{"account": id, "label": c.row["label"], "skip": nullable(reason), "picked": false})
+			candidates = append(candidates, shared.M{"account": id, "label": c.row["label"], "skip": shared.Nullable(reason), "picked": false})
 			if reason == "" {
 				usable = append(usable, c)
 			}
 		}
-		policy := str(p.group["policy"])
+		policy := shared.Str(p.group["policy"])
 		sticky := a.sticky[o.Affinity]
 		stickyValid := o.Sticky > 0 && float64(now-sticky.At) <= o.Sticky*60000
-		urgentWindow := int64(num(fallback(p.group["urgent_window_min"], 180)) * 60000)
+		urgentWindow := int64(shared.Num(shared.Fallback(p.group["urgent_window_min"], 180)) * 60000)
 		preferred := func(x, y schedulingCandidate) bool {
-			xs, ys := a.state(str(x.row["id"])), a.state(str(y.row["id"]))
+			xs, ys := a.state(shared.Str(x.row["id"])), a.state(shared.Str(y.row["id"]))
 			if stickyValid {
-				xp, yp := str(x.row["id"]) == sticky.Account, str(y.row["id"]) == sticky.Account
+				xp, yp := shared.Str(x.row["id"]) == sticky.Account, shared.Str(y.row["id"]) == sticky.Account
 				if xp != yp {
 					return xp
 				}
@@ -179,7 +181,7 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 			case "remaining_desc":
 				return x.remaining > y.remaining
 			case "expiring_first":
-				xe, ye := integer(x.row["card_expires_at"]), integer(y.row["card_expires_at"])
+				xe, ye := shared.Integer(x.row["card_expires_at"]), shared.Integer(y.row["card_expires_at"])
 				xu, yu := xe > 0 && xe-now < urgentWindow, ye > 0 && ye-now < urgentWindow
 				if xu != yu {
 					return xu
@@ -198,7 +200,7 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 		var picked *schedulingCandidate
 		for i := range usable {
 			c := &usable[i]
-			id := str(c.row["id"])
+			id := shared.Str(c.row["id"])
 			s := a.state(id)
 			if s.Inflight >= accountConcurrencyLimit {
 				busy = true
@@ -209,7 +211,7 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 			}
 		}
 		if picked != nil {
-			id := str(picked.row["id"])
+			id := shared.Str(picked.row["id"])
 			a.state(id).Inflight++
 			picked.row["_busy_generation"] = a.state(id).BusyGeneration
 			picked.row["_busy_probe"] = a.state(id).BusyUntil != 0
@@ -217,7 +219,7 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (M, bool, 
 				a.state(id).BusyProbe = true
 			}
 			for _, v := range candidates {
-				if m := obj(v); str(m["account"]) == id {
+				if m := shared.Obj(v); shared.Str(m["account"]) == id {
 					m["picked"] = true
 				}
 			}
@@ -235,14 +237,17 @@ func (a *App) availability() <-chan struct{} {
 	}
 	return a.available
 }
+
 func (a *App) notifyAvailableLocked() {
 	if a.available != nil {
 		close(a.available)
 	}
 	a.available = make(chan struct{})
 }
+
 func (a *App) notifyAvailable() { a.mu.Lock(); a.notifyAvailableLocked(); a.mu.Unlock() }
-func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool, limit time.Duration) (M, bool, []any, string, error) {
+
+func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool, limit time.Duration) (shared.M, bool, []any, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, nil, "", err
 	}
@@ -253,7 +258,7 @@ func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool,
 	a.scheduleMu.Lock()
 	if len(a.waiters) >= maxQueuedRequests {
 		a.scheduleMu.Unlock()
-		return nil, false, nil, "", &Failure{Kind: "busy", Code: "queue_full", Message: "请求等待队列已满", RetryAfter: time.Second}
+		return nil, false, nil, "", &fault.Failure{Kind: "busy", Code: "queue_full", Message: "请求等待队列已满", RetryAfter: time.Second}
 	}
 	a.waiters = append(a.waiters, w)
 	a.scheduleMu.Unlock()
@@ -335,7 +340,7 @@ func (a *App) dispatchAccounts() {
 		account, busy, candidates, policy := a.selectAccount(w.o, w.skip)
 		if account == nil {
 			for _, candidate := range candidates {
-				if obj(candidate)["skip"] == "upstream_busy" {
+				if shared.Obj(candidate)["skip"] == "upstream_busy" {
 					w.deadline = time.Time{}
 					break
 				}
@@ -360,41 +365,41 @@ func (a *App) nextBusyDelay() time.Duration {
 	defer a.mu.Unlock()
 	delay := time.Second
 	for _, s := range a.states {
-		if s.BusyUntil > nowMS() {
-			delay = min(delay, time.Duration(s.BusyUntil-nowMS())*time.Millisecond)
+		if s.BusyUntil > shared.NowMS() {
+			delay = min(delay, time.Duration(s.BusyUntil-shared.NowMS())*time.Millisecond)
 		}
 	}
 	return max(time.Millisecond, delay)
 }
 
-func (a *App) admitAccount(account M) {
+func (a *App) admitAccount(account shared.M) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s := a.state(str(account["id"]))
-	if s.BusyGeneration == integer(account["_busy_generation"]) {
+	s := a.state(shared.Str(account["id"]))
+	if s.BusyGeneration == shared.Integer(account["_busy_generation"]) {
 		s.BusyUntil, s.BusyProbe, s.BusyBackoffStep = 0, false, 0
 		a.notifyAvailableLocked()
 	}
 }
 
 // Publish upstream busy state before waking other requests on slot release.
-func (a *App) finishAccountAttempt(account M, failure *Failure, completed bool, params M) {
+func (a *App) finishAccountAttempt(account shared.M, failure *fault.Failure, completed bool, params shared.M) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s := a.state(str(account["id"]))
+	s := a.state(shared.Str(account["id"]))
 	s.Inflight = max(0, s.Inflight-1)
-	s.LastUsed = nowMS()
-	if failure != nil && classify(failure).Kind == "busy" {
+	s.LastUsed = shared.NowMS()
+	if failure != nil && fault.Classify(failure).Kind == "busy" {
 		// Only the single current recovery probe advances the backoff. Replies
 		// from the same earlier batch may extend a deadline, never compound it.
-		if truth(account["_busy_probe"]) && s.BusyGeneration == integer(account["_busy_generation"]) {
+		if shared.Truth(account["_busy_probe"]) && s.BusyGeneration == shared.Integer(account["_busy_generation"]) {
 			s.BusyBackoffStep = min(7, s.BusyBackoffStep+1)
 		}
 		delay := accountBusyDelay(params, s.BusyBackoffStep, failure.RetryAfter)
 		s.BusyGeneration++
-		s.BusyUntil = max(s.BusyUntil, nowMS()+max(50*time.Millisecond, delay).Milliseconds())
+		s.BusyUntil = max(s.BusyUntil, shared.NowMS()+max(50*time.Millisecond, delay).Milliseconds())
 		s.BusyProbe = false
-	} else if s.BusyGeneration == integer(account["_busy_generation"]) {
+	} else if s.BusyGeneration == shared.Integer(account["_busy_generation"]) {
 		s.BusyProbe = false
 		if completed && failure == nil {
 			s.BusyUntil, s.BusyBackoffStep = 0, 0
@@ -403,14 +408,14 @@ func (a *App) finishAccountAttempt(account M, failure *Failure, completed bool, 
 	a.notifyAvailableLocked()
 }
 
-func accountBusyDelay(params M, step int, retryAfter time.Duration) time.Duration {
-	delay := max(50*time.Millisecond, ms(fallback(params["rate_limit_retry_interval_ms"], 1000)))
+func accountBusyDelay(params shared.M, step int, retryAfter time.Duration) time.Duration {
+	delay := max(50*time.Millisecond, shared.Ms(shared.Fallback(params["rate_limit_retry_interval_ms"], 1000)))
 	limit := max(5*time.Second, delay)
 	for i := 0; i < step && delay < limit; i++ {
 		delay = min(limit, delay*2)
 	}
 	var jitter time.Duration
-	if truth(params["jitter"]) {
+	if shared.Truth(params["jitter"]) {
 		jitter = time.Duration(rand.Float64() * float64(min(250*time.Millisecond, delay/5)))
 	}
 	return max(delay, retryAfter) + jitter

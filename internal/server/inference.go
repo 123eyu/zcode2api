@@ -3,118 +3,25 @@ package server
 import (
 	"context"
 	"math"
-	"math/rand/v2"
-	"net/http"
-	"strconv"
+	rand "math/rand/v2"
 	"time"
+	"zcode2api/internal/server/fault"
+	wire "zcode2api/internal/server/protocol"
+	"zcode2api/internal/server/shared"
 )
 
-func retryAfter(s string, now time.Time) time.Duration {
-	if s == "" {
-		return 0
-	}
-	if n, e := strconv.ParseFloat(s, 64); e == nil && n >= 0 && !math.IsNaN(n) && !math.IsInf(n, 0) && n < float64(1<<63-1)/float64(time.Second) {
-		return time.Duration(n * float64(time.Second))
-	}
-	if t, e := http.ParseTime(s); e == nil {
-		return max(0, t.Sub(now))
-	}
-	return 0
+func (a *App) retryParams() shared.M {
+	return shared.Merge(shared.Obj(a.configValue("retry")), shared.Obj(a.setting("retry", shared.M{})))
 }
-func classify(f *Failure) *Failure {
-	if f == nil {
-		return nil
-	}
-	if f.Code == "captcha_verification_failed" {
-		switch f.VerifyCode {
-		case "F001":
-			f.Kind, f.Code, f.Retryable = "risk", "captcha_risk_blocked", false
-		case "F010":
-			f.Kind, f.Code, f.Retryable = "rate_limit", "captcha_ip_rate_limited", true
-		case "F011":
-			f.Kind, f.Code, f.Retryable = "rate_limit", "captcha_device_rate_limited", true
-		}
-	}
-	if f.Kind != "" {
-		return f
-	}
-	switch f.Code {
-	case "3008", "3009", "3010":
-		f.Kind, f.Retryable = "busy", true
-		return f
-	}
-	if f.Status == http.StatusTooManyRequests {
-		f.Kind, f.Retryable = "rate_limit", true
-		return f
-	}
-	kind := ""
-	retry := false
-	switch f.Code {
-	case "rate_limit_error", "1302", "1303", "1305", "3002", "F010", "F011", "captcha_ip_rate_limited", "captcha_device_rate_limited":
-		kind, retry = "rate_limit", true
-	case "authentication_error":
-		kind = "auth"
-	case "3007":
-		kind = "auth"
-		if explicitCaptchaChallenge(f.Message) {
-			kind = "risk"
-		}
-	case "permission_error":
-		kind = "permission"
-	case "invalid_request_error", "3001", "3006":
-		kind = "invalid"
-	case "500", "2007", "1120", "1230":
-		kind, retry = "server", true
-	case "1234", "network", "upstream_stream_error", "proxy_auth_failed", "proxy_connection_failed":
-		kind, retry = "network", true
-	case "503", "529", "1312", "engine_overloaded_error", "overloaded_error":
-		kind, retry = "overload", true
-	case "1005", "1006", "3103", "2056", "20097", "1316", "1317", "1318", "1319", "1320", "1321", "insufficient_quota":
-		kind = "quota"
-	case "1261":
-		kind = "context"
-	case "1113", "1309", "1311", "1304", "1308", "1310", "1313", "1008", "1314", "1315":
-		kind = "terminal"
-	case "3012", "upstream_risk_blocked":
-		kind = "account_risk"
-	case "CAPTCHA_VERIFY_FAILED", "coding_plan_security_verification_required", "captcha_expired", "captcha_invalid", "captcha_verification_failed", "captcha_duplicate_result", "captcha_config_risk_blocked", "captcha_risk_blocked", "upstream_waf_blocked", "F001", "F008", "F014", "F018", "F019", "F020":
-		kind = "risk"
-	case "timeout", "first_token_timeout", "stream_idle_timeout", "inference_timeout", "captcha_config_timeout", "retry_budget_exhausted":
-		kind, retry = "timeout", true
-	case "throttle_window_exhausted":
-		kind, retry = "rate_limit", true
-	}
-	if kind == "" {
-		switch {
-		case riskBlockMessage(f.Message):
-			kind = "account_risk"
-		case f.Status == 401:
-			kind = "auth"
-		case f.Status == 403:
-			kind = "permission"
-		case f.Status == 503 || f.Status == 529:
-			kind, retry = "overload", true
-		case f.Status >= 500:
-			kind, retry = "server", true
-		case f.Status == 400:
-			kind = "invalid"
-		default:
-			kind = "unknown"
-		}
-	}
-	f.Kind, f.Retryable = kind, retry
-	return f
-}
-func (a *App) retryParams() M {
-	return merge(obj(a.configValue("retry")), obj(a.setting("retry", M{})))
-}
-func busyWait(p M) time.Duration {
-	s := num(p["busy_wait_sec"])
+
+func busyWait(p shared.M) time.Duration {
+	s := shared.Num(p["busy_wait_sec"])
 	if s <= 0 {
 		s = 10
 	}
 	return time.Duration(math.Min(600, s) * float64(time.Second))
 }
+
 func (a *App) state(id string) *accountState {
 	s := a.states[id]
 	if s == nil {
@@ -123,17 +30,18 @@ func (a *App) state(id string) *accountState {
 	}
 	return s
 }
-func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
+
+func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.Failure) {
 	if o.Timing == nil {
 		o.Timing = newTiming()
 	}
 	p := a.retryParams()
-	remainingBudget := max(10*time.Second, ms(p["total_budget_ms"]))
+	remainingBudget := max(10*time.Second, shared.Ms(p["total_budget_ms"]))
 	var throttleDeadline time.Time
 	excluded, round := map[string]bool{}, map[string]bool{}
 	throttled := map[string]time.Time{}
 	accountFailures := map[string]int{}
-	var last, lastThrottle *Failure
+	var last, lastThrottle *fault.Failure
 	clearThrottle := func(id string) {
 		delete(throttled, id)
 		delete(round, id)
@@ -144,13 +52,13 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 	}
 	attempts, regular := 0, 0
 	rotated := []any{}
-	var lastAccount M
-	fail := func(f *Failure) (*Result, *Failure) {
+	var lastAccount shared.M
+	fail := func(f *fault.Failure) (*wire.Result, *fault.Failure) {
 		if f == nil {
-			f = &Failure{Kind: "exhausted", Code: "no_account", Message: "所有账号不可用（到期/冷却/额度/模型不符）"}
+			f = &fault.Failure{Kind: "exhausted", Code: "no_account", Message: "所有账号不可用（到期/冷却/额度/模型不符）"}
 		}
 		if ctx.Err() != nil {
-			f = &Failure{Kind: "canceled", Code: "canceled", Message: "客户端已断开", Detail: failureDetail(f)}
+			f = &fault.Failure{Kind: "canceled", Code: "canceled", Message: "客户端已断开", Detail: fault.FailureDetail(f)}
 		}
 		f.Attempts = attempts
 		if len(throttled) > 0 && (f.Kind == "busy" || f.Kind == "rate_limit" || f.Kind == "overload") {
@@ -165,7 +73,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 	}
 	wait := func(d time.Duration) error {
 		start := time.Now()
-		e := pause(ctx, d)
+		e := shared.Pause(ctx, d)
 		o.Timing.retry += time.Since(start)
 		return e
 	}
@@ -181,7 +89,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			}
 		} else if remainingBudget <= 0 {
 			if last == nil {
-				last = &Failure{Kind: "timeout", Code: "retry_budget_exhausted", Message: "故障重试超时"}
+				last = &fault.Failure{Kind: "timeout", Code: "retry_budget_exhausted", Message: "故障重试超时"}
 			}
 			return fail(last)
 		}
@@ -209,7 +117,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 		account, busy, candidates, policy, e := a.acquire(ctx, o, skip, max(0, min(busyWait(p), time.Until(deadline))))
 		o.Timing.queue += time.Since(start)
 		if e != nil {
-			if f, ok := e.(*Failure); ok {
+			if f, ok := e.(*fault.Failure); ok {
 				return fail(f)
 			}
 			return fail(nil)
@@ -218,7 +126,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 		if account != nil {
 			picked = account["id"]
 		}
-		_ = a.exec("INSERT INTO schedule_log(ts,request_id,chain,candidates,policy,picked) VALUES(?,?,?,?,?,?)", nowMS(), o.ID, js(a.keyChain(o.Key)), js(candidates), policy, picked)
+		_ = a.exec("INSERT INTO schedule_log(ts,request_id,chain,candidates,policy,picked) VALUES(?,?,?,?,?,?)", shared.NowMS(), o.ID, shared.JSON(a.keyChain(o.Key)), shared.JSON(candidates), policy, picked)
 		if !throttleDeadline.IsZero() && !time.Now().Before(throttleDeadline) {
 			if account != nil {
 				a.finishAccountAttempt(account, nil, false, nil)
@@ -250,12 +158,12 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 				return fail(last)
 			}
 			if busy {
-				return fail(&Failure{Kind: "busy", Code: "account_busy", Message: "账号忙碌，等待超时"})
+				return fail(&fault.Failure{Kind: "busy", Code: "account_busy", Message: "账号忙碌，等待超时"})
 			}
 			return fail(nil)
 		}
-		id := str(account["id"])
-		if lastAccount != nil && str(lastAccount["id"]) != id {
+		id := shared.Str(account["id"])
+		if lastAccount != nil && shared.Str(lastAccount["id"]) != id {
 			rotated = append(rotated, id)
 		}
 		lastAccount = account
@@ -267,20 +175,19 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 		o.OnAdmitted = func() { a.admitAccount(account) }
 		attemptStart := time.Now()
 		result, f := a.inferHTTP(ctx, account, o)
-		if f != nil && classify(f).Kind == "quota" {
+		if f != nil && fault.Classify(f).Kind == "quota" {
 			// Publish exhaustion before releasing the slot and waking queued requests.
 			a.markQuotaExhausted(id)
 		}
 		a.finishAccountAttempt(account, f, true, p)
 		if f == nil {
 			a.mu.Lock()
-			a.state(id).Cooldown = 0
 			if o.Sticky > 0 {
-				a.sticky[o.Affinity] = stickyEntry{id, nowMS()}
+				a.sticky[o.Affinity] = stickyEntry{id, shared.NowMS()}
 			}
 			if len(a.sticky) > 1000 {
 				for k, v := range a.sticky {
-					if nowMS()-v.At > 86400000 {
+					if shared.NowMS()-v.At > 86400000 {
 						delete(a.sticky, k)
 					}
 				}
@@ -291,7 +198,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			a.logUsage(o, result, nil, account, attempts, rotated)
 			return result, nil
 		}
-		last = classify(f)
+		last = fault.Classify(f)
 		if f.Committed {
 			return fail(f)
 		}
@@ -307,7 +214,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			remainingBudget -= time.Since(attemptStart)
 			continue
 		case "auth":
-			if a.updateAccountStatusIfCurrent(account, nil, M{"status": "needs_relogin", "fail_streak": integer(account["fail_streak"]) + 1, "last_error": "ZCode 登录鉴权失效，请重新授权"}) {
+			if a.updateAccountStatusIfCurrent(account, nil, shared.M{"status": "needs_relogin", "fail_streak": shared.Integer(account["fail_streak"]) + 1, "last_error": "ZCode 登录鉴权失效，请重新授权"}) {
 				a.background(func() { _, _ = a.startOAuth(a.ctx, a.accountLoginProvider(account), id, false) })
 			}
 			excluded[id] = true
@@ -318,10 +225,10 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			clearThrottle(id)
 			a.background(func() {
 				if b, e := a.fetchBalanceFresh(a.ctx, account); e == nil {
-					if truth(b["ok"]) {
+					if shared.Truth(b["ok"]) {
 						a.applyBalance(account, b, true)
-					} else if truth(b["authFailed"]) {
-						a.updateAccountStatusIfCurrent(account, b, M{"status": "needs_relogin"})
+					} else if shared.Truth(b["authFailed"]) {
+						a.updateAccountStatusIfCurrent(account, b, shared.M{"status": "needs_relogin"})
 					}
 				}
 			})
@@ -334,7 +241,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			lastThrottle = f
 			delay := f.RetryAfter
 			if delay <= 0 {
-				delay = ms(fallback(p["rate_limit_retry_interval_ms"], 1000))
+				delay = shared.Ms(shared.Fallback(p["rate_limit_retry_interval_ms"], 1000))
 			}
 			throttled[id] = time.Now().Add(max(50*time.Millisecond, delay))
 			round[id] = true
@@ -348,7 +255,7 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			return fail(f)
 		}
 		regular++
-		if regular >= max(1, int(integer(p["max_attempts"]))) {
+		if regular >= max(1, int(shared.Integer(p["max_attempts"]))) {
 			return fail(f)
 		}
 		if f.ProxyFailover {
@@ -360,21 +267,22 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*Result, *Failure) {
 			clearThrottle(id)
 			continue
 		}
-		delay := math.Min(num(p["max_delay_ms"]), num(p["base_delay_ms"])*math.Pow(num(p["backoff_factor"]), float64(regular-1)))
-		if truth(p["jitter"]) {
+		delay := math.Min(shared.Num(p["max_delay_ms"]), shared.Num(p["base_delay_ms"])*math.Pow(shared.Num(p["backoff_factor"]), float64(regular-1)))
+		if shared.Truth(p["jitter"]) {
 			delay *= 0.8 + rand.Float64()*0.4
 		}
 		delayStart := time.Now()
-		if wait(min(ms(delay), remainingBudget, max(0, time.Until(deadline)))) != nil {
+		if wait(min(shared.Ms(delay), remainingBudget, max(0, time.Until(deadline)))) != nil {
 			return fail(f)
 		}
 		remainingBudget -= time.Since(delayStart)
 	}
 }
-func (a *App) logUsage(o inferOptions, r *Result, f *Failure, account M, attempts int, rotated []any) {
+
+func (a *App) logUsage(o inferOptions, r *wire.Result, f *fault.Failure, account shared.M, attempts int, rotated []any) {
 	status := "success"
 	var code, message, detail any
-	u := M{}
+	u := shared.M{}
 	trace := ""
 	if r != nil {
 		u = r.Usage
@@ -388,11 +296,11 @@ func (a *App) logUsage(o inferOptions, r *Result, f *Failure, account M, attempt
 		if f.Kind == "busy" {
 			status = "busy"
 		}
-		code, message = fallback(f.Code, f.Kind), conciseFailureMessage(f)
-		diagnostic := failureDetail(f)
-		detail = js(diagnostic)
-		trace = str(diagnostic["trace_id"])
+		code, message = shared.Fallback(f.Code, f.Kind), fault.ConciseFailureMessage(f)
+		diagnostic := fault.FailureDetail(f)
+		detail = shared.JSON(diagnostic)
+		trace = shared.Str(diagnostic["trace_id"])
 	}
 	timings := o.Timing.snapshot()
-	_ = a.exec("INSERT INTO usage_log(request_id,ts,key_id,client_ip,account_id,family,model,reasoning_level,stream,attempt_count,rotated_accounts,status,error_code,error_message,ttft_ms,total_ms,tokens_in,tokens_out,tokens_reasoning,cache_read,cache_write,prompt_hash,timings,trace_id,error_detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", o.ID, nowMS(), o.Key["id"], o.IP, account["id"], account["family"], o.Model, nullable(o.Level), integer(o.Stream), attempts, js(rotated), status, code, message, timings["ttft_ms"], timings["total_ms"], u["inputTokens"], u["outputTokens"], u["reasoningTokens"], u["cacheReadTokens"], u["cacheWriteTokens"], hash(js(o.Body))[:12], js(timings), nullable(trace), detail)
+	_ = a.exec("INSERT INTO usage_log(request_id,ts,key_id,client_ip,account_id,family,model,reasoning_level,stream,attempt_count,rotated_accounts,status,error_code,error_message,ttft_ms,total_ms,tokens_in,tokens_out,tokens_reasoning,cache_read,cache_write,prompt_hash,timings,trace_id,error_detail) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", o.ID, shared.NowMS(), o.Key["id"], o.IP, account["id"], account["family"], o.Model, shared.Nullable(o.Level), shared.Integer(o.Stream), attempts, shared.JSON(rotated), status, code, message, timings["ttft_ms"], timings["total_ms"], u["inputTokens"], u["outputTokens"], u["reasoningTokens"], u["cacheReadTokens"], u["cacheWriteTokens"], shared.Hash(shared.JSON(o.Body))[:12], shared.JSON(timings), shared.Nullable(trace), detail)
 }

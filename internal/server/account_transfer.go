@@ -5,8 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
+	accountdata "zcode2api/internal/server/account"
+	"zcode2api/internal/server/shared"
+	"zcode2api/internal/server/storage"
 )
 
 const accountTransferFormat = "zcode2api-accounts"
@@ -31,7 +35,7 @@ type transferAccount struct {
 	Disabled               bool              `json:"disabled,omitempty"`
 }
 
-func (a *App) exportAccounts(b M) (any, int, error) {
+func (a *App) exportAccounts(b shared.M) (any, int, error) {
 	selected := map[string]bool{}
 	if raw, present := b["account_ids"]; present {
 		ids, valid := raw.([]any)
@@ -46,38 +50,38 @@ func (a *App) exportAccounts(b M) (any, int, error) {
 			selected[id] = true
 		}
 	}
-	rows, err := query(a.db, "SELECT * FROM accounts ORDER BY created_at,id")
+	rows, err := storage.Query(a.db, "SELECT * FROM accounts ORDER BY created_at,id")
 	if err != nil {
 		return nil, 500, err
 	}
 	file := accountTransferFile{Format: accountTransferFormat, Version: 1, ExportedAt: time.Now().UTC().Format(time.RFC3339), Accounts: []transferAccount{}}
 	for _, value := range rows {
-		r := obj(value)
-		if len(selected) > 0 && !selected[str(r["id"])] {
+		r := shared.Obj(value)
+		if len(selected) > 0 && !selected[shared.Str(r["id"])] {
 			continue
 		}
-		entry := transferAccount{Label: str(r["label"]), Family: str(r["family"]), CustomerID: str(r["customer_id"]), DeviceMid: str(r["device_mid"]), Tokens: map[string]string{}, Disabled: r["status"] == "disabled"}
+		entry := transferAccount{Label: shared.Str(r["label"]), Family: shared.Str(r["family"]), CustomerID: shared.Str(r["customer_id"]), DeviceMid: shared.Str(r["device_mid"]), Tokens: map[string]string{}, Disabled: r["status"] == "disabled"}
 		var encrypted map[string]string
-		if err := json.Unmarshal([]byte(str(r["enc_tokens"])), &encrypted); err != nil {
-			return adminError(409, "账号 "+str(r["id"])+" 的凭据损坏，未导出")
+		if err := json.Unmarshal([]byte(shared.Str(r["enc_tokens"])), &encrypted); err != nil {
+			return adminError(409, "账号 "+shared.Str(r["id"])+" 的凭据损坏，未导出")
 		}
 		for key, value := range encrypted {
-			plain, err := decrypt(value, a.secret)
+			plain, err := accountdata.Decrypt(value, a.secret)
 			if err != nil {
-				return adminError(409, "账号 "+str(r["id"])+" 的凭据无法解密，未导出")
+				return adminError(409, "账号 "+shared.Str(r["id"])+" 的凭据无法解密，未导出")
 			}
 			entry.Tokens[key] = plain
 		}
 		if r["web_cookie_expires_at"] != nil {
-			v := integer(r["web_cookie_expires_at"])
+			v := shared.Integer(r["web_cookie_expires_at"])
 			entry.WebCookieExpiresAt = &v
 		}
 		if r["business_token_expires_at"] != nil {
-			v := integer(r["business_token_expires_at"])
+			v := shared.Integer(r["business_token_expires_at"])
 			entry.BusinessTokenExpiresAt = &v
 		}
 		if err := entry.validate(); err != nil {
-			return adminError(409, "账号 "+str(r["id"])+" 无法导出："+err.Error())
+			return adminError(409, "账号 "+shared.Str(r["id"])+" 无法导出："+err.Error())
 		}
 		file.Accounts = append(file.Accounts, entry)
 	}
@@ -88,7 +92,7 @@ func (a *App) exportAccounts(b M) (any, int, error) {
 		return adminError(400, "每次可导出 1–10000 个账号，请调整筛选范围")
 	}
 	// Leave room for the import request envelope under readBody's 32 MiB limit.
-	if len(js(file)) > 30<<20 {
+	if len(shared.JSON(file)) > 30<<20 {
 		return adminError(400, "导出文件过大，请缩小筛选范围后分批导出")
 	}
 	return file, 200, nil
@@ -98,8 +102,8 @@ func (entry *transferAccount) validate() error {
 	if entry.Family != "bigmodel" && entry.Family != "zai" {
 		return fmt.Errorf("账号平台无效")
 	}
-	provider := loginProvider(entry.Family, entry.Tokens)
-	if !validLoginProvider(provider) || loginFamily(provider) != entry.Family {
+	provider := accountdata.LoginProvider(entry.Family, entry.Tokens)
+	if !accountdata.ValidLoginProvider(provider) || accountdata.LoginFamily(provider) != entry.Family {
 		return fmt.Errorf("登录渠道与账号平台不匹配")
 	}
 	if len([]rune(entry.Label)) > 200 || len(entry.CustomerID) > 512 || len(entry.DeviceMid) > 512 || strings.ContainsAny(entry.DeviceMid, "\r\n\x00") {
@@ -118,13 +122,13 @@ func (entry *transferAccount) validate() error {
 	}
 	identity := ""
 	if token := entry.Tokens["zcode_jwt"]; token != "" {
-		identity = str(jwtPayload(token)["user_id"])
+		identity = shared.Str(accountdata.JwtPayload(token)["user_id"])
 		if entry.Tokens["active_provider"] != "" && (identity == "" || len(strings.Split(token, ".")) != 3) {
 			return fmt.Errorf("缺少有效的 ZCode 登录身份")
 		}
 	} else {
-		payload := jwtPayload(entry.Tokens["web_jwt"])
-		identity = str(first(payload["customer_id"], payload["user_id"]))
+		payload := accountdata.JwtPayload(entry.Tokens["web_jwt"])
+		identity = shared.Str(shared.First(payload["customer_id"], payload["user_id"]))
 	}
 	if identity != "" {
 		if entry.CustomerID != "" && entry.CustomerID != identity {
@@ -133,18 +137,18 @@ func (entry *transferAccount) validate() error {
 		entry.CustomerID = identity
 	}
 	if raw := entry.Tokens["provider_user_info"]; raw != "" {
-		var profile M
-		if json.Unmarshal([]byte(raw), &profile) != nil || profile == nil || truth(profile["user_id"]) && str(profile["user_id"]) != identity {
+		var profile shared.M
+		if json.Unmarshal([]byte(raw), &profile) != nil || profile == nil || shared.Truth(profile["user_id"]) && shared.Str(profile["user_id"]) != identity {
 			return fmt.Errorf("用户资料与登录身份不一致")
 		}
-		entry.Tokens["provider_user_info"] = js(loginProfile(profile))
+		entry.Tokens["provider_user_info"] = shared.JSON(accountdata.LoginProfile(profile))
 	}
 	if raw := entry.Tokens["linked_bigmodel"]; raw != "" {
-		var linked M
-		if json.Unmarshal([]byte(raw), &linked) != nil || identity == "" || str(linked["userId"]) != identity || str(linked["customerId"]) == "" || str(linked["accessToken"]) == "" {
+		var linked shared.M
+		if json.Unmarshal([]byte(raw), &linked) != nil || identity == "" || shared.Str(linked["userId"]) != identity || shared.Str(linked["customerId"]) == "" || shared.Str(linked["accessToken"]) == "" {
 			return fmt.Errorf("BigModel 关联凭据与登录身份不一致")
 		}
-		if provider == "zai_cn" && (entry.Tokens["business_token"] != "" && entry.Tokens["business_token"] != str(linked["accessToken"]) || entry.Tokens["business_customer_id"] != "" && entry.Tokens["business_customer_id"] != str(linked["customerId"])) {
+		if provider == "zai_cn" && (entry.Tokens["business_token"] != "" && entry.Tokens["business_token"] != shared.Str(linked["accessToken"]) || entry.Tokens["business_customer_id"] != "" && entry.Tokens["business_customer_id"] != shared.Str(linked["customerId"])) {
 			return fmt.Errorf("BigModel 关联与业务凭据不一致")
 		}
 	}
@@ -164,21 +168,21 @@ func (entry *transferAccount) validate() error {
 
 func (entry transferAccount) identityKeys() []string {
 	keys := []string{}
-	provider := loginProvider(entry.Family, entry.Tokens)
+	provider := accountdata.LoginProvider(entry.Family, entry.Tokens)
 	if entry.CustomerID != "" {
 		keys = append(keys, provider+":id:"+entry.CustomerID)
 	}
 	for _, kind := range []string{"zcode_jwt", "web_jwt", "business_token"} {
 		if token := entry.Tokens[kind]; token != "" {
-			keys = append(keys, provider+":"+kind+":"+hash(token))
+			keys = append(keys, provider+":"+kind+":"+shared.Hash(token))
 		}
 	}
 	return keys
 }
 
-func (a *App) importAccounts(ctx context.Context, b M) (any, int, error) {
+func (a *App) importAccounts(ctx context.Context, b shared.M) (any, int, error) {
 	var file accountTransferFile
-	if err := json.Unmarshal([]byte(js(b["data"])), &file); err != nil || file.Format != accountTransferFormat || file.Version != 1 {
+	if err := json.Unmarshal([]byte(shared.JSON(b["data"])), &file); err != nil || file.Format != accountTransferFormat || file.Version != 1 {
 		return adminError(400, "文件格式或版本不支持，请选择本程序导出的账号 JSON 文件")
 	}
 	if len(file.Accounts) == 0 || len(file.Accounts) > 10000 {
@@ -193,7 +197,7 @@ func (a *App) importAccounts(ctx context.Context, b M) (any, int, error) {
 	if b["group_id"] != nil && !validGroup {
 		return adminError(400, "目标分组无效")
 	}
-	appVersion := str(a.configValue("app_version"))
+	appVersion := shared.Str(a.configValue("app_version"))
 	a.credentialMu.Lock()
 	defer a.credentialMu.Unlock()
 	tx, err := a.db.BeginTx(ctx, nil)
@@ -215,13 +219,13 @@ func (a *App) importAccounts(ctx context.Context, b M) (any, int, error) {
 		}
 	}
 	seen := map[string]bool{}
-	rows, err := query(tx, "SELECT family,customer_id,enc_tokens FROM accounts")
+	rows, err := storage.Query(tx, "SELECT family,customer_id,enc_tokens FROM accounts")
 	if err != nil {
 		return nil, 500, err
 	}
 	for _, value := range rows {
-		r := obj(value)
-		entry := transferAccount{Family: str(r["family"]), CustomerID: str(r["customer_id"]), Tokens: a.accountTokens(r)}
+		r := shared.Obj(value)
+		entry := transferAccount{Family: shared.Str(r["family"]), CustomerID: shared.Str(r["customer_id"]), Tokens: a.accountTokens(r)}
 		for _, key := range entry.identityKeys() {
 			seen[key] = true
 		}
@@ -257,7 +261,7 @@ func (a *App) importAccounts(ctx context.Context, b M) (any, int, error) {
 		if entry.Disabled {
 			status = "disabled"
 		}
-		id, err := a.insertAccountRow(tx, M{"label": fallback(entry.Label, "导入账号"), "family": entry.Family, "customer_id": nullable(entry.CustomerID), "group_id": nullable(targetGroup), "status": status, "device_mid": entry.DeviceMid, "web_cookie_expires_at": entry.WebCookieExpiresAt, "business_token_expires_at": entry.BusinessTokenExpiresAt, "source": "file"}, entry.Tokens, appVersion)
+		id, err := a.insertAccountRow(tx, shared.M{"label": shared.Fallback(entry.Label, "导入账号"), "family": entry.Family, "customer_id": shared.Nullable(entry.CustomerID), "group_id": shared.Nullable(targetGroup), "status": status, "device_mid": entry.DeviceMid, "web_cookie_expires_at": entry.WebCookieExpiresAt, "business_token_expires_at": entry.BusinessTokenExpiresAt, "source": "file"}, entry.Tokens, appVersion)
 		if err != nil {
 			return nil, 500, err
 		}
@@ -276,5 +280,42 @@ func (a *App) importAccounts(ctx context.Context, b M) (any, int, error) {
 		a.scheduleNext(id, time.Second+time.Duration(i)*300*time.Millisecond)
 	}
 	a.notifyAvailable()
-	return M{"ok": true, "imported": imported, "skipped": skipped, "total": len(file.Accounts)}, 200, nil
+	return shared.M{"ok": true, "imported": imported, "skipped": skipped, "total": len(file.Accounts)}, 200, nil
+}
+
+func (a *App) importLocal(ctx context.Context, b shared.M) (shared.M, error) {
+	if !a.localImportMu.TryLock() {
+		return shared.M{"ok": false, "error": "正在导入客户端账号，请稍候"}, nil
+	}
+	defer a.localImportMu.Unlock()
+	path, err := accountdata.ClientCredentialsPath(shared.Str(b["credentials_path"]))
+	if err != nil {
+		return shared.M{"ok": false, "error": err.Error()}, nil
+	}
+	clientType := shared.Str(shared.Fallback(b["client_type"], "desktop"))
+	if clientType != "desktop" && clientType != "cli" {
+		return shared.M{"ok": false, "error": "客户端类型须为 desktop 或 cli"}, nil
+	}
+	tokens, identity, err := accountdata.LoadClientAccount(ctx, path, clientType)
+	if err != nil {
+		return shared.M{"ok": false, "error": err.Error()}, nil
+	}
+	device := ""
+	if data, err := accountdata.ReadClientCredentialFile(filepath.Join(filepath.Dir(path), "telemetry-state.json"), 1<<20); err == nil {
+		if mid := shared.Str(shared.Obj(shared.Parse(string(data), nil))["deviceMid"]); mid != "" && len(mid) <= 512 && !strings.ContainsAny(mid, "\r\n\x00") {
+			device = mid
+		}
+	}
+	account, updated, err := a.saveLoginAccount("", identity, shared.M{"label": shared.Fallback(b["label"], "客户端-"+shared.Str(tokens["active_provider"])), "source": "local", "device_mid": device}, tokens)
+	if err != nil {
+		return nil, err
+	}
+	id := shared.Str(account["id"])
+	result := a.verifyImportedAccount(ctx, account)
+	imported := 1
+	if updated {
+		imported = 0
+	}
+	// Import success means credentials were saved; upstream verification is separate.
+	return shared.M{"ok": true, "id": id, "login_provider": tokens["active_provider"], "imported": imported, "updated": updated, "verified": shared.Truth(result["ok"]), "status": result["status"], "reason": result["reason"], "results": []any{result}}, nil
 }

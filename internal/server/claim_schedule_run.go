@@ -7,10 +7,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	captchasdk "zcode2api/internal/server/captcha"
+	"zcode2api/internal/server/fault"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
+	"zcode2api/internal/server/storage"
 )
 
 const dailyClaimRecoveryWindow = 10 * time.Minute
+
 const dailyClaimRecoveryDelay = time.Minute
+
 const dailyClaimConcurrency = 5
 
 type scheduledClaimContextKey struct{}
@@ -42,27 +49,27 @@ type scheduledClaimAccount struct {
 	Status    string                `json:"status"`
 	ExitHash  string                `json:"exit_hash,omitempty"`
 	SameExit  bool                  `json:"same_exit,omitempty"`
-	Result    M                     `json:"result,omitempty"`
+	Result    shared.M              `json:"result,omitempty"`
 	Items     []*scheduledClaimItem `json:"items"`
 }
 
 type scheduledClaimItem struct {
-	PlanID   string `json:"plan_id"`
-	Attempts int    `json:"attempts"`
-	Status   string `json:"status"`
-	Result   M      `json:"result,omitempty"`
+	PlanID   string   `json:"plan_id"`
+	Attempts int      `json:"attempts"`
+	Status   string   `json:"status"`
+	Result   shared.M `json:"result,omitempty"`
 }
 
 func cloneScheduledClaimAccount(account *scheduledClaimAccount) *scheduledClaimAccount {
 	copy := *account
 	if account.Result != nil {
-		copy.Result = clone(account.Result)
+		copy.Result = shared.Clone(account.Result)
 	}
 	copy.Items = make([]*scheduledClaimItem, len(account.Items))
 	for index, item := range account.Items {
 		itemCopy := *item
 		if item.Result != nil {
-			itemCopy.Result = clone(item.Result)
+			itemCopy.Result = shared.Clone(item.Result)
 		}
 		copy.Items[index] = &itemCopy
 	}
@@ -74,36 +81,36 @@ func scheduledClaimOpen(status string) bool {
 }
 
 // Keep one copy of results in the checkpoint; flatten only for API consumers.
-func scheduledClaimReport(run M) M {
-	if integer(run["version"]) != 2 {
+func scheduledClaimReport(run shared.M) shared.M {
+	if shared.Integer(run["version"]) != 2 {
 		return run
 	}
 	results := []any{}
-	for _, value := range arr(run["accounts"]) {
-		account := obj(value)
+	for _, value := range shared.Arr(run["accounts"]) {
+		account := shared.Obj(value)
 		if account["result"] != nil {
-			results = append(results, merge(obj(account["result"]), M{"account": account["account_id"], "status": account["status"]}))
+			results = append(results, shared.Merge(shared.Obj(account["result"]), shared.M{"account": account["account_id"], "status": account["status"]}))
 		}
-		for _, value := range arr(account["items"]) {
-			item := obj(value)
-			results = append(results, merge(obj(item["result"]), M{"account": account["account_id"], "plan_id": item["plan_id"], "status": item["status"], "attempts": item["attempts"]}))
+		for _, value := range shared.Arr(account["items"]) {
+			item := shared.Obj(value)
+			results = append(results, shared.Merge(shared.Obj(item["result"]), shared.M{"account": account["account_id"], "plan_id": item["plan_id"], "status": item["status"], "attempts": item["attempts"]}))
 		}
 	}
 	run["results"] = results
 	return run
 }
 
-func scheduledClaimError(ctx context.Context, err error) M {
-	var failure *Failure
+func scheduledClaimError(ctx context.Context, err error) shared.M {
+	var failure *fault.Failure
 	if !errors.As(err, &failure) {
-		failure = transportFailure(context.WithoutCancel(ctx), err)
+		failure = routing.TransportFailure(context.WithoutCancel(ctx), err)
 	}
-	failure = classify(failure)
-	return M{"ok": false, "code": failure.Code, "error": conciseFailureMessage(failure), "message": conciseFailureMessage(failure), "failure_kind": failure.Kind, "retryable": failure.Retryable, "retry_after_ms": failure.RetryAfter.Milliseconds(), "requires_verification": claimBrowserFallback(failure)}
+	failure = fault.Classify(failure)
+	return shared.M{"ok": false, "code": failure.Code, "error": fault.ConciseFailureMessage(failure), "message": fault.ConciseFailureMessage(failure), "failure_kind": failure.Kind, "retryable": failure.Retryable, "retry_after_ms": failure.RetryAfter.Milliseconds(), "requires_verification": captchasdk.ClaimBrowserFallback(failure)}
 }
 
-func scheduledClaimRetryable(result M) bool {
-	switch str(result["code"]) {
+func scheduledClaimRetryable(result shared.M) bool {
+	switch shared.Str(result["code"]) {
 	case "captcha_risk_blocked", "F001":
 		return false // An explicit risk refusal is not a transient transport error.
 	case "captcha_timeout", "captcha_config_timeout", "captcha_expired", "captcha_invalid", "captcha_duplicate_result", "captcha_invalid_result", "captcha_config_changed", "F008", "F014", "F018", "F019", "F020", "CAPTCHA_VERIFY_FAILED", "coding_plan_security_verification_required", "claim_invalid_response", "claim_request_failed", "in_progress", "canceled":
@@ -111,25 +118,25 @@ func scheduledClaimRetryable(result M) bool {
 	case "captcha_runtime_error":
 		// SDK initialization failures can be transient; a missing/broken Node
 		// runtime cannot be repaired by repeating the same command.
-		stage := str(obj(result["verification"])["sdk_stage"])
+		stage := shared.Str(shared.Obj(result["verification"])["sdk_stage"])
 		return stage == "sdk_load" || stage == "sdk_init" || stage == "sdk_ready" || stage == "sdk_verify"
 	case "captcha_interaction_required", "captcha_jsdom_missing", "captcha_proxy_unsupported", "captcha_config_invalid", "captcha_scene_disabled", "captcha_session_invalid":
 		return false
 	}
-	switch str(result["failure_kind"]) {
+	switch shared.Str(result["failure_kind"]) {
 	case "auth", "account_risk", "permission", "invalid":
 		return false
 	}
-	return truth(result["retryable"])
+	return shared.Truth(result["retryable"])
 }
 
 // Waiting for a shared cooldown is not an SDK execution or a claim attempt.
-func scheduledClaimWaiting(result M) bool {
+func scheduledClaimWaiting(result shared.M) bool {
 	if result["code"] == "in_progress" {
 		return true
 	}
-	diagnostic := obj(result["verification"])
-	return integer(result["retry_after_ms"]) > 0 && !truth(diagnostic["sdk_executed"]) && !truth(diagnostic["claim_request_started"]) &&
+	diagnostic := shared.Obj(result["verification"])
+	return shared.Integer(result["retry_after_ms"]) > 0 && !shared.Truth(diagnostic["sdk_executed"]) && !shared.Truth(diagnostic["claim_request_started"]) &&
 		(diagnostic["stage"] == "admission" || diagnostic["sdk_stage"] == "admission")
 }
 
@@ -159,7 +166,7 @@ func (run *scheduledClaimRun) summarize() {
 		for _, item := range account.Items {
 			switch item.Status {
 			case "claimed":
-				if !truth(item.Result["external_claim"]) {
+				if !shared.Truth(item.Result["external_claim"]) {
 					run.Claimed++
 				}
 			case "needs_verification":
@@ -188,7 +195,7 @@ func (run *scheduledClaimRun) summarize() {
 		run.Status = "partial"
 	}
 	if run.FinishedAt == 0 {
-		run.FinishedAt = nowMS()
+		run.FinishedAt = shared.NowMS()
 	}
 }
 
@@ -200,16 +207,16 @@ func (a *App) saveScheduledClaims(run *scheduledClaimRun) error {
 func finishScheduledAccount(account *scheduledClaimAccount) {
 	account.Status, account.RetryAt = "completed", 0
 	if len(account.Items) == 0 && account.Result == nil {
-		account.Result = M{"ok": false, "message": "本次自动领取未完成，等待下次计划"}
+		account.Result = shared.M{"ok": false, "message": "本次自动领取未完成，等待下次计划"}
 	}
 	for _, item := range account.Items {
 		if scheduledClaimOpen(item.Status) {
 			item.Status = "failed"
-			if truth(item.Result["requires_verification"]) {
+			if shared.Truth(item.Result["requires_verification"]) {
 				item.Status = "needs_verification"
 			}
 			if item.Result == nil {
-				item.Result = M{"ok": false, "message": "本次自动领取已结束，等待下次计划"}
+				item.Result = shared.M{"ok": false, "message": "本次自动领取已结束，等待下次计划"}
 			}
 		}
 		if item.Status == "failed" {
@@ -218,9 +225,9 @@ func finishScheduledAccount(account *scheduledClaimAccount) {
 			account.Status = "needs_verification"
 		}
 	}
-	if account.Result != nil && !truth(account.Result["no_cards"]) {
+	if account.Result != nil && !shared.Truth(account.Result["no_cards"]) {
 		account.Status = "failed"
-		if truth(account.Result["requires_verification"]) {
+		if shared.Truth(account.Result["requires_verification"]) {
 			account.Status = "needs_verification"
 		}
 	}
@@ -243,20 +250,20 @@ func (run *scheduledClaimRun) recoverInterrupted(now time.Time) {
 }
 
 func (a *App) scheduledClaimEnabled(due time.Time) bool {
-	return a.ctx.Err() == nil && truth(a.configValue("daily_claim_enabled")) && a.dailyClaimTime() == due.In(claimTimezone).Format("15:04")
+	return a.ctx.Err() == nil && shared.Truth(a.configValue("daily_claim_enabled")) && a.dailyClaimTime() == due.In(claimTimezone).Format("15:04")
 }
 
-func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) {
+func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (shared.M, error) {
 	ctx, cancel := context.WithDeadline(ctx, due.Add(dailyClaimRecoveryWindow))
 	defer cancel()
 	ctx = context.WithValue(ctx, scheduledClaimContextKey{}, due.UnixMilli())
-	last := obj(a.setting("daily_claim_last_run", nil))
+	last := shared.Obj(a.setting("daily_claim_last_run", nil))
 	var run scheduledClaimRun
 	if claimRunRecorded(last, due) {
-		if integer(last["version"]) != 2 || integer(last["scheduled_at"]) != due.UnixMilli() || !scheduledClaimOpen(str(last["status"])) {
-			return M{"skipped": true}, nil
+		if shared.Integer(last["version"]) != 2 || shared.Integer(last["scheduled_at"]) != due.UnixMilli() || !scheduledClaimOpen(shared.Str(last["status"])) {
+			return shared.M{"skipped": true}, nil
 		}
-		if err := json.Unmarshal([]byte(js(last)), &run); err != nil {
+		if err := json.Unmarshal([]byte(shared.JSON(last)), &run); err != nil {
 			return nil, err
 		}
 		if err := a.reconcileScheduledClaims(&run); err != nil {
@@ -265,17 +272,17 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 		run.recoverInterrupted(time.Now())
 	} else {
 		if !time.Now().Before(due.Add(dailyClaimRecoveryWindow)) {
-			return M{"skipped": true}, nil
+			return shared.M{"skipped": true}, nil
 		}
-		run = scheduledClaimRun{Version: 2, Day: due.In(claimTimezone).Format("2006-01-02"), ScheduledAt: due.UnixMilli(), StartedAt: nowMS(), RetryDeadline: due.Add(dailyClaimRecoveryWindow).UnixMilli(), Accounts: []*scheduledClaimAccount{}}
-		accounts, err := query(a.db, "SELECT * FROM accounts WHERE status IN ('active','unverified','cooldown') ORDER BY created_at")
+		run = scheduledClaimRun{Version: 2, Day: due.In(claimTimezone).Format("2006-01-02"), ScheduledAt: due.UnixMilli(), StartedAt: shared.NowMS(), RetryDeadline: due.Add(dailyClaimRecoveryWindow).UnixMilli(), Accounts: []*scheduledClaimAccount{}}
+		accounts, err := storage.Query(a.db, "SELECT * FROM accounts WHERE status IN ('active','unverified','cooldown') ORDER BY created_at")
 		if err != nil {
 			return nil, err
 		}
 		for _, value := range accounts {
-			r := obj(value)
+			r := shared.Obj(value)
 			if a.accountTokens(r)["zcode_jwt"] != "" {
-				run.Accounts = append(run.Accounts, &scheduledClaimAccount{ID: str(r["id"]), Status: "pending", Items: []*scheduledClaimItem{}})
+				run.Accounts = append(run.Accounts, &scheduledClaimAccount{ID: shared.Str(r["id"]), Status: "pending", Items: []*scheduledClaimItem{}})
 			}
 		}
 	}
@@ -285,7 +292,7 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 	// Require a running browser before discovery or any claim, including when
 	// the upstream verification scene is disabled. Never fall back to jsdom.
 	if run.Pending > 0 && ctx.Err() == nil && a.scheduledClaimEnabled(due) {
-		if err := a.warmClaimBrowser(ctx, obj(a.configValue("http", "captcha")), due); err != nil && ctx.Err() == nil && a.scheduledClaimEnabled(due) {
+		if err := a.warmClaimBrowser(ctx, shared.Obj(a.configValue("http", "captcha")), due); err != nil && ctx.Err() == nil && a.scheduledClaimEnabled(due) {
 			for _, account := range run.Accounts {
 				if !scheduledClaimOpen(account.Status) {
 					continue
@@ -299,7 +306,7 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 			if err := a.saveScheduledClaims(&run); err != nil {
 				return nil, err
 			}
-			return scheduledClaimReport(obj(parse(js(run), nil))), nil
+			return scheduledClaimReport(shared.Obj(shared.Parse(shared.JSON(run), nil))), nil
 		}
 	}
 	// Workers only mutate private account copies. Publish immutable snapshots
@@ -309,7 +316,7 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 	var checkpointErr error
 	var nextAccount atomic.Int64
 	workerErrors := make([]error, dailyClaimConcurrency)
-	parallelFor(dailyClaimConcurrency, dailyClaimConcurrency, func(worker int) {
+	shared.ParallelFor(dailyClaimConcurrency, dailyClaimConcurrency, func(worker int) {
 		workerCtx := context.WithValue(ctx, scheduledClaimWorkerKey{}, worker)
 		for {
 			if ctx.Err() != nil || !a.scheduledClaimEnabled(due) {
@@ -320,7 +327,7 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 				return
 			}
 			account := cloneScheduledClaimAccount(run.Accounts[index])
-			if !scheduledClaimOpen(account.Status) || nowMS() < account.RetryAt {
+			if !scheduledClaimOpen(account.Status) || shared.NowMS() < account.RetryAt {
 				continue
 			}
 			checkpoint := func() error {
@@ -336,7 +343,7 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 				}
 				return checkpointErr
 			}
-			if nowMS() >= run.RetryDeadline || account.Attempts >= 2 {
+			if shared.NowMS() >= run.RetryDeadline || account.Attempts >= 2 {
 				finishScheduledAccount(account)
 			} else if err := a.runScheduledClaimAccount(workerCtx, due, &run, account, checkpoint); err != nil {
 				workerErrors[worker] = err
@@ -358,20 +365,20 @@ func (a *App) runScheduledClaims(ctx context.Context, due time.Time) (M, error) 
 	if err := errors.Join(workerErrors...); err != nil {
 		return nil, err
 	}
-	return scheduledClaimReport(obj(parse(js(run), nil))), nil
+	return scheduledClaimReport(shared.Obj(shared.Parse(shared.JSON(run), nil))), nil
 }
 
 // Reconcile successes even if the process exited after receiving the claim but
 // before updating its checkpoint, including on the final allowed attempt.
 func (a *App) reconcileScheduledClaims(run *scheduledClaimRun) error {
-	rows, err := query(a.db, "SELECT account_id,plan_id,trigger FROM claim_log WHERE ok=1 AND ts>=? ORDER BY ts", run.ScheduledAt)
+	rows, err := storage.Query(a.db, "SELECT account_id,plan_id,trigger FROM claim_log WHERE ok=1 AND ts>=? ORDER BY ts", run.ScheduledAt)
 	if err != nil {
 		return err
 	}
-	successes := map[string]M{}
+	successes := map[string]shared.M{}
 	for _, value := range rows {
-		r := obj(value)
-		successes[str(r["account_id"])+"|"+str(r["plan_id"])] = r
+		r := shared.Obj(value)
+		successes[shared.Str(r["account_id"])+"|"+shared.Str(r["plan_id"])] = r
 	}
 	for _, account := range run.Accounts {
 		for _, item := range account.Items {
@@ -379,7 +386,7 @@ func (a *App) reconcileScheduledClaims(run *scheduledClaimRun) error {
 				continue
 			}
 			if success := successes[account.ID+"|"+item.PlanID]; success != nil {
-				item.Status, item.Result = "claimed", M{"ok": true, "external_claim": success["trigger"] != "scheduled", "message": "已确认领取成功"}
+				item.Status, item.Result = "claimed", shared.M{"ok": true, "external_claim": success["trigger"] != "scheduled", "message": "已确认领取成功"}
 			}
 		}
 	}
@@ -388,13 +395,13 @@ func (a *App) reconcileScheduledClaims(run *scheduledClaimRun) error {
 
 func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *scheduledClaimRun, account *scheduledClaimAccount, checkpoint func() error) error {
 	account.Attempts++
-	account.StartedAt, account.Status = nowMS(), "running"
+	account.StartedAt, account.Status = shared.NowMS(), "running"
 	if err := checkpoint(); err != nil {
 		return err
 	}
 	r := a.account(account.ID)
 	if r == nil || r["status"] == "disabled" || r["status"] == "needs_relogin" || a.accountTokens(r)["zcode_jwt"] == "" {
-		account.Result = M{"ok": false, "message": "账号不存在、已停用或需要重新登录"}
+		account.Result = shared.M{"ok": false, "message": "账号不存在、已停用或需要重新登录"}
 		finishScheduledAccount(account)
 		return nil
 	}
@@ -409,24 +416,24 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 		return a.deferScheduledClaimAccount(run, account, scheduledClaimRetryable(account.Result))
 	}
 	defer release()
-	if account.SameExit && account.ExitHash != hash(selectedProxy(pinned)) {
+	if account.SameExit && account.ExitHash != shared.Hash(routing.SelectedProxy(pinned)) {
 		// A different request may have moved the shared sticky selection. Reuse
 		// the original healthy endpoint if it is still in the configured pool.
-		if _, pooled := pinned.Value(proxySelectionKey{}).(proxySelection); pooled {
+		if _, pooled := pinned.Value(routing.ProxySelectionKey{}).(routing.ProxySelection); pooled {
 			a.proxies.mu.Lock()
 			for _, endpoint := range a.proxies.endpoints {
-				if hash(endpoint.URL) == account.ExitHash && !a.proxies.unavailable[endpoint.identity()] && a.proxies.blocked[endpoint.identity()].IsZero() {
-					pinned = pinnedProxyContext(pinned, endpoint.URL)
-					pinned = context.WithValue(pinned, proxySelectionKey{}, proxySelection{a.proxies.generation, endpoint.identity()})
+				if shared.Hash(endpoint.URL) == account.ExitHash && a.proxies.retryAt[endpoint.Identity()].IsZero() && a.proxies.blocked[endpoint.Identity()].IsZero() {
+					pinned = routing.PinnedProxyContext(pinned, endpoint.URL)
+					pinned = context.WithValue(pinned, routing.ProxySelectionKey{}, routing.ProxySelection{a.proxies.generation, endpoint.Identity()})
 					break
 				}
 			}
 			a.proxies.mu.Unlock()
 		}
 	}
-	exit := hash(selectedProxy(pinned))
+	exit := shared.Hash(routing.SelectedProxy(pinned))
 	if account.SameExit && account.ExitHash != "" && account.ExitHash != exit {
-		account.Result = M{"ok": false, "message": "验证出口已变更，本次不再自动重试"}
+		account.Result = shared.M{"ok": false, "message": "验证出口已变更，本次不再自动重试"}
 		finishScheduledAccount(account)
 		return nil
 	}
@@ -437,15 +444,15 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 	p, err := a.preview(pinned, r, true)
 	if err != nil {
 		account.Result = scheduledClaimError(ctx, err)
-		if integer(account.Result["retry_after_ms"]) > 0 {
+		if shared.Integer(account.Result["retry_after_ms"]) > 0 {
 			account.Attempts--
 		}
 		return a.deferScheduledClaimAccount(run, account, scheduledClaimRetryable(account.Result))
 	}
 	account.Result = nil
 	available := map[string]bool{}
-	for _, value := range arr(p["plans"]) {
-		plan := str(obj(value)["plan_id"])
+	for _, value := range shared.Arr(p["plans"]) {
+		plan := shared.Str(shared.Obj(value)["plan_id"])
 		available[plan] = true
 		found := false
 		for _, item := range account.Items {
@@ -459,7 +466,7 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 		// Campaign delivery may lag the configured minute. Keep discovering
 		// within the recovery window without spending actual claim attempts.
 		account.Attempts--
-		account.Result = M{"no_cards": true, "message": "暂未查询到可领取的每日免费卡"}
+		account.Result = shared.M{"no_cards": true, "message": "暂未查询到可领取的每日免费卡"}
 		return a.deferScheduledClaimAccount(run, account, true)
 	}
 	attempted := false
@@ -470,7 +477,7 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 		if ctx.Err() != nil || !a.scheduledClaimEnabled(due) {
 			return nil // Leave the checkpoint recoverable without another POST.
 		}
-		if nowMS() >= run.RetryDeadline {
+		if shared.NowMS() >= run.RetryDeadline {
 			finishScheduledAccount(account)
 			return nil
 		}
@@ -481,7 +488,7 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 		if recorded != nil {
 			item.Status, item.Result = "claimed", recorded
 		} else if !available[item.PlanID] {
-			item.Status, item.Result = "unavailable", M{"ok": false, "message": "该卡片已不在可领取清单中"}
+			item.Status, item.Result = "unavailable", shared.M{"ok": false, "message": "该卡片已不在可领取清单中"}
 		} else if item.Attempts >= 2 {
 			item.Status = "failed"
 		} else {
@@ -493,7 +500,7 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 			}
 			result, claimErr := a.claim(pinned, account.ID, item.PlanID, "scheduled", nil)
 			if claimErr != nil {
-				result = merge(result, scheduledClaimError(ctx, claimErr))
+				result = shared.Merge(result, scheduledClaimError(ctx, claimErr))
 			}
 			item.Result = result
 			if scheduledClaimWaiting(result) {
@@ -502,19 +509,19 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 					account.Attempts--
 				}
 				item.Status = "retry_wait"
-				account.RetryAt = nowMS() + max(dailyClaimRecoveryDelay.Milliseconds(), integer(result["retry_after_ms"]))
+				account.RetryAt = shared.NowMS() + max(dailyClaimRecoveryDelay.Milliseconds(), shared.Integer(result["retry_after_ms"]))
 				return a.deferScheduledClaimAccount(run, account, true)
 			}
 			attempted = true
 			item.Status = "failed"
-			if truth(result["ok"]) {
+			if shared.Truth(result["ok"]) {
 				item.Status = "claimed"
-			} else if truth(result["requires_verification"]) {
+			} else if shared.Truth(result["requires_verification"]) {
 				item.Status = "needs_verification"
 			}
-			if !truth(result["ok"]) && scheduledClaimRetryable(result) && account.Attempts < 2 {
+			if !shared.Truth(result["ok"]) && scheduledClaimRetryable(result) && account.Attempts < 2 {
 				item.Status = "retry_wait"
-				account.RetryAt = max(account.RetryAt, nowMS()+max(dailyClaimRecoveryDelay.Milliseconds(), integer(result["retry_after_ms"])))
+				account.RetryAt = max(account.RetryAt, shared.NowMS()+max(dailyClaimRecoveryDelay.Milliseconds(), shared.Integer(result["retry_after_ms"])))
 			}
 			if result["failure_kind"] == "network" {
 				account.SameExit = false
@@ -537,9 +544,9 @@ func (a *App) runScheduledClaimAccount(ctx context.Context, due time.Time, run *
 }
 
 func (a *App) deferScheduledClaimAccount(run *scheduledClaimRun, account *scheduledClaimAccount, retry bool) error {
-	retryAt := max(account.RetryAt, nowMS()+dailyClaimRecoveryDelay.Milliseconds())
+	retryAt := max(account.RetryAt, shared.NowMS()+dailyClaimRecoveryDelay.Milliseconds())
 	if account.Result != nil {
-		retryAt = max(retryAt, nowMS()+integer(account.Result["retry_after_ms"]))
+		retryAt = max(retryAt, shared.NowMS()+shared.Integer(account.Result["retry_after_ms"]))
 	}
 	for _, item := range account.Items {
 		// Relative item delays were already converted to account.RetryAt.

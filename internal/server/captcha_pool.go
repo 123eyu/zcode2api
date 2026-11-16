@@ -4,13 +4,10 @@ import (
 	"context"
 	"net/http"
 	"time"
-)
-
-// Aliyun rejects V3 tickets over 90 seconds old (F019).
-const (
-	maxCaptchaTicketTTL = 90 * time.Second
-	// Leave time for the business request to reach the verifier.
-	captchaTicketSafetyMargin = 5 * time.Second
+	captchasdk "zcode2api/internal/server/captcha"
+	"zcode2api/internal/server/fault"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
 // Background SDK work only takes an idle slot after foreground waiters. The
@@ -82,43 +79,17 @@ func (a *App) retainCaptchaProxy(proxyURL string) (func(), bool) {
 	return func() {}, true
 }
 
-// Background work must use the original request's exit.
-func pinnedProxyContext(parent context.Context, proxyURL string) context.Context {
-	return context.WithValue(parent, proxyContextKey{}, proxyRoute{URL: proxyURL})
-}
-
-// An explicit 0 disables prefetch; an absent setting keeps the default.
-func captchaTicketTTL(options M) time.Duration {
-	raw, present := options["ticket_ttl_ms"]
-	if !present {
-		return 75 * time.Second
-	}
-	value := num(raw)
-	if value <= 0 {
-		return 0
-	}
-	return min(max(time.Duration(value)*time.Millisecond, 30*time.Second), maxCaptchaTicketTTL)
-}
-
-const (
-	captchaPurposeInference      = "inference"
-	captchaPurposeClaim          = "claim"
-	captchaPurposeScheduledClaim = "scheduled_claim"
-	captchaPrefetchDemandWindow  = 30 * time.Second
-	maxCaptchaPools              = 128
-)
-
 type captchaTicketScope struct {
 	sceneKey, accountID, accountVersion, purpose string
 	accountDevice                                string
 	generation                                   uint64
 	guard                                        upstreamRequestScope
-	route                                        proxySelection
+	route                                        routing.ProxySelection
 	pooled                                       bool
 }
 
 func (s captchaTicketScope) key() string {
-	return hash(js([]any{s.sceneKey, s.accountID, s.accountVersion, s.purpose, s.generation, s.pooled, s.route.generation, s.route.identity}))
+	return shared.Hash(shared.JSON([]any{s.sceneKey, s.accountID, s.accountVersion, s.purpose, s.generation, s.pooled, s.route.Generation, s.route.Identity}))
 }
 
 func (s captchaTicketScope) matchesCooldown(key string) bool {
@@ -130,7 +101,7 @@ type captchaPrefetchJob struct{ cancel context.CancelFunc }
 type captchaTicketPool struct {
 	scope                  captchaTicketScope
 	ticket                 *captchaTicket
-	runtimeState           M
+	runtimeState           shared.M
 	job                    *captchaPrefetchJob
 	lastUsed, lastAccepted time.Time
 }
@@ -142,58 +113,47 @@ type captchaVerification struct {
 	accepted bool
 }
 
-func captchaScopeChanged() *Failure {
-	return &Failure{Kind: "server", Code: "captcha_config_changed", Message: "验证账号、用途或场景已更新，请重新验证", Retryable: true}
+func (a *App) captchaAccountVersion(account shared.M) string {
+	token := shared.Str(a.tokens(shared.Str(account["id"]))["zcode_jwt"])
+	return captchasdk.CaptchaCredentialVersion(account, token)
 }
 
-func (a *App) captchaAccountVersion(account M) string {
-	token := str(a.tokens(str(account["id"]))["zcode_jwt"])
-	return captchaCredentialVersion(account, token)
-}
-
-func captchaCredentialVersion(account M, token string) string {
-	if token == "" {
-		return ""
-	}
-	return hash(js([]any{account["id"], account["device_mid"], account["proxy_url"], token}))
-}
-
-func validateCaptchaRequestToken(verification captchaVerification, account M, token string) *Failure {
-	if verification.pool != nil && verification.pool.scope.accountVersion != captchaCredentialVersion(account, token) {
-		return captchaScopeChanged()
+func validateCaptchaRequestToken(verification captchaVerification, account shared.M, token string) *fault.Failure {
+	if verification.pool != nil && verification.pool.scope.accountVersion != captchasdk.CaptchaCredentialVersion(account, token) {
+		return captchasdk.CaptchaScopeChanged()
 	}
 	return nil
 }
 
-func (a *App) captchaScope(ctx context.Context, account M, purpose string, scene M) (captchaTicketScope, *Failure) {
-	if str(account["id"]) == "" || (purpose != captchaPurposeInference && purpose != captchaPurposeClaim && purpose != captchaPurposeScheduledClaim) {
-		return captchaTicketScope{}, captchaScopeChanged()
+func (a *App) captchaScope(ctx context.Context, account shared.M, purpose string, scene shared.M) (captchaTicketScope, *fault.Failure) {
+	if shared.Str(account["id"]) == "" || (purpose != captchasdk.CaptchaPurposeInference && purpose != captchasdk.CaptchaPurposeClaim && purpose != captchasdk.CaptchaPurposeScheduledClaim) {
+		return captchaTicketScope{}, captchasdk.CaptchaScopeChanged()
 	}
-	scope := captchaTicketScope{sceneKey: a.captchaSceneKey(ctx), accountID: str(account["id"]), accountVersion: a.captchaAccountVersion(account), purpose: purpose, guard: a.captchaRequestScope(ctx, account, scene), accountDevice: a.upstreamScope(ctx, account, a.origin, true).device}
+	scope := captchaTicketScope{sceneKey: a.captchaSceneKey(ctx), accountID: shared.Str(account["id"]), accountVersion: a.captchaAccountVersion(account), purpose: purpose, guard: a.captchaRequestScope(ctx, account, scene), accountDevice: a.upstreamScope(ctx, account, a.origin, true).device}
 	if scope.accountVersion == "" {
-		return scope, &Failure{Kind: "auth", Code: "authentication_error", Message: "验证账号凭据不可用"}
+		return scope, &fault.Failure{Kind: "auth", Code: "authentication_error", Message: "验证账号凭据不可用"}
 	}
-	scope.route, scope.pooled = ctx.Value(proxySelectionKey{}).(proxySelection)
+	scope.route, scope.pooled = ctx.Value(routing.ProxySelectionKey{}).(routing.ProxySelection)
 	a.captcha.mu.Lock()
 	current := a.captcha.scenes[scope.sceneKey]
 	scope.generation = current.Generation
-	valid := current.Generation != 0 && current.Loading == nil && js(current.Value) == js(scene)
+	valid := current.Generation != 0 && current.Loading == nil && shared.JSON(current.Value) == shared.JSON(scene)
 	a.captcha.mu.Unlock()
 	if !valid || !a.captchaScopeCurrent(ctx, scope) {
-		return captchaTicketScope{}, captchaScopeChanged()
+		return captchaTicketScope{}, captchasdk.CaptchaScopeChanged()
 	}
 	return scope, nil
 }
 
 func (a *App) captchaScopeCurrent(ctx context.Context, scope captchaTicketScope) bool {
 	account := a.account(scope.accountID)
-	route, pooled := ctx.Value(proxySelectionKey{}).(proxySelection)
+	route, pooled := ctx.Value(routing.ProxySelectionKey{}).(routing.ProxySelection)
 	if account == nil || scope.accountVersion == "" || account["status"] == "needs_relogin" || account["status"] == "disabled" || pooled != scope.pooled || route != scope.route || scope.sceneKey != a.captchaSceneKey(ctx) || scope.accountVersion != a.captchaAccountVersion(account) {
 		return false
 	}
 	a.captcha.mu.Lock()
 	scene := a.captcha.scenes[scope.sceneKey]
-	valid := scene.Generation == scope.generation && scene.Loading == nil && truth(scene.Value["enabled"]) && time.Now().Before(scene.Expires)
+	valid := scene.Generation == scope.generation && scene.Loading == nil && shared.Truth(scene.Value["enabled"]) && time.Now().Before(scene.Expires)
 	a.captcha.mu.Unlock()
 	return valid
 }
@@ -214,7 +174,7 @@ func (a *App) captchaPool(scope captchaTicketScope) *captchaTicketPool {
 			a.dropCaptchaPoolLocked(candidate)
 		}
 	}
-	if len(a.captcha.pools) >= maxCaptchaPools {
+	if len(a.captcha.pools) >= captchasdk.MaxCaptchaPools {
 		oldest := ""
 		for candidate, pool := range a.captcha.pools {
 			if oldest == "" || pool.lastUsed.Before(a.captcha.pools[oldest].lastUsed) {
@@ -244,7 +204,7 @@ func (a *App) dropCaptchaScenePoolsLocked(sceneKey string) {
 }
 
 func (a *App) takeCaptchaTicket(pool *captchaTicketPool) (captchaTicket, bool) {
-	if captchaTicketTTL(obj(a.configValue("http", "captcha"))) <= 0 {
+	if captchasdk.CaptchaTicketTTL(shared.Obj(a.configValue("http", "captcha"))) <= 0 {
 		return captchaTicket{}, false
 	}
 	a.captcha.mu.Lock()
@@ -255,7 +215,7 @@ func (a *App) takeCaptchaTicket(pool *captchaTicketPool) (captchaTicket, bool) {
 	}
 	ticket := *pool.ticket
 	pool.ticket = nil
-	if ticket.scope != pool.scope || scene.Generation != pool.scope.generation || !time.Now().Before(scene.Expires) || !time.Now().Add(captchaTicketSafetyMargin).Before(ticket.expiresAt) {
+	if ticket.scope != pool.scope || scene.Generation != pool.scope.generation || !time.Now().Before(scene.Expires) || !time.Now().Add(captchasdk.CaptchaTicketSafetyMargin).Before(ticket.expiresAt) {
 		return captchaTicket{}, false
 	}
 	return ticket, true
@@ -278,7 +238,7 @@ func (a *App) acceptCaptchaVerification(ctx context.Context, verification *captc
 		return
 	}
 	now := time.Now()
-	recent := !pool.lastAccepted.IsZero() && now.Sub(pool.lastAccepted) <= captchaPrefetchDemandWindow
+	recent := !pool.lastAccepted.IsZero() && now.Sub(pool.lastAccepted) <= captchasdk.CaptchaPrefetchDemandWindow
 	pool.lastAccepted, pool.lastUsed = now, now
 	a.captcha.mu.Unlock()
 	if recent {
@@ -322,27 +282,27 @@ func (a *App) captchaPrefetchBlocked(scope captchaTicketScope) bool {
 }
 
 func (a *App) scheduleTicketRenewal(pool *captchaTicketPool, proxyURL string) {
-	options := obj(a.configValue("http", "captcha"))
+	options := shared.Obj(a.configValue("http", "captcha"))
 	// Claims mint on demand: prefetch would bypass worker limits and race another claim.
-	if pool.scope.purpose != captchaPurposeInference {
+	if pool.scope.purpose != captchasdk.CaptchaPurposeInference {
 		return
 	}
-	if captchaTicketTTL(options) <= 0 || a.ctx.Err() != nil || a.captchaPrefetchBlocked(pool.scope) {
+	if captchasdk.CaptchaTicketTTL(options) <= 0 || a.ctx.Err() != nil || a.captchaPrefetchBlocked(pool.scope) {
 		return
 	}
 	a.captcha.mu.Lock()
 	scene := a.captcha.scenes[pool.scope.sceneKey]
-	if a.captcha.pools[pool.scope.key()] != pool || pool.job != nil || time.Since(pool.lastAccepted) > captchaPrefetchDemandWindow || scene.Generation != pool.scope.generation || !truth(scene.Value["enabled"]) {
+	if a.captcha.pools[pool.scope.key()] != pool || pool.job != nil || time.Since(pool.lastAccepted) > captchasdk.CaptchaPrefetchDemandWindow || scene.Generation != pool.scope.generation || !shared.Truth(scene.Value["enabled"]) {
 		a.captcha.mu.Unlock()
 		return
 	}
-	if pool.ticket != nil && time.Now().Add(captchaTicketSafetyMargin).Before(pool.ticket.expiresAt) {
+	if pool.ticket != nil && time.Now().Add(captchasdk.CaptchaTicketSafetyMargin).Before(pool.ticket.expiresAt) {
 		a.captcha.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(pinnedProxyContext(a.ctx, proxyURL), ms(fallback(options["timeout_ms"], 30000))+3*time.Second)
+	ctx, cancel := context.WithTimeout(routing.PinnedProxyContext(a.ctx, proxyURL), shared.Ms(shared.Fallback(options["timeout_ms"], 30000))+3*time.Second)
 	if pool.scope.pooled {
-		ctx = context.WithValue(ctx, proxySelectionKey{}, pool.scope.route)
+		ctx = context.WithValue(ctx, routing.ProxySelectionKey{}, pool.scope.route)
 	}
 	job := &captchaPrefetchJob{cancel: cancel}
 	pool.job = job
@@ -366,24 +326,24 @@ func (a *App) scheduleTicketRenewal(pool *captchaTicketPool, proxyURL string) {
 			pool.lastAccepted, pool.ticket = time.Time{}, nil
 			return
 		}
-		ticket.expiresAt = ticket.expiresAt.Add(captchaTicketTTL(options) - maxCaptchaTicketTTL)
-		if _, used := a.captcha.used[hash(ticket.param)]; !used && time.Now().Add(captchaTicketSafetyMargin).Before(ticket.expiresAt) {
+		ticket.expiresAt = ticket.expiresAt.Add(captchasdk.CaptchaTicketTTL(options) - captchasdk.MaxTicketTTL)
+		if _, used := a.captcha.used[shared.Hash(ticket.param)]; !used && time.Now().Add(captchasdk.CaptchaTicketSafetyMargin).Before(ticket.expiresAt) {
 			pool.ticket = &ticket
 		}
 	})
 }
 
-func (a *App) renewCaptchaTicket(ctx context.Context, pool *captchaTicketPool, options M) (captchaTicket, bool) {
+func (a *App) renewCaptchaTicket(ctx context.Context, pool *captchaTicketPool, options shared.M) (captchaTicket, bool) {
 	if !a.acquireCaptchaSlot(ctx, true) {
 		return captchaTicket{}, false
 	}
 	defer a.releaseCaptchaSlot()
-	if ctx.Err() != nil || !a.captchaScopeCurrent(ctx, pool.scope) || a.captchaPrefetchBlocked(pool.scope) || js(options) != js(obj(a.configValue("http", "captcha"))) {
+	if ctx.Err() != nil || !a.captchaScopeCurrent(ctx, pool.scope) || a.captchaPrefetchBlocked(pool.scope) || shared.JSON(options) != shared.JSON(shared.Obj(a.configValue("http", "captcha"))) {
 		return captchaTicket{}, false
 	}
 	a.captcha.mu.Lock()
 	scene := a.captcha.scenes[pool.scope.sceneKey]
-	valid := a.captcha.pools[pool.scope.key()] == pool && scene.Generation == pool.scope.generation && time.Now().Before(scene.Expires) && time.Since(pool.lastAccepted) <= captchaPrefetchDemandWindow
+	valid := a.captcha.pools[pool.scope.key()] == pool && scene.Generation == pool.scope.generation && time.Now().Before(scene.Expires) && time.Since(pool.lastAccepted) <= captchasdk.CaptchaPrefetchDemandWindow
 	a.captcha.mu.Unlock()
 	if !valid {
 		return captchaTicket{}, false
@@ -392,7 +352,7 @@ func (a *App) renewCaptchaTicket(ctx context.Context, pool *captchaTicketPool, o
 	ticket, failure := a.mintCaptchaTicket(ctx, account, options, scene.Value, pool.scope)
 	if failure != nil {
 		if ctx.Err() == nil {
-			a.log.Printf("验证码预取失败: %s", conciseFailureMessage(failure))
+			a.log.Printf("验证码预取失败: %s", fault.ConciseFailureMessage(failure))
 		}
 		return captchaTicket{}, false
 	}

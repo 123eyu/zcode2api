@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	_ "embed"
 	"fmt"
 	"io"
 	"os"
@@ -12,27 +11,21 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	captchasdk "zcode2api/internal/server/captcha"
+	"zcode2api/internal/server/fault"
+	childproc "zcode2api/internal/server/process"
+	"zcode2api/internal/server/shared"
+	"zcode2api/internal/server/storage"
 )
 
-//go:embed captcha_browser.cjs
-var captchaBrowserRuntime []byte
-
-//go:embed captcha_native.cjs
-var captchaNativeRuntime []byte
-
 const claimBrowserWarmup = 3 * time.Minute
-const claimBrowserIdle = 30 * time.Second
 
-// The configured runtime applies only to manual claims. Scheduled claims
-// always use Chromium and have their own ticket scope.
-func captchaUsesBrowser(purpose string, options M) bool {
-	return purpose == captchaPurposeScheduledClaim || (purpose == captchaPurposeClaim && options["claim_runtime"] == "browser")
-}
+const claimBrowserIdle = 30 * time.Second
 
 type claimBrowserProcess struct {
 	key     string
 	input   io.WriteCloser
-	replies chan M
+	replies chan shared.M
 	done    chan struct{}
 	cancel  context.CancelFunc
 	active  bool
@@ -86,8 +79,8 @@ func (a *App) acquireClaimCaptchaSlot(ctx context.Context, background bool) (fun
 	}
 }
 
-func (a *App) browserParameters(options M) M {
-	return M{"root": a.root, "module_path": a.captchaModulePath(str(options["jsdom_path"])), "playwright_path": str(options["playwright_path"]), "driver_path": filepath.Join(a.data, "tools", "playwright"), "browser_cache": filepath.Join(a.data, "tools", "chromium"), "browser_path": str(options["browser_path"]), "browser_profiles": filepath.Join(a.data, "browser-profiles")}
+func (a *App) browserParameters(options shared.M) shared.M {
+	return shared.M{"root": a.root, "module_path": a.captchaModulePath(shared.Str(options["jsdom_path"])), "playwright_path": shared.Str(options["playwright_path"]), "driver_path": filepath.Join(a.data, "tools", "playwright"), "browser_cache": filepath.Join(a.data, "tools", "chromium"), "browser_path": shared.Str(options["browser_path"]), "browser_profiles": filepath.Join(a.data, "browser-profiles")}
 }
 
 func (a *App) writeCaptchaRuntime(name string, source []byte) (string, error) {
@@ -105,18 +98,18 @@ func (a *App) writeCaptchaRuntime(name string, source []byte) (string, error) {
 }
 
 func (a *App) browserHelper() (string, error) {
-	return a.writeCaptchaRuntime("captcha_browser.cjs", captchaBrowserRuntime)
+	return a.writeCaptchaRuntime("captcha_browser.cjs", captchasdk.CaptchaBrowserRuntime)
 }
 
 // Worker slots serialize requests; each worker has its own process, SDK and browser profile.
-func (a *App) runBrowserCaptcha(ctx context.Context, options, parameters M) (result M, err error) {
+func (a *App) runBrowserCaptcha(ctx context.Context, options, parameters shared.M) (result shared.M, err error) {
 	manager := a.claimBrowserForContext(ctx)
 	manager.mu.Lock()
 	if ctx.Err() != nil || a.ctx.Err() != nil {
 		manager.mu.Unlock()
 		return nil, context.Canceled
 	}
-	key := js([]any{options["node_path"], options["playwright_path"], options["browser_path"]})
+	key := shared.JSON([]any{options["node_path"], options["playwright_path"], options["browser_path"]})
 	if manager.process != nil && manager.process.key != key {
 		a.stopClaimBrowserLocked(manager)
 	}
@@ -157,13 +150,13 @@ func (a *App) runBrowserCaptcha(ctx context.Context, options, parameters M) (res
 			a.armClaimBrowserLocked(manager)
 		}
 	}()
-	parameters = merge(a.browserParameters(options), parameters)
+	parameters = shared.Merge(a.browserParameters(options), parameters)
 	if worker, ok := ctx.Value(scheduledClaimWorkerKey{}).(int); ok && manager != &a.claimBrowser {
 		parameters["browser_profiles"] = filepath.Join(a.data, "browser-profiles", fmt.Sprintf("scheduled-%d", worker+1))
 	} else if worker, ok := ctx.Value(manualClaimWorkerKey{}).(int); ok && manager != &a.claimBrowser {
 		parameters["browser_profiles"] = filepath.Join(a.data, "browser-profiles", fmt.Sprintf("manual-%d", worker+1))
 	}
-	if _, err = io.WriteString(process.input, js(parameters)+"\n"); err != nil {
+	if _, err = io.WriteString(process.input, shared.JSON(parameters)+"\n"); err != nil {
 		return nil, err
 	}
 	select {
@@ -177,8 +170,8 @@ func (a *App) runBrowserCaptcha(ctx context.Context, options, parameters M) (res
 	}
 }
 
-func (a *App) startClaimBrowser(options M, key string) (*claimBrowserProcess, error) {
-	node, err := a.resolveCaptchaNode(str(options["node_path"]))
+func (a *App) startClaimBrowser(options shared.M, key string) (*claimBrowserProcess, error) {
+	node, err := a.resolveCaptchaNode(shared.Str(options["node_path"]))
 	if err != nil {
 		return nil, err
 	}
@@ -186,15 +179,15 @@ func (a *App) startClaimBrowser(options M, key string) (*claimBrowserProcess, er
 	if err != nil {
 		return nil, err
 	}
-	if _, err = a.writeCaptchaRuntime("captcha.cjs", captchaRuntime); err != nil {
+	if _, err = a.writeCaptchaRuntime("captcha.cjs", captchasdk.CaptchaRuntime); err != nil {
 		return nil, err
 	}
-	if _, err = a.writeCaptchaRuntime("captcha_native.cjs", captchaNativeRuntime); err != nil {
+	if _, err = a.writeCaptchaRuntime("captcha_native.cjs", captchasdk.CaptchaNativeRuntime); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(a.ctx)
 	command := exec.CommandContext(ctx, node, helper)
-	prepareBrowserProcess(command)
+	childproc.PrepareBrowserProcess(command)
 	command.Stderr = io.Discard
 	input, err := command.StdinPipe()
 	if err != nil {
@@ -207,14 +200,14 @@ func (a *App) startClaimBrowser(options M, key string) (*claimBrowserProcess, er
 		input.Close()
 		return nil, err
 	}
-	process := &claimBrowserProcess{key: key, input: input, replies: make(chan M, 1), done: make(chan struct{}), cancel: cancel}
+	process := &claimBrowserProcess{key: key, input: input, replies: make(chan shared.M, 1), done: make(chan struct{}), cancel: cancel}
 	command.Cancel = func() error {
 		_ = input.Close() // EOF lets Playwright close Chromium and its children.
 		time.AfterFunc(3*time.Second, func() {
 			select {
 			case <-process.done:
 			default:
-				killBrowserProcess(command)
+				childproc.KillBrowserProcess(command)
 			}
 		})
 		return nil
@@ -233,7 +226,7 @@ func (a *App) startClaimBrowser(options M, key string) (*claimBrowserProcess, er
 		scanner := bufio.NewScanner(output)
 		scanner.Buffer(make([]byte, 4096), 64<<10)
 		for scanner.Scan() {
-			result, valid := parse(scanner.Text(), nil).(map[string]any)
+			result, valid := shared.Parse(scanner.Text(), nil).(map[string]any)
 			if !valid {
 				break
 			}
@@ -313,10 +306,10 @@ func (a *App) claimBrowserWindow(until time.Time) {
 	}
 }
 
-func (a *App) warmClaimBrowser(ctx context.Context, options M, due time.Time) error {
+func (a *App) warmClaimBrowser(ctx context.Context, options shared.M, due time.Time) error {
 	a.claimBrowserWindow(due.Add(dailyClaimRecoveryWindow))
 	errors := make([]error, dailyClaimConcurrency)
-	parallelFor(dailyClaimConcurrency, dailyClaimConcurrency, func(worker int) {
+	shared.ParallelFor(dailyClaimConcurrency, dailyClaimConcurrency, func(worker int) {
 		workerCtx := context.WithValue(ctx, scheduledClaimWorkerKey{}, worker)
 		errors[worker] = a.warmClaimBrowserWorker(workerCtx, options)
 	})
@@ -328,24 +321,24 @@ func (a *App) warmClaimBrowser(ctx context.Context, options M, due time.Time) er
 	return nil
 }
 
-func (a *App) warmClaimBrowserWorker(ctx context.Context, options M) error {
+func (a *App) warmClaimBrowserWorker(ctx context.Context, options shared.M) error {
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	release, acquired := a.acquireClaimCaptchaSlot(ctx, true)
 	if !acquired {
-		return &Failure{Kind: "server", Code: "captcha_browser_timeout", Message: "等待浏览器准备超时", Retryable: true}
+		return &fault.Failure{Kind: "server", Code: "captcha_browser_timeout", Message: "等待浏览器准备超时", Retryable: true}
 	}
 	defer release()
-	result, err := a.runBrowserCaptcha(ctx, options, M{"action": "warm"})
+	result, err := a.runBrowserCaptcha(ctx, options, shared.M{"action": "warm"})
 	if ctx.Err() != nil {
-		return &Failure{Kind: "server", Code: "captcha_browser_timeout", Message: "等待浏览器准备超时", Retryable: true}
+		return &fault.Failure{Kind: "server", Code: "captcha_browser_timeout", Message: "等待浏览器准备超时", Retryable: true}
 	}
-	code := str(fallback(result["code"], "captcha_browser_launch_failed"))
+	code := shared.Str(shared.Fallback(result["code"], "captcha_browser_launch_failed"))
 	if err != nil {
 		code = "captcha_browser_launch_failed"
 	}
-	if err != nil || !truth(result["ok"]) {
-		return &Failure{Kind: "server", Code: code, Message: conciseFailureMessage(&Failure{Code: code})}
+	if err != nil || !shared.Truth(result["ok"]) {
+		return &fault.Failure{Kind: "server", Code: code, Message: fault.ConciseFailureMessage(&fault.Failure{Code: code})}
 	}
 	return nil
 }
@@ -355,31 +348,31 @@ func (a *App) warmClaimBrowserWorker(ctx context.Context, options M) error {
 func (a *App) prepareScheduledClaimBrowsers(parent context.Context, due time.Time) error {
 	ctx, cancel := context.WithDeadline(parent, due)
 	defer cancel()
-	accounts, err := query(a.db, "SELECT * FROM accounts WHERE status IN ('active','unverified','cooldown') ORDER BY created_at LIMIT 16")
+	accounts, err := storage.Query(a.db, "SELECT * FROM accounts WHERE status IN ('active','unverified','cooldown') ORDER BY created_at LIMIT 16")
 	if err != nil {
 		return err
 	}
-	options := obj(a.configValue("http", "captcha"))
+	options := shared.Obj(a.configValue("http", "captcha"))
 	for index, value := range accounts {
 		// Do not let the preparation deadline kill the shared browser just as
 		// the prepared accounts are about to claim.
-		if ctx.Err() != nil || !a.scheduledClaimEnabled(due) || time.Until(due) <= ms(fallback(options["timeout_ms"], 30000))+5*time.Second {
+		if ctx.Err() != nil || !a.scheduledClaimEnabled(due) || time.Until(due) <= shared.Ms(shared.Fallback(options["timeout_ms"], 30000))+5*time.Second {
 			break
 		}
-		account := obj(value)
+		account := shared.Obj(value)
 		if a.accountTokens(account)["zcode_jwt"] == "" {
 			continue
 		}
 		workerCtx := context.WithValue(ctx, scheduledClaimWorkerKey{}, index%dailyClaimConcurrency)
 		if err := a.prepareClaimBrowser(workerCtx, options, account); err != nil && ctx.Err() == nil {
-			a.log.Printf("自动领卡账号 %s 验证页面预热失败: %v", str(account["id"]), err)
+			a.log.Printf("自动领卡账号 %s 验证页面预热失败: %v", shared.Str(account["id"]), err)
 		}
 	}
 	return nil
 }
 
-func (a *App) prepareClaimBrowser(parent context.Context, options, account M) error {
-	ctx, cancel := context.WithTimeout(parent, ms(fallback(options["timeout_ms"], 30000))+3*time.Second)
+func (a *App) prepareClaimBrowser(parent context.Context, options, account shared.M) error {
+	ctx, cancel := context.WithTimeout(parent, shared.Ms(shared.Fallback(options["timeout_ms"], 30000))+3*time.Second)
 	defer cancel()
 	ctx, release, err := a.pinOutboundProxy(ctx, account)
 	if err != nil {
@@ -390,10 +383,10 @@ func (a *App) prepareClaimBrowser(parent context.Context, options, account M) er
 	if failure != nil {
 		return failure
 	}
-	if !truth(scene["enabled"]) {
+	if !shared.Truth(scene["enabled"]) {
 		return nil
 	}
-	scope, failure := a.captchaScope(ctx, account, captchaPurposeScheduledClaim, scene)
+	scope, failure := a.captchaScope(ctx, account, captchasdk.CaptchaPurposeScheduledClaim, scene)
 	if failure != nil {
 		return failure
 	}
@@ -414,9 +407,9 @@ func (a *App) prepareClaimBrowser(parent context.Context, options, account M) er
 	if err != nil {
 		return err
 	}
-	if !truth(result["ok"]) {
-		code := str(fallback(result["code"], "captcha_runtime_error"))
-		return &Failure{Kind: "server", Code: code, Message: conciseFailureMessage(&Failure{Code: code})}
+	if !shared.Truth(result["ok"]) {
+		code := shared.Str(shared.Fallback(result["code"], "captcha_runtime_error"))
+		return &fault.Failure{Kind: "server", Code: code, Message: fault.ConciseFailureMessage(&fault.Failure{Code: code})}
 	}
 	return nil
 }

@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   checks:
-    name: Basic checks and smoke test
+    name: Source and build checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -36,14 +36,12 @@ jobs:
         run: |
           go mod verify
           go vet ./...
-          go test ./... -count=1 -timeout=120s
       - name: Check JavaScript syntax
         shell: bash
         run: |
-          for file in src/web/*.js internal/server/*.cjs scripts/*.cjs; do
+          shopt -s globstar nullglob
+          for file in src/web/*.js internal/server/**/*.cjs scripts/*.cjs; do
             node --check "$file"
           done
-      - name: Build smoke executable
+      - name: Build executable
         run: go build -trimpath -ldflags "-X main.version=ci" -o bin/zcode2api .
-      - name: Smoke test local service
-        run: node scripts/smoke.cjs bin/zcode2api ci

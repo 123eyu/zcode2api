@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"sync"
 	"time"
+	accountdata "zcode2api/internal/server/account"
+	"zcode2api/internal/server/fault"
+	"zcode2api/internal/server/shared"
+	"zcode2api/internal/server/storage"
 )
 
 const balanceCacheTTL = 2 * time.Second
+
 const balanceSnapshotBaseline = time.Minute
 
 type balanceFlight struct {
@@ -17,7 +23,7 @@ type balanceFlight struct {
 	cancel    context.CancelFunc
 	waiters   int
 	completed bool
-	result    M
+	result    shared.M
 	err       error
 }
 
@@ -25,7 +31,7 @@ type balanceCacheEntry struct {
 	scope      string
 	generation uint64
 	until      time.Time
-	result     M
+	result     shared.M
 }
 
 type balanceSnapshotState struct {
@@ -44,9 +50,9 @@ type balanceManager struct {
 	snapshots   map[string]balanceSnapshotState // Protected by applyMu.
 }
 
-func (a *App) balanceScope(r M) string {
+func (a *App) balanceScope(r shared.M) string {
 	cfg := a.config("app_version", "outbound_proxy")
-	return hash(js([]any{r["id"], r["enc_tokens"], r["device_mid"], r["proxy_url"], a.origin, cfg["app_version"], cfg["outbound_proxy"]}))
+	return shared.Hash(shared.JSON([]any{r["id"], r["enc_tokens"], r["device_mid"], r["proxy_url"], a.origin, cfg["app_version"], cfg["outbound_proxy"]}))
 }
 
 func (a *App) invalidateBalance(id string) {
@@ -77,7 +83,7 @@ func (a *App) invalidateBalanceLocked(id string) {
 	delete(a.balances.cache, id)
 }
 
-func (a *App) balanceResultCurrent(r, result M) bool {
+func (a *App) balanceResultCurrent(r, result shared.M) bool {
 	scope, tracked := result["_balance_scope"].(string)
 	if !tracked {
 		return true
@@ -87,24 +93,24 @@ func (a *App) balanceResultCurrent(r, result M) bool {
 	}
 	a.balances.mu.Lock()
 	defer a.balances.mu.Unlock()
-	return integer(result["_balance_generation"]) == int64(a.balances.generations[str(r["id"])])
+	return shared.Integer(result["_balance_generation"]) == int64(a.balances.generations[shared.Str(r["id"])])
 }
 
-func (a *App) fetchBalance(ctx context.Context, r M) (M, error) {
+func (a *App) fetchBalance(ctx context.Context, r shared.M) (shared.M, error) {
 	return a.sharedBalance(ctx, r, false)
 }
 
 // Explicit refreshes bypass the short success cache, but can still join a
 // current request. Claims and credential changes invalidate earlier flights.
-func (a *App) fetchBalanceFresh(ctx context.Context, r M) (M, error) {
+func (a *App) fetchBalanceFresh(ctx context.Context, r shared.M) (shared.M, error) {
 	return a.sharedBalance(ctx, r, true)
 }
 
-func (a *App) sharedBalance(ctx context.Context, r M, fresh bool) (M, error) {
+func (a *App) sharedBalance(ctx context.Context, r shared.M, fresh bool) (shared.M, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	id := str(r["id"])
+	id := shared.Str(r["id"])
 	r = a.account(id)
 	if r == nil {
 		return nil, fmt.Errorf("账号不存在")
@@ -116,7 +122,7 @@ func (a *App) sharedBalance(ctx context.Context, r M, fresh bool) (M, error) {
 	if cached, ok := manager.cache[id]; !fresh && ok && cached.scope == scope && cached.generation == generation && time.Now().Before(cached.until) {
 		result := cached.result
 		manager.mu.Unlock()
-		return clone(result), nil
+		return shared.Clone(result), nil
 	}
 	key := fmt.Sprintf("%s|%s|%d", id, scope, generation)
 	flight := manager.flights[key]
@@ -135,7 +141,7 @@ func (a *App) sharedBalance(ctx context.Context, r M, fresh bool) (M, error) {
 			currentScope := a.balanceScope(current)
 			manager.mu.Lock()
 			if current == nil || currentScope != scope || manager.generations[id] != generation {
-				err = &Failure{Kind: "canceled", Code: "balance_context_changed", Message: "余额查询期间账号或额度已更新，请重新刷新", Retryable: true}
+				err = &fault.Failure{Kind: "canceled", Code: "balance_context_changed", Message: "余额查询期间账号或额度已更新，请重新刷新", Retryable: true}
 			}
 			if err == nil {
 				result["_balance_scope"], result["_balance_generation"] = scope, generation
@@ -145,7 +151,7 @@ func (a *App) sharedBalance(ctx context.Context, r M, fresh bool) (M, error) {
 			flight.result, flight.err, flight.completed = result, err, true
 			if manager.flights[key] == flight {
 				delete(manager.flights, key)
-				if err == nil && requestCtx.Err() == nil && truth(result["ok"]) {
+				if err == nil && requestCtx.Err() == nil && shared.Truth(result["ok"]) {
 					if manager.cache == nil {
 						manager.cache = map[string]balanceCacheEntry{}
 					}
@@ -185,7 +191,7 @@ func (a *App) sharedBalance(ctx context.Context, r M, fresh bool) (M, error) {
 			return nil, ctx.Err()
 		}
 		if err != nil {
-			var failure *Failure
+			var failure *fault.Failure
 			if errors.As(err, &failure) {
 				copy := *failure
 				return nil, &copy
@@ -193,27 +199,27 @@ func (a *App) sharedBalance(ctx context.Context, r M, fresh bool) (M, error) {
 			return nil, err
 		}
 		if !a.balanceResultCurrent(a.account(id), result) {
-			return nil, &Failure{Kind: "canceled", Code: "balance_context_changed", Message: "余额查询结果已失效，请重新刷新", Retryable: true}
+			return nil, &fault.Failure{Kind: "canceled", Code: "balance_context_changed", Message: "余额查询结果已失效，请重新刷新", Retryable: true}
 		}
-		return clone(result), nil
+		return shared.Clone(result), nil
 	}
 }
 
 func balancePayloadFingerprint(value any) string {
-	payload := clone(balancePayload(value))
+	payload := maps.Clone(accountdata.BalancePayload(value))
 	delete(payload, "server_time")
 	delete(payload, "logid")
-	return hash(js(payload))
+	return shared.Hash(shared.JSON(payload))
 }
 
 func balanceSnapshotFingerprint(rows []any) string {
 	values := make([]string, 0, len(rows))
 	for _, value := range rows {
-		r := obj(value)
-		values = append(values, js([]any{str(r["bucket_id"]), str(r["entitlement_id"]), str(r["meter"]), num(r["total_units"]), num(r["used_units"]), num(r["remaining_units"]), integer(r["expires_at"])}))
+		r := shared.Obj(value)
+		values = append(values, shared.JSON([]any{shared.Str(r["bucket_id"]), shared.Str(r["entitlement_id"]), shared.Str(r["meter"]), shared.Num(r["total_units"]), shared.Num(r["used_units"]), shared.Num(r["remaining_units"]), shared.Integer(r["expires_at"])}))
 	}
 	sort.Strings(values)
-	return hash(js(values))
+	return shared.Hash(shared.JSON(values))
 }
 
 // Called under applyMu. Changes are recorded immediately, with a periodic
@@ -225,23 +231,23 @@ func (a *App) saveBalanceSnapshot(id string, balances []any) error {
 	}
 	previous, loaded := a.balances.snapshots[id]
 	if !loaded {
-		rows, err := query(a.db, "SELECT * FROM quota_snapshots WHERE account_id=? AND ts=(SELECT MAX(ts) FROM quota_snapshots WHERE account_id=?)", id, id)
+		rows, err := storage.Query(a.db, "SELECT * FROM quota_snapshots WHERE account_id=? AND ts=(SELECT MAX(ts) FROM quota_snapshots WHERE account_id=?)", id, id)
 		if err != nil {
 			return err
 		}
 		previous.fingerprint = balanceSnapshotFingerprint(rows)
 		if len(rows) > 0 {
-			previous.at = integer(obj(rows[0])["ts"])
+			previous.at = shared.Integer(shared.Obj(rows[0])["ts"])
 		}
 	}
 	rows := make([]any, 0, len(balances))
 	for _, value := range balances {
-		r := clone(obj(value))
-		r["expires_at"] = secondsMS(r["expires_at"])
+		r := shared.Clone(shared.Obj(value))
+		r["expires_at"] = accountdata.SecondsMS(r["expires_at"])
 		rows = append(rows, r)
 	}
 	fingerprint := balanceSnapshotFingerprint(rows)
-	now := nowMS()
+	now := shared.NowMS()
 	if fingerprint == previous.fingerprint && now-previous.at < balanceSnapshotBaseline.Milliseconds() {
 		a.balances.snapshots[id] = previous
 		return nil
@@ -253,7 +259,7 @@ func (a *App) saveBalanceSnapshot(id string, balances []any) error {
 		}
 		defer tx.Rollback()
 		for _, value := range rows {
-			r := obj(value)
+			r := shared.Obj(value)
 			if _, err := tx.Exec("INSERT INTO quota_snapshots(account_id,ts,bucket_id,entitlement_id,meter,total_units,used_units,remaining_units,expires_at) VALUES(?,?,?,?,?,?,?,?,?)", id, now, r["bucket_id"], r["entitlement_id"], r["meter"], r["total_units"], r["used_units"], r["remaining_units"], r["expires_at"]); err != nil {
 				return err
 			}
@@ -274,7 +280,7 @@ func (a *App) startBalanceSnapshotCleanup() {
 			if a.ctx.Err() != nil {
 				return
 			}
-			_ = a.exec("DELETE FROM quota_snapshots WHERE ts<?", nowMS()-48*time.Hour.Milliseconds())
+			_ = a.exec("DELETE FROM quota_snapshots WHERE ts<?", shared.NowMS()-48*time.Hour.Milliseconds())
 			select {
 			case <-a.ctx.Done():
 				return

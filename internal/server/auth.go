@@ -5,6 +5,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	settings "zcode2api/internal/server/config"
+	"zcode2api/internal/server/fault"
+	wire "zcode2api/internal/server/protocol"
+	"zcode2api/internal/server/shared"
 )
 
 func bearer(r *http.Request) string {
@@ -14,6 +18,7 @@ func bearer(r *http.Request) string {
 	}
 	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
+
 func (a *App) adminAuth(r *http.Request) bool {
 	token := bearer(r)
 	if token == "" {
@@ -22,23 +27,25 @@ func (a *App) adminAuth(r *http.Request) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	expiry := a.sessions[token]
-	if expiry <= nowMS() {
+	if expiry <= shared.NowMS() {
 		delete(a.sessions, token)
 		return false
 	}
 	return true
 }
+
 func (a *App) password(v any) bool {
 	s, ok := v.(string)
 	if !ok || s == "" {
 		return false
 	}
-	x, y := hash(s), hash(str(a.configValue("admin_password")))
+	x, y := shared.Hash(s), shared.Hash(shared.Str(a.configValue("admin_password")))
 	return subtle.ConstantTimeCompare([]byte(x), []byte(y)) == 1
 }
+
 func ipAllowed(ip string, patterns []any) bool {
 	for _, v := range patterns {
-		p := strings.TrimSpace(str(v))
+		p := strings.TrimSpace(shared.Str(v))
 		if p == "" {
 			continue
 		}
@@ -54,70 +61,75 @@ func ipAllowed(ip string, patterns []any) bool {
 	}
 	return false
 }
-func (a *App) authenticate(r *http.Request) (M, *Failure) {
+
+func (a *App) authenticate(r *http.Request) (shared.M, *fault.Failure) {
 	secret := bearer(r)
 	if secret == "" {
-		return nil, &Failure{Status: 401, Code: "invalid_api_key", Message: "缺少 API 密钥"}
+		return nil, &fault.Failure{Status: 401, Code: "invalid_api_key", Message: "缺少 API 密钥"}
 	}
-	k := a.row("SELECT * FROM keys WHERE key_hash=?", hash(secret))
+	k := a.row("SELECT * FROM keys WHERE key_hash=?", shared.Hash(secret))
 	if k == nil {
-		return nil, &Failure{Status: 401, Code: "invalid_api_key", Message: "无效密钥"}
+		return nil, &fault.Failure{Status: 401, Code: "invalid_api_key", Message: "无效密钥"}
 	}
-	if !truth(k["enabled"]) {
-		return nil, &Failure{Status: 403, Code: "invalid_api_key", Message: "密钥已禁用"}
+	if !shared.Truth(k["enabled"]) {
+		return nil, &fault.Failure{Status: 403, Code: "invalid_api_key", Message: "密钥已禁用"}
 	}
-	if truth(k["expires_at"]) && integer(k["expires_at"]) < nowMS() {
-		return nil, &Failure{Status: 403, Code: "invalid_api_key", Message: "密钥已过期"}
+	if shared.Truth(k["expires_at"]) && shared.Integer(k["expires_at"]) < shared.NowMS() {
+		return nil, &fault.Failure{Status: 403, Code: "invalid_api_key", Message: "密钥已过期"}
 	}
-	if k["quota_limit"] != nil && num(k["used_units"]) >= num(k["quota_limit"]) {
-		return nil, &Failure{Status: 429, Code: "quota_exceeded", Message: "密钥配额已用尽"}
+	if k["quota_limit"] != nil && shared.Num(k["used_units"]) >= shared.Num(k["quota_limit"]) {
+		return nil, &fault.Failure{Status: 429, Code: "quota_exceeded", Message: "密钥配额已用尽"}
 	}
-	ips := arr(parse(k["ip_whitelist"], nil))
+	ips := shared.Arr(shared.Parse(k["ip_whitelist"], nil))
 	if len(ips) > 0 && !ipAllowed(a.ip(r), ips) {
-		return nil, &Failure{Status: 403, Code: "ip_not_allowed", Message: "IP 不在白名单"}
+		return nil, &fault.Failure{Status: 403, Code: "ip_not_allowed", Message: "IP 不在白名单"}
 	}
-	_ = a.exec("UPDATE keys SET last_used_at=? WHERE id=?", nowMS(), k["id"])
+	_ = a.exec("UPDATE keys SET last_used_at=? WHERE id=?", shared.NowMS(), k["id"])
 	return k, nil
 }
-func (a *App) createKey(b M) (M, error) {
-	id, secret := "key_"+random(4), "zk2-"+random(20)
-	level := first(b["defaultLevel"], b["default_level"])
-	if !validLevel(str(level)) {
+
+func (a *App) createKey(b shared.M) (shared.M, error) {
+	id, secret := "key_"+shared.Random(4), "zk2-"+shared.Random(20)
+	level := shared.First(b["defaultLevel"], b["default_level"])
+	if !settings.ValidLevel(shared.Str(level)) {
 		level = nil
 	}
-	groups := first(b["groupOrder"], b["group_order"])
+	groups := shared.First(b["groupOrder"], b["group_order"])
 	if groups != nil {
-		groups = js(groups)
+		groups = shared.JSON(groups)
 	}
-	e := a.exec("INSERT INTO keys(id,name,key_hash,key_tail,quota_limit,expires_at,ip_whitelist,model_whitelist,group_order,sticky_minutes,default_level,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", id, fallback(b["name"], "default"), hash(secret), secret[len(secret)-6:], first(b["quotaLimit"], b["quota_limit"]), first(b["expiresAt"], b["expires_at"]), js(first(b["ipWhitelist"], b["ip_whitelist"], []any{})), js(first(b["modelWhitelist"], b["model_whitelist"], []any{})), groups, first(b["stickyMinutes"], b["sticky_minutes"], 0), level, nowMS())
-	return M{"ok": e == nil, "id": id, "secret": secret}, e
+	e := a.exec("INSERT INTO keys(id,name,key_hash,key_tail,quota_limit,expires_at,ip_whitelist,model_whitelist,group_order,sticky_minutes,default_level,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", id, shared.Fallback(b["name"], "default"), shared.Hash(secret), secret[len(secret)-6:], shared.First(b["quotaLimit"], b["quota_limit"]), shared.First(b["expiresAt"], b["expires_at"]), shared.JSON(shared.First(b["ipWhitelist"], b["ip_whitelist"], []any{})), shared.JSON(shared.First(b["modelWhitelist"], b["model_whitelist"], []any{})), groups, shared.First(b["stickyMinutes"], b["sticky_minutes"], 0), level, shared.NowMS())
+	return shared.M{"ok": e == nil, "id": id, "secret": secret}, e
 }
-func (a *App) keyChain(k M) []any {
+
+func (a *App) keyChain(k shared.M) []any {
 	if s := k["group_order"]; s != nil {
-		if v, ok := parse(s, nil).([]any); ok {
+		if v, ok := shared.Parse(s, nil).([]any); ok {
 			return v
 		}
 	}
 	return a.defaultChain()
 }
-func (a *App) modelAllowed(k M, model string) bool {
-	list := arr(parse(k["model_whitelist"], nil))
+
+func (a *App) modelAllowed(k shared.M, model string) bool {
+	list := shared.Arr(shared.Parse(k["model_whitelist"], nil))
 	if len(list) == 0 {
 		return true
 	}
 	for _, v := range list {
-		if strings.EqualFold(a.resolveModel(str(v)), model) {
+		if strings.EqualFold(a.resolveModel(shared.Str(v)), model) {
 			return true
 		}
 	}
 	return false
 }
+
 func (a *App) resolveModel(s string) string {
 	s = strings.TrimSpace(s)
-	s = modelSuffix.ReplaceAllString(s, "")
-	for alias, v := range obj(a.configValue("aliases")) {
+	s = wire.ModelSuffix.ReplaceAllString(s, "")
+	for alias, v := range shared.Obj(a.configValue("aliases")) {
 		if strings.EqualFold(alias, s) {
-			return str(v)
+			return shared.Str(v)
 		}
 	}
 	if s == "" {
@@ -125,55 +137,16 @@ func (a *App) resolveModel(s string) string {
 	}
 	return s
 }
-func validLevel(s string) bool { return s == "low" || s == "high" || s == "max" }
-func effort(b M) string {
-	raw := first(b["reasoning_effort"], b["thinking_level"], b["reasoningLevel"], obj(b["output_config"])["effort"])
-	if raw == nil {
-		if s, ok := b["reasoning"].(string); ok {
-			raw = s
-		} else {
-			raw = obj(b["reasoning"])["effort"]
-		}
-	}
-	if raw == nil {
-		if s, ok := b["thinking"].(string); ok {
-			raw = s
-		} else {
-			t := obj(b["thinking"])
-			switch str(t["type"]) {
-			case "disabled":
-				return "low"
-			case "enabled", "adaptive":
-				n := num(t["budget_tokens"])
-				if n >= 24000 {
-					return "max"
-				}
-				if n >= 8000 || n == 0 {
-					return "high"
-				}
-				return "low"
-			}
-		}
-	}
-	switch lower(raw) {
-	case "low", "minimal", "off", "disabled", "none":
-		return "low"
-	case "max", "xhigh":
-		return "max"
-	case "high", "medium", "default", "enabled":
-		return "high"
-	}
-	return ""
-}
-func (a *App) effectiveEffort(b, k M) string {
-	if v := effort(b); v != "" {
+
+func (a *App) effectiveEffort(b, k shared.M) string {
+	if v := settings.Effort(b); v != "" {
 		return v
 	}
-	if v := str(k["default_level"]); validLevel(v) {
+	if v := shared.Str(k["default_level"]); settings.ValidLevel(v) {
 		return v
 	}
-	v := str(a.configValue("default_reasoning_level"))
-	if validLevel(v) {
+	v := shared.Str(a.configValue("default_reasoning_level"))
+	if settings.ValidLevel(v) {
 		return v
 	}
 	return ""

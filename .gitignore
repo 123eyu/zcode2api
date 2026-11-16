@@ -7,3 +7,4 @@ data/
 config.json
 probe-*.json
 AGENTS.md
+/test/

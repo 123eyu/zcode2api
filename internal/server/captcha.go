@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	_ "embed"
 	"errors"
 	"fmt"
 	"net/http"
@@ -12,13 +11,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+	captchasdk "zcode2api/internal/server/captcha"
+	"zcode2api/internal/server/fault"
+	childproc "zcode2api/internal/server/process"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
-//go:embed captcha.cjs
-var captchaRuntime []byte
-
 type captchaScene struct {
-	Value      M
+	Value      shared.M
 	Expires    time.Time
 	Generation uint64
 	Loading    chan struct{}
@@ -41,14 +42,13 @@ type captchaManager struct {
 	used       map[string]time.Time
 	pools      map[string]*captchaTicketPool
 	browser    map[string]*claimCaptchaSession
-	refreshing map[string]bool
-	cancels    map[string]context.CancelFunc
-	run        func(context.Context, M) (M, error)
+	refreshing map[string]context.CancelFunc
+	run        func(context.Context, shared.M) (shared.M, error)
 }
 
 // Scene configuration is shared by exit. Tickets have a separate, narrower scope.
 func (a *App) captchaSceneKey(ctx context.Context) string {
-	return a.origin + "|" + str(a.configValue("app_version")) + "|" + selectedProxy(ctx)
+	return a.origin + "|" + shared.Str(a.configValue("app_version")) + "|" + routing.SelectedProxy(ctx)
 }
 
 func (a *App) captchaSlot() chan struct{} {
@@ -61,25 +61,25 @@ func (a *App) captchaSlot() chan struct{} {
 	return a.captcha.slot
 }
 
-func (a *App) captchaHeaders(parent context.Context, account M, purpose string, force bool) (captchaVerification, *Failure) {
-	options := obj(a.configValue("http", "captcha"))
-	mode := str(fallback(options["mode"], "off"))
+func (a *App) captchaHeaders(parent context.Context, account shared.M, purpose string, force bool) (captchaVerification, *fault.Failure) {
+	options := shared.Obj(a.configValue("http", "captcha"))
+	mode := shared.Str(shared.Fallback(options["mode"], "off"))
 	verification := captchaVerification{Headers: http.Header{}}
-	if err := validateCaptchaOptions(options); err != nil {
-		return verification, &Failure{Kind: "server", Code: "captcha_config_invalid", Message: err.Error()}
+	if err := captchasdk.ValidateCaptchaOptions(options); err != nil {
+		return verification, &fault.Failure{Kind: "server", Code: "captcha_config_invalid", Message: err.Error()}
 	}
 	if mode == "off" && !force {
 		return verification, nil
 	}
 	parent, release, err := a.pinOutboundProxy(parent, account)
 	if err != nil {
-		return verification, asProxyFailure(err)
+		return verification, routing.AsProxyFailure(err)
 	}
 	defer release()
-	ctx, cancel := a.operationContext(parent, ms(fallback(options["timeout_ms"], 30000))+3*time.Second)
+	ctx, cancel := a.operationContext(parent, shared.Ms(shared.Fallback(options["timeout_ms"], 30000))+3*time.Second)
 	defer cancel()
 	if ctx.Err() != nil {
-		return verification, &Failure{Kind: "server", Code: "captcha_timeout", Message: "上游安全验证已取消或超时"}
+		return verification, &fault.Failure{Kind: "server", Code: "captcha_timeout", Message: "上游安全验证已取消或超时"}
 	}
 	for holdingSlot := false; ; holdingSlot = true {
 		// Recheck the scene and pool after waiting: either may have changed.
@@ -87,10 +87,10 @@ func (a *App) captchaHeaders(parent context.Context, account M, purpose string, 
 		if failure != nil {
 			return verification, failure
 		}
-		if force && !truth(scene["enabled"]) {
-			return verification, &Failure{Kind: "risk", Code: "captcha_scene_disabled", Message: "上游要求安全验证，但未提供可用的验证场景"}
+		if force && !shared.Truth(scene["enabled"]) {
+			return verification, &fault.Failure{Kind: "risk", Code: "captcha_scene_disabled", Message: "上游要求安全验证，但未提供可用的验证场景"}
 		}
-		if !truth(scene["enabled"]) || (!force && mode == "auto" && truth(scene["skip_model_request"])) {
+		if !shared.Truth(scene["enabled"]) || (!force && mode == "auto" && shared.Truth(scene["skip_model_request"])) {
 			return verification, nil
 		}
 		scope, failure := a.captchaScope(ctx, account, purpose, scene)
@@ -103,7 +103,7 @@ func (a *App) captchaHeaders(parent context.Context, account M, purpose string, 
 		if !ready && !holdingSlot {
 			releaseSlot, acquired := a.acquireClaimCaptchaSlot(ctx, false)
 			if !acquired {
-				return verification, &Failure{Kind: "server", Code: "captcha_timeout", Message: "等待上游安全验证超时"}
+				return verification, &fault.Failure{Kind: "server", Code: "captcha_timeout", Message: "等待上游安全验证超时"}
 			}
 			defer releaseSlot()
 			continue
@@ -119,46 +119,46 @@ func (a *App) captchaHeaders(parent context.Context, account M, purpose string, 
 	}
 }
 
-func (a *App) attachCaptchaTicket(ctx context.Context, verification *captchaVerification, pool *captchaTicketPool, ticket captchaTicket) *Failure {
+func (a *App) attachCaptchaTicket(ctx context.Context, verification *captchaVerification, pool *captchaTicketPool, ticket captchaTicket) *fault.Failure {
 	if ticket.scope != pool.scope || !a.captchaScopeCurrent(ctx, ticket.scope) {
-		return captchaScopeChanged()
+		return captchasdk.CaptchaScopeChanged()
 	}
 	a.captcha.mu.Lock()
 	current := a.captcha.scenes[ticket.scope.sceneKey]
 	valid := current.Generation == ticket.scope.generation && a.captcha.pools[ticket.scope.key()] == pool
 	a.captcha.mu.Unlock()
 	if !valid {
-		return captchaScopeChanged()
+		return captchasdk.CaptchaScopeChanged()
 	}
-	if !time.Now().Add(captchaTicketSafetyMargin).Before(ticket.expiresAt) {
-		return &Failure{Kind: "risk", Code: "captcha_expired", Message: "验证票据已过期，请重新验证"}
+	if !time.Now().Add(captchasdk.CaptchaTicketSafetyMargin).Before(ticket.expiresAt) {
+		return &fault.Failure{Kind: "risk", Code: "captcha_expired", Message: "验证票据已过期，请重新验证"}
 	}
 	if failure := a.reserveCaptchaTicket(ticket.param); failure != nil {
 		return failure
 	}
 	verification.Headers.Set("X-Aliyun-Captcha-Verify-Param", ticket.param)
 	verification.Headers.Set("X-Aliyun-Captcha-Verify-Region", ticket.region)
-	verification.pool, verification.proxyURL = pool, selectedProxy(ctx)
+	verification.pool, verification.proxyURL = pool, routing.SelectedProxy(ctx)
 	return nil
 }
 
-func (a *App) captchaRuntimeParameters(ctx context.Context, options, scene M, scope captchaTicketScope) (M, *captchaTicketPool) {
-	modulePath := a.captchaModulePath(str(options["jsdom_path"]))
-	parameters := M{"origin": a.origin, "scene_id": scene["sceneId"], "region": scene["region"], "prefix": scene["prefix"], "simulate_canvas_webgl": first(options["simulate_canvas_webgl"], true), "module_path": modulePath, "timeout_ms": options["timeout_ms"], "proxy_url": selectedProxy(ctx)}
-	if captchaUsesBrowser(scope.purpose, options) {
+func (a *App) captchaRuntimeParameters(ctx context.Context, options, scene shared.M, scope captchaTicketScope) (shared.M, *captchaTicketPool) {
+	modulePath := a.captchaModulePath(shared.Str(options["jsdom_path"]))
+	parameters := shared.M{"origin": a.origin, "scene_id": scene["sceneId"], "region": scene["region"], "prefix": scene["prefix"], "simulate_canvas_webgl": shared.First(options["simulate_canvas_webgl"], true), "module_path": modulePath, "timeout_ms": options["timeout_ms"], "proxy_url": routing.SelectedProxy(ctx)}
+	if captchasdk.CaptchaUsesBrowser(scope.purpose, options) {
 		parameters["session_key"] = scope.key()
 	}
 	pool := a.captchaPool(scope)
 	a.captcha.mu.Lock()
-	parameters["state"] = clone(pool.runtimeState)
+	parameters["state"] = shared.Clone(pool.runtimeState)
 	a.captcha.mu.Unlock()
 	parameters["cookies"] = a.jar(scope.accountID).header()
 	return parameters, pool
 }
 
 // The caller holds the captcha slot and pins the exit for this SDK execution.
-func (a *App) mintCaptchaTicket(ctx context.Context, account M, options, scene M, scope captchaTicketScope) (ticket captchaTicket, failure *Failure) {
-	diagnostic, _ := ctx.Value(claimCaptchaDiagnosticKey{}).(M)
+func (a *App) mintCaptchaTicket(ctx context.Context, account shared.M, options, scene shared.M, scope captchaTicketScope) (ticket captchaTicket, failure *fault.Failure) {
+	diagnostic, _ := ctx.Value(claimCaptchaDiagnosticKey{}).(shared.M)
 	if diagnostic != nil {
 		diagnostic["sdk_stage"] = "admission"
 	}
@@ -170,9 +170,11 @@ func (a *App) mintCaptchaTicket(ctx context.Context, account M, options, scene M
 	parameters, pool := a.captchaRuntimeParameters(ctx, options, scene, scope)
 	run := a.captcha.run
 	if run == nil {
-		run = func(ctx context.Context, parameters M) (M, error) { return a.runCaptcha(ctx, options, parameters) }
-		if captchaUsesBrowser(scope.purpose, options) {
-			run = func(ctx context.Context, parameters M) (M, error) {
+		run = func(ctx context.Context, parameters shared.M) (shared.M, error) {
+			return a.runCaptcha(ctx, options, parameters)
+		}
+		if captchasdk.CaptchaUsesBrowser(scope.purpose, options) {
+			run = func(ctx context.Context, parameters shared.M) (shared.M, error) {
 				return a.runBrowserCaptcha(ctx, options, parameters)
 			}
 		}
@@ -182,84 +184,84 @@ func (a *App) mintCaptchaTicket(ctx context.Context, account M, options, scene M
 		diagnostic["sdk_stage"] = "runtime"
 		diagnostic["sdk_executed"], diagnostic["sdk_initialized"] = nil, nil
 		diagnostic["runtime"] = "jsdom"
-		if captchaUsesBrowser(scope.purpose, options) {
+		if captchasdk.CaptchaUsesBrowser(scope.purpose, options) {
 			diagnostic["runtime"] = "browser"
 		}
 	}
 	result, err := run(ctx, parameters)
 	// Only bounded SDK session data is reusable; the scoped pool discards it on invalidation.
-	if state := obj(result["state"]); ctx.Err() == nil && len(state) > 0 && len(js(state)) <= 16<<10 && a.captchaScopeCurrent(ctx, scope) {
+	if state := shared.Obj(result["state"]); ctx.Err() == nil && len(state) > 0 && len(shared.JSON(state)) <= 16<<10 && a.captchaScopeCurrent(ctx, scope) {
 		a.captcha.mu.Lock()
 		if a.captcha.pools[scope.key()] == pool {
-			pool.runtimeState = clone(state)
+			pool.runtimeState = shared.Clone(state)
 		}
 		a.captcha.mu.Unlock()
 	}
 	if diagnostic != nil {
 		diagnostic["sdk_executed"] = result["sdk_executed"]
 		diagnostic["sdk_initialized"] = result["sdk_initialized"]
-		if stage := str(result["stage"]); stage != "" {
+		if stage := shared.Str(result["stage"]); stage != "" {
 			diagnostic["sdk_stage"] = stage
 		}
-		if code := str(result["verify_code"]); code != "" {
+		if code := shared.Str(result["verify_code"]); code != "" {
 			diagnostic["verify_code"] = code
 		}
 		if result["runtime"] == "native_browser" {
 			diagnostic["runtime"] = "native_browser"
 		}
-		copyFields(diagnostic, result, "sdk_error_code", "sdk_load_ms", "sdk_init_ms", "sdk_ready_wait_ms", "sdk_prepared_age_ms", "sdk_verify_ms", "request_id", "browser_version", "browser_visibility", "session_reused")
+		shared.CopyFields(diagnostic, result, "sdk_error_code", "sdk_load_ms", "sdk_init_ms", "sdk_ready_wait_ms", "sdk_prepared_age_ms", "sdk_verify_ms", "request_id", "browser_version", "browser_visibility", "session_reused")
 	}
 	if ctx.Err() != nil {
-		return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_timeout", Message: "SDK 验证已取消或超时"}
+		return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_timeout", Message: "SDK 验证已取消或超时"}
 	}
 	if err != nil {
-		return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_runtime_error", Message: "上游安全验证运行失败，请检查 Node、验证运行时和网络配置"}
+		return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_runtime_error", Message: "上游安全验证运行失败，请检查 Node、验证运行时和网络配置"}
 	}
-	if !truth(result["ok"]) {
-		switch str(result["code"]) {
+	if !shared.Truth(result["ok"]) {
+		switch shared.Str(result["code"]) {
 		case "captcha_playwright_missing", "captcha_browser_missing", "captcha_browser_launch_failed":
-			return captchaTicket{}, &Failure{Kind: "server", Code: str(result["code"]), Message: conciseFailureMessage(&Failure{Code: str(result["code"])})}
+			return captchaTicket{}, &fault.Failure{Kind: "server", Code: shared.Str(result["code"]), Message: fault.ConciseFailureMessage(&fault.Failure{Code: shared.Str(result["code"])})}
 		case "captcha_jsdom_missing":
-			return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_jsdom_missing", Message: "未找到 jsdom，请在程序根目录运行 npm --prefix captcha_node ci --omit=dev --ignore-scripts，或配置 http.captcha.jsdom_path"}
+			return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_jsdom_missing", Message: "未找到 jsdom，请在程序根目录运行 npm --prefix captcha_node ci --omit=dev --ignore-scripts，或配置 http.captcha.jsdom_path"}
 		case "captcha_timeout":
-			return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_timeout", Message: "上游安全验证超时或需要人工交互"}
+			return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_timeout", Message: "上游安全验证超时或需要人工交互"}
 		case "captcha_proxy_unsupported":
-			return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_proxy_unsupported", Message: "SDK 验证需要有效的 HTTP/HTTPS 代理"}
+			return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_proxy_unsupported", Message: "SDK 验证需要有效的 HTTP/HTTPS 代理"}
 		case "proxy_auth_failed":
-			return captchaTicket{}, &Failure{Kind: "network", Code: "proxy_auth_failed", Message: "代理认证失败", Retryable: true}
+			return captchaTicket{}, &fault.Failure{Kind: "network", Code: "proxy_auth_failed", Message: "代理认证失败", Retryable: true}
 		case "proxy_connection_failed":
-			return captchaTicket{}, &Failure{Kind: "network", Code: "proxy_connection_failed", Message: "SDK 代理连接失败", Retryable: true}
+			return captchaTicket{}, &fault.Failure{Kind: "network", Code: "proxy_connection_failed", Message: "SDK 代理连接失败", Retryable: true}
 		case "captcha_resource_http_error":
-			if integer(result["status"]) == http.StatusTooManyRequests {
-				return captchaTicket{}, &Failure{Kind: "rate_limit", Code: "captcha_resource_http_error", Status: http.StatusTooManyRequests, Message: "验证码 SDK 资源请求受限", Retryable: true, RetryAfter: retryAfter(str(result["retry_after"]), time.Now())}
+			if shared.Integer(result["status"]) == http.StatusTooManyRequests {
+				return captchaTicket{}, &fault.Failure{Kind: "rate_limit", Code: "captcha_resource_http_error", Status: http.StatusTooManyRequests, Message: "验证码 SDK 资源请求受限", Retryable: true, RetryAfter: fault.RetryAfter(shared.Str(result["retry_after"]), time.Now())}
 			}
-			return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_resource_http_error", Status: int(integer(result["status"])), Message: "验证码 SDK 资源返回 HTTP 错误", Retryable: integer(result["status"]) >= 500}
+			return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_resource_http_error", Status: int(shared.Integer(result["status"])), Message: "验证码 SDK 资源返回 HTTP 错误", Retryable: shared.Integer(result["status"]) >= 500}
 		case "captcha_network_error":
-			return captchaTicket{}, &Failure{Kind: "network", Code: "captcha_network_error", Message: "验证码 SDK 资源连接失败", Retryable: true}
+			return captchaTicket{}, &fault.Failure{Kind: "network", Code: "captcha_network_error", Message: "验证码 SDK 资源连接失败", Retryable: true}
 		case "captcha_interaction_required":
-			return captchaTicket{}, &Failure{Kind: "risk", Code: "captcha_interaction_required", Message: "上游要求人工安全验证，请先在官方客户端完成验证", VerifyCode: str(result["verify_code"])}
+			return captchaTicket{}, &fault.Failure{Kind: "risk", Code: "captcha_interaction_required", Message: "上游要求人工安全验证，请先在官方客户端完成验证", VerifyCode: shared.Str(result["verify_code"])}
 		case "captcha_runtime_error", "captcha_sdk_error", "captcha_origin_invalid", "captcha_canceled":
-			return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_runtime_error", Message: "验证码运行环境、页面或网络配置不可用"}
+			return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_runtime_error", Message: "验证码运行环境、页面或网络配置不可用"}
 		}
-		code := str(result["verify_code"])
+		code := shared.Str(result["verify_code"])
 		message := "上游安全验证未通过，需要按官方验证流程处理"
 		if len(code) == 4 && code[0] == 'F' && code[1] >= '0' && code[1] <= '9' && code[2] >= '0' && code[2] <= '9' && code[3] >= '0' && code[3] <= '9' {
 			message += "（" + code + "）"
 		}
-		return captchaTicket{}, classify(&Failure{Kind: "risk", Code: "captcha_verification_failed", Message: message, VerifyCode: code})
+		return captchaTicket{}, fault.Classify(&fault.Failure{Kind: "risk", Code: "captcha_verification_failed", Message: message, VerifyCode: code})
 	}
-	param := str(result["param"])
-	if !validCaptchaParam(param) {
-		return captchaTicket{}, &Failure{Kind: "server", Code: "captcha_invalid_result", Message: "验证码运行时返回了无效票据"}
+	param := shared.Str(result["param"])
+	if !captchasdk.ValidCaptchaParam(param) {
+		return captchaTicket{}, &fault.Failure{Kind: "server", Code: "captcha_invalid_result", Message: "验证码运行时返回了无效票据"}
 	}
 	// Count from the SDK verification, never from the child process's exit.
 	issued := started
-	if timestamp := integer(result["issued_at_ms"]); timestamp >= started.UnixMilli() && timestamp <= time.Now().UnixMilli() {
+	if timestamp := shared.Integer(result["issued_at_ms"]); timestamp >= started.UnixMilli() && timestamp <= time.Now().UnixMilli() {
 		issued = started.Add(time.Duration(timestamp-started.UnixMilli()) * time.Millisecond)
 	}
-	ticket = captchaTicket{param: param, region: str(scene["region"]), expiresAt: issued.Add(maxCaptchaTicketTTL), scope: scope}
-	if !time.Now().Add(captchaTicketSafetyMargin).Before(ticket.expiresAt) {
-		return captchaTicket{}, &Failure{Kind: "risk", Code: "captcha_expired", Message: "验证票据已过期，请重新验证"}
+	ticket = captchaTicket{param: param, region: shared.Str(scene["region"]), expiresAt: issued.Add(captchasdk.MaxTicketTTL), scope: scope}
+	if !time.Now().Add(captchasdk.CaptchaTicketSafetyMargin).Before(ticket.expiresAt) {
+		return captchaTicket{}, &fault.Failure{Kind: "risk", Code: "captcha_expired", Message: "验证票据已过期，请重新验证"}
 	}
 	return ticket, nil
 }
@@ -269,7 +271,7 @@ const (
 	captchaSceneRefreshLead = 2 * time.Minute
 )
 
-func (a *App) captchaScene(ctx context.Context, account M) (M, *Failure) {
+func (a *App) captchaScene(ctx context.Context, account shared.M) (shared.M, *fault.Failure) {
 	key := a.captchaSceneKey(ctx)
 	for {
 		a.captcha.mu.Lock()
@@ -283,13 +285,13 @@ func (a *App) captchaScene(ctx context.Context, account M) (M, *Failure) {
 			case <-entry.Loading:
 				continue
 			case <-ctx.Done():
-				return nil, &Failure{Kind: "timeout", Code: "captcha_config_timeout", Message: "等待 SDK 配置已取消或超时", Retryable: true}
+				return nil, &fault.Failure{Kind: "timeout", Code: "captcha_config_timeout", Message: "等待 SDK 配置已取消或超时", Retryable: true}
 			}
 		}
 		if cached && time.Now().Before(entry.Expires) {
 			a.captcha.mu.Unlock()
 			if time.Until(entry.Expires) < captchaSceneRefreshLead {
-				a.refreshCaptchaScene(key, selectedProxy(ctx))
+				a.refreshCaptchaScene(key, routing.SelectedProxy(ctx))
 			}
 			return entry.Value, nil
 		}
@@ -304,7 +306,7 @@ func (a *App) captchaScene(ctx context.Context, account M) (M, *Failure) {
 			}
 			if oldestKey == "" {
 				a.captcha.mu.Unlock()
-				return nil, &Failure{Kind: "server", Code: "captcha_capacity_exceeded", Message: "安全验证配置请求过多，请稍后重试"}
+				return nil, &fault.Failure{Kind: "server", Code: "captcha_capacity_exceeded", Message: "安全验证配置请求过多，请稍后重试"}
 			}
 			a.invalidateCaptchaSceneLocked(oldestKey)
 		}
@@ -320,7 +322,7 @@ func (a *App) captchaScene(ctx context.Context, account M) (M, *Failure) {
 		a.captcha.mu.Lock()
 		current := a.captcha.scenes[key]
 		if current.Generation != entry.Generation {
-			failure = &Failure{Kind: "server", Code: "captcha_config_changed", Message: "安全验证配置已更新，请重试", Retryable: true}
+			failure = &fault.Failure{Kind: "server", Code: "captcha_config_changed", Message: "安全验证配置已更新，请重试", Retryable: true}
 		} else if failure != nil {
 			delete(a.captcha.scenes, key)
 		} else {
@@ -335,16 +337,15 @@ func (a *App) captchaScene(ctx context.Context, account M) (M, *Failure) {
 func (a *App) refreshCaptchaScene(key, proxyURL string) {
 	a.captcha.mu.Lock()
 	entry, exists := a.captcha.scenes[key]
-	if a.captcha.refreshing[key] || !exists || entry.Loading != nil || a.ctx.Err() != nil {
+	if a.captcha.refreshing[key] != nil || !exists || entry.Loading != nil || a.ctx.Err() != nil {
 		a.captcha.mu.Unlock()
 		return
 	}
 	if a.captcha.refreshing == nil {
-		a.captcha.refreshing = map[string]bool{}
+		a.captcha.refreshing = map[string]context.CancelFunc{}
 	}
-	a.captcha.refreshing[key] = true
-	ctx, cancel := context.WithTimeout(pinnedProxyContext(a.ctx, proxyURL), 10*time.Second)
-	a.registerCaptchaCancelLocked("refresh|"+key, cancel)
+	ctx, cancel := context.WithTimeout(routing.PinnedProxyContext(a.ctx, proxyURL), 10*time.Second)
+	a.captcha.refreshing[key] = cancel
 	a.captcha.mu.Unlock()
 	release, retained := a.retainCaptchaProxy(proxyURL)
 	a.background(func() {
@@ -353,7 +354,6 @@ func (a *App) refreshCaptchaScene(key, proxyURL string) {
 			release()
 			a.captcha.mu.Lock()
 			delete(a.captcha.refreshing, key)
-			delete(a.captcha.cancels, "refresh|"+key)
 			a.captcha.mu.Unlock()
 		}()
 		if !retained || ctx.Err() != nil || key != a.captchaSceneKey(ctx) {
@@ -366,7 +366,7 @@ func (a *App) refreshCaptchaScene(key, proxyURL string) {
 		a.captcha.mu.Lock()
 		// Identity prevents a stale refresh from overwriting a replacement after invalidation.
 		if current := a.captcha.scenes[key]; ctx.Err() == nil && current.Generation == entry.Generation {
-			if js(scene) != js(current.Value) {
+			if shared.JSON(scene) != shared.JSON(current.Value) {
 				a.captcha.generation++
 				current.Generation = a.captcha.generation
 				a.dropCaptchaScenePoolsLocked(key)
@@ -378,23 +378,23 @@ func (a *App) refreshCaptchaScene(key, proxyURL string) {
 	})
 }
 
-func (a *App) fetchCaptchaScene(ctx context.Context, account M) (M, *Failure) {
+func (a *App) fetchCaptchaScene(ctx context.Context, account shared.M) (shared.M, *fault.Failure) {
 	configCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	endpoint := "/api/v1/client/configs?app_version=" + url.QueryEscape(str(a.configValue("app_version"))) + "&platform=" + url.QueryEscape(platform())
+	endpoint := "/api/v1/client/configs?app_version=" + url.QueryEscape(shared.Str(a.configValue("app_version"))) + "&platform=" + url.QueryEscape(platform())
 	response, err := a.api(configCtx, account, "GET", endpoint, "", nil, nil, nil)
 	if err != nil {
-		var failure *Failure
+		var failure *fault.Failure
 		if errors.As(err, &failure) {
 			return nil, failure
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, &Failure{Kind: "timeout", Code: "captcha_config_timeout", Message: "SDK 配置获取超时", Retryable: true}
+			return nil, &fault.Failure{Kind: "timeout", Code: "captcha_config_timeout", Message: "SDK 配置获取超时", Retryable: true}
 		}
-		return nil, &Failure{Kind: "network", Code: "captcha_config_unavailable", Message: "读取上游安全验证配置的网络请求失败", Retryable: true}
+		return nil, &fault.Failure{Kind: "network", Code: "captcha_config_unavailable", Message: "读取上游安全验证配置的网络请求失败", Retryable: true}
 	}
 	if !response.OK {
-		failure := apiResponseFailure(response)
+		failure := fault.ApiResponseFailure(response)
 		// Anonymous config refusals cannot establish account risk, even with business error codes.
 		if failure.Kind == "account_risk" {
 			failure.Kind, failure.Code, failure.Message = "risk", "captcha_config_risk_blocked", "SDK 配置请求被风控拦截"
@@ -402,36 +402,36 @@ func (a *App) fetchCaptchaScene(ctx context.Context, account M) (M, *Failure) {
 		if failure.Kind == "risk" || failure.Kind == "account_risk" || failure.Kind == "rate_limit" || failure.Code == "proxy_auth_failed" {
 			return nil, failure
 		}
-		return nil, &Failure{Kind: "server", Code: "captcha_config_unavailable", Message: fmt.Sprintf("读取上游安全验证配置失败（HTTP %d）", response.Status), Retryable: response.Status >= 500}
+		return nil, &fault.Failure{Kind: "server", Code: "captcha_config_unavailable", Message: fmt.Sprintf("读取上游安全验证配置失败（HTTP %d）", response.Status), Retryable: response.Status >= 500}
 	}
-	scene := obj(obj(obj(response.JSON["data"])["configs"])["captcha"])
+	scene := shared.Obj(shared.Obj(shared.Obj(response.JSON["data"])["configs"])["captcha"])
 	if _, ok := scene["enabled"].(bool); !ok {
-		return nil, &Failure{Kind: "server", Code: "captcha_config_invalid", Message: "上游没有返回有效的安全验证配置"}
+		return nil, &fault.Failure{Kind: "server", Code: "captcha_config_invalid", Message: "上游没有返回有效的安全验证配置"}
 	}
 	if value, present := scene["skip_model_request"]; present {
 		if _, ok := value.(bool); !ok {
-			return nil, &Failure{Kind: "server", Code: "captcha_config_invalid", Message: "上游安全验证跳过策略无效"}
+			return nil, &fault.Failure{Kind: "server", Code: "captcha_config_invalid", Message: "上游安全验证跳过策略无效"}
 		}
 	}
-	if truth(scene["enabled"]) {
-		region := str(scene["region"])
-		if (region != "cn" && region != "sgp") || strings.TrimSpace(str(scene["sceneId"])) == "" || strings.TrimSpace(str(scene["prefix"])) == "" {
-			return nil, &Failure{Kind: "server", Code: "captcha_config_invalid", Message: "上游安全验证场景或地域配置不完整"}
+	if shared.Truth(scene["enabled"]) {
+		region := shared.Str(scene["region"])
+		if (region != "cn" && region != "sgp") || strings.TrimSpace(shared.Str(scene["sceneId"])) == "" || strings.TrimSpace(shared.Str(scene["prefix"])) == "" {
+			return nil, &fault.Failure{Kind: "server", Code: "captcha_config_invalid", Message: "上游安全验证场景或地域配置不完整"}
 		}
 	}
 	return scene, nil
 }
 
-func (a *App) runCaptcha(ctx context.Context, options, parameters M) (M, error) {
-	helper, err := a.writeCaptchaRuntime("captcha.cjs", captchaRuntime)
+func (a *App) runCaptcha(ctx context.Context, options, parameters shared.M) (shared.M, error) {
+	helper, err := a.writeCaptchaRuntime("captcha.cjs", captchasdk.CaptchaRuntime)
 	if err != nil {
 		return nil, err
 	}
-	node, err := a.resolveCaptchaNode(str(options["node_path"]))
+	node, err := a.resolveCaptchaNode(shared.Str(options["node_path"]))
 	if err != nil {
 		return nil, err
 	}
-	command, output := newJSONCommand(ctx, node, parameters, helper)
+	command, output := childproc.NewJSONCommand(ctx, node, parameters, helper)
 	command.WaitDelay = 2 * time.Second
 	command.Cancel = func() error {
 		if runtime.GOOS != "windows" {
@@ -442,8 +442,8 @@ func (a *App) runCaptcha(ctx context.Context, options, parameters M) (M, error) 
 		return command.Process.Kill()
 	}
 	err = command.Run()
-	result := obj(parse(string(output.value), nil))
-	if err != nil && truth(result["ok"]) {
+	result := shared.Obj(shared.Parse(string(output.Value), nil))
+	if err != nil && shared.Truth(result["ok"]) {
 		return nil, err
 	}
 	if len(result) == 0 {
@@ -455,25 +455,13 @@ func (a *App) runCaptcha(ctx context.Context, options, parameters M) (M, error) 
 	return result, nil
 }
 
-func captchaExpired(f *Failure) bool {
-	if f == nil || (f.Status != 401 && f.Status != 403) {
-		return false
-	}
-	return captchaChallenge(f)
-}
-
-func explicitCaptchaChallenge(message string) bool {
-	message = strings.ToLower(message)
-	return strings.Contains(message, "captcha") || strings.Contains(message, "security verification") || strings.Contains(message, "安全验证")
-}
-
 // An initial challenge is not evidence that a still-unused ticket is invalid.
 // Only refresh a disabled scene here; rejected submitted tickets use invalidation.
 func (a *App) prepareCaptchaChallenge(ctx context.Context) {
 	key := a.captchaSceneKey(ctx)
 	a.captcha.mu.Lock()
 	defer a.captcha.mu.Unlock()
-	if entry, exists := a.captcha.scenes[key]; exists && entry.Loading == nil && !truth(entry.Value["enabled"]) {
+	if entry, exists := a.captcha.scenes[key]; exists && entry.Loading == nil && !shared.Truth(entry.Value["enabled"]) {
 		a.invalidateCaptchaSceneLocked(key)
 	}
 }
@@ -484,17 +472,10 @@ func (a *App) invalidateCaptchaScene(key string) {
 	a.invalidateCaptchaSceneLocked(key)
 }
 
-func (a *App) registerCaptchaCancelLocked(key string, cancel context.CancelFunc) {
-	if a.captcha.cancels == nil {
-		a.captcha.cancels = map[string]context.CancelFunc{}
-	}
-	a.captcha.cancels[key] = cancel
-}
-
 func (a *App) invalidateCaptchaSceneLocked(key string) {
 	delete(a.captcha.scenes, key)
 	a.dropCaptchaScenePoolsLocked(key)
-	if cancel := a.captcha.cancels["refresh|"+key]; cancel != nil {
+	if cancel := a.captcha.refreshing[key]; cancel != nil {
 		cancel()
 	}
 }
@@ -503,50 +484,11 @@ func (a *App) resetCaptchaCache() {
 	a.closeClaimBrowser()
 	a.captcha.mu.Lock()
 	defer a.captcha.mu.Unlock()
-	for _, cancel := range a.captcha.cancels {
+	for _, cancel := range a.captcha.refreshing {
 		cancel()
 	}
 	for key := range a.captcha.pools {
 		a.dropCaptchaPoolLocked(key)
 	}
 	clear(a.captcha.scenes)
-}
-
-func validateCaptchaOptions(value any) error {
-	options, ok := value.(map[string]any)
-	if !ok {
-		return fmt.Errorf("http.captcha 必须为配置对象")
-	}
-	for key, value := range options {
-		switch key {
-		case "claim_runtime":
-			if value != "jsdom" && value != "browser" {
-				return fmt.Errorf("http.captcha.claim_runtime 须为 jsdom/browser")
-			}
-		case "mode":
-			if value != "off" && value != "auto" && value != "always" {
-				return fmt.Errorf("http.captcha.mode 须为 off/auto/always")
-			}
-		case "simulate_canvas_webgl":
-			if _, ok := value.(bool); !ok {
-				return fmt.Errorf("http.captcha.simulate_canvas_webgl 必须为布尔值")
-			}
-		case "node_path", "jsdom_path", "playwright_path", "browser_path":
-			text, ok := value.(string)
-			if !ok || strings.ContainsAny(text, "\r\n\x00") || (key == "node_path" && strings.TrimSpace(text) == "") {
-				return fmt.Errorf("http.captcha.%s 路径无效", key)
-			}
-		case "timeout_ms":
-			if !integerInRange(value, 5000, 120000) {
-				return fmt.Errorf("http.captcha.timeout_ms 须为 5000 到 120000 的整数")
-			}
-		case "ticket_ttl_ms":
-			if !integerInRange(value, 0, 0) && !integerInRange(value, 30000, float64(maxCaptchaTicketTTL.Milliseconds())) {
-				return fmt.Errorf("http.captcha.ticket_ttl_ms 须为 0（关闭）或 30000 到 90000 的整数")
-			}
-		default:
-			return fmt.Errorf("未知安全验证设置 http.captcha.%s", key)
-		}
-	}
-	return nil
 }

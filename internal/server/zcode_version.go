@@ -10,26 +10,15 @@ import (
 	"runtime"
 	"strings"
 	"time"
-)
-
-const (
-	defaultZCodeVersionCheckIntervalSec = 5 * 24 * 60 * 60
-	minZCodeVersionCheckIntervalSec     = 60
-	maxZCodeVersionCheckIntervalSec     = 365 * 24 * 60 * 60
+	settings "zcode2api/internal/server/config"
+	"zcode2api/internal/server/shared"
+	updater "zcode2api/internal/server/update"
 )
 
 var zcodeManifestVersion = regexp.MustCompile(`(?m)^version:[ \t]*([^\r\n]+)`)
 
-func zcodeVersionInterval(cfg M) time.Duration {
-	seconds := integer(cfg["zcode_version_check_interval_sec"])
-	if seconds < minZCodeVersionCheckIntervalSec || seconds > maxZCodeVersionCheckIntervalSec {
-		seconds = defaultZCodeVersionCheckIntervalSec
-	}
-	return time.Duration(seconds) * time.Second
-}
-
 func (a *App) rescheduleZCodeVersionChecks() {
-	wake(a.zcodeVersionReschedule)
+	shared.Wake(a.zcodeVersionReschedule)
 }
 
 func zcodeReleasePlatform() string {
@@ -91,7 +80,7 @@ func (a *App) fetchZCodeVersion(parent context.Context) (string, error) {
 	if len(version) > 1 && (version[0] == '"' || version[0] == '\'') && version[len(version)-1] == version[0] {
 		version = version[1 : len(version)-1]
 	}
-	if !versionPattern.MatchString(version) {
+	if !settings.VersionPattern.MatchString(version) {
 		return "", fmt.Errorf("ZCode 清单未返回有效的稳定版本号")
 	}
 	return version, nil
@@ -102,12 +91,12 @@ func (a *App) syncZCodeVersion(parent context.Context) (err error) {
 		return fmt.Errorf("正在同步 ZCode 版本")
 	}
 	defer a.zcodeVersionMu.Unlock()
-	if !truth(a.configValue("zcode_version_auto_update")) {
+	if !shared.Truth(a.configValue("zcode_version_auto_update")) {
 		return fmt.Errorf("请先启用自动跟随 ZCode 稳定版")
 	}
-	state := obj(a.setting("zcode_version_status", M{}))
+	state := shared.Obj(a.setting("zcode_version_status", shared.M{}))
 	defer func() {
-		state["checked_at"] = nowMS()
+		state["checked_at"] = shared.NowMS()
 		state["error"] = ""
 		if err != nil {
 			state["error"] = err.Error()
@@ -121,26 +110,26 @@ func (a *App) syncZCodeVersion(parent context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if previous := str(state["version"]); previous != "" && newerUpdate(version, previous) {
+	if previous := shared.Str(state["version"]); previous != "" && updater.NewerUpdate(version, previous) {
 		return fmt.Errorf("ZCode 清单低于已同步版本，保留当前版本")
 	}
 	state["version"] = version
 	a.configMu.Lock()
-	if !truth(a.cfg["zcode_version_auto_update"]) {
+	if !shared.Truth(a.cfg["zcode_version_auto_update"]) {
 		a.configMu.Unlock()
 		return nil
 	}
-	if newerUpdate(version, str(a.cfg["app_version"])) || newerUpdate(version, str(obj(a.cfg["http"])["client_version"])) {
+	if updater.NewerUpdate(version, shared.Str(a.cfg["app_version"])) || updater.NewerUpdate(version, shared.Str(shared.Obj(a.cfg["http"])["client_version"])) {
 		a.configMu.Unlock()
 		return fmt.Errorf("ZCode 清单低于当前配置，保留当前版本")
 	}
-	changed := str(a.cfg["app_version"]) != version || str(obj(a.cfg["http"])["client_version"]) != version
+	changed := shared.Str(a.cfg["app_version"]) != version || shared.Str(shared.Obj(a.cfg["http"])["client_version"]) != version
 	if !changed {
 		a.configMu.Unlock()
 		return nil
 	}
-	overrides := obj(a.setting("config_overrides", M{}))
-	httpOverrides := obj(overrides["http"])
+	overrides := shared.Obj(a.setting("config_overrides", shared.M{}))
+	httpOverrides := shared.Obj(overrides["http"])
 	httpOverrides["client_version"] = version
 	overrides["http"], overrides["app_version"] = httpOverrides, version
 	if err = a.setSetting("config_overrides", overrides); err != nil {
@@ -148,7 +137,7 @@ func (a *App) syncZCodeVersion(parent context.Context) (err error) {
 		return err
 	}
 	a.cfg["app_version"] = version
-	obj(a.cfg["http"])["client_version"] = version
+	shared.Obj(a.cfg["http"])["client_version"] = version
 	a.configMu.Unlock()
 	a.resetCaptchaCache()
 	a.log.Printf("ZCode 请求版本已同步至 %s", version)
@@ -162,12 +151,12 @@ func (a *App) startZCodeVersionUpdates() {
 			cfg := a.config("zcode_version_auto_update", "zcode_version_check_interval_sec")
 			var timer *time.Timer
 			var due <-chan time.Time
-			if truth(cfg["zcode_version_auto_update"]) {
-				state := obj(a.setting("zcode_version_status", M{}))
-				checkedAt := max(integer(state["checked_at"]), lastAttempt)
+			if shared.Truth(cfg["zcode_version_auto_update"]) {
+				state := shared.Obj(a.setting("zcode_version_status", shared.M{}))
+				checkedAt := max(shared.Integer(state["checked_at"]), lastAttempt)
 				wait := time.Duration(0)
 				if checkedAt > 0 {
-					wait = max(0, time.Until(time.UnixMilli(checkedAt).Add(zcodeVersionInterval(cfg))))
+					wait = max(0, time.Until(time.UnixMilli(checkedAt).Add(settings.ZcodeVersionInterval(cfg))))
 				}
 				timer = time.NewTimer(wait)
 				due = timer.C
@@ -183,7 +172,7 @@ func (a *App) startZCodeVersionUpdates() {
 					timer.Stop()
 				}
 			case <-due:
-				lastAttempt = nowMS()
+				lastAttempt = shared.NowMS()
 				if err := a.syncZCodeVersion(a.ctx); err != nil && a.ctx.Err() == nil {
 					a.log.Printf("ZCode 版本同步失败，沿用当前版本：%v", err)
 				}

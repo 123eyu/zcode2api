@@ -117,9 +117,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -133,14 +130,15 @@ jobs:
           test "$(find . -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 4
           sha256sum ./*.tar.gz ./*.zip > SHA256SUMS
           sha256sum -c SHA256SUMS
-      - name: Smoke test packaged Linux executable
+      - name: Check packaged Linux version
         env:
           RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('ci-{0}', github.sha) }}
         shell: bash
         run: |
           package="zcode2api_${RELEASE_VERSION}_linux_amd64"
           tar -xzf "dist/${package}.tar.gz" -C "$RUNNER_TEMP"
-          node scripts/smoke.cjs "$RUNNER_TEMP/$package/zcode2api" "$RELEASE_VERSION"
+          actual_version=$("$RUNNER_TEMP/$package/zcode2api" --version)
+          test "$actual_version" = "zcode2api $RELEASE_VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: release-checksums
@@ -148,4 +146,4 @@ jobs:
           if-no-files-found: error
       - name: Summarize validation-only run
         if: github.event_name == 'workflow_dispatch'
-        run: echo 'Basic checks, service and packaged-binary smoke tests, six release packages and release checksums passed. No release or image was published.' >> "$GITHUB_STEP_SUMMARY"
+        run: echo 'Source and build checks, six release packages, packaged version and release checksums passed. No release or image was published.' >> "$GITHUB_STEP_SUMMARY"

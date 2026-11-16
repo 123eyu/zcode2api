@@ -1,10 +1,8 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -13,76 +11,31 @@ import (
 	"sort"
 	"strings"
 	"time"
+	accountdata "zcode2api/internal/server/account"
+	captchasdk "zcode2api/internal/server/captcha"
+	settings "zcode2api/internal/server/config"
+	"zcode2api/internal/server/fault"
+	childproc "zcode2api/internal/server/process"
+	wire "zcode2api/internal/server/protocol"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
-type Frame struct{ Data, Raw string }
-
-func readSSE(body io.Reader, consume func(Frame) error) error {
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 4096), 32<<20)
-	lines := []string{}
-	size := 0
-	flush := func() error {
-		if len(lines) == 0 {
-			return nil
-		}
-		f := Frame{Raw: strings.Join(lines, "\n") + "\n\n"}
-		data := []string{}
-		for _, line := range lines {
-			if strings.HasPrefix(line, "data:") {
-				data = append(data, strings.TrimPrefix(line[5:], " "))
-			}
-		}
-		f.Data = strings.Join(data, "\n")
-		lines = nil
-		size = 0
-		return consume(f)
-	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		size += len(line) + 1
-		if size > 32<<20 {
-			return fmt.Errorf("上游 SSE 事件超过 32MB")
-		}
-		if line == "" {
-			if e := flush(); e != nil {
-				return e
-			}
-		} else {
-			lines = append(lines, line)
-		}
-	}
-	if e := scanner.Err(); e != nil {
-		return e
-	}
-	return flush()
-}
-
-type Event struct {
-	Type, Text, Delta, ID, Name string
-	Index                       int
-	Frame                       Frame
-}
-type Result struct {
-	Text, Reasoning, FinishReason, SessionID string
-	TraceID                                  string
-	Native, Usage                            M
-	Calls                                    []any
-	Attempts                                 int
-}
 type contentBuffer struct{ text, thinking, signature, partial strings.Builder }
+
 type inferOptions struct {
-	Key, Body, Upstream                      M
-	Tools                                    *toolCatalog
+	Key, Body, Upstream                      shared.M
+	Tools                                    *wire.ToolCatalog
 	Protocol, Model, Level, ID, IP, Affinity string
 	Sticky                                   float64
 	Stream                                   bool
-	OnEvent                                  func(Event) error
+	OnEvent                                  func(wire.Event) error
 	OnAdmitted                               func()
 	Timing                                   *requestTiming
 	Admission                                time.Duration
 	RecheckAt                                time.Time
 }
+
 type requestTiming struct {
 	start                     time.Time
 	queue, retry              time.Duration
@@ -90,7 +43,8 @@ type requestTiming struct {
 }
 
 func newTiming() *requestTiming { return &requestTiming{start: time.Now()} }
-func (t *requestTiming) observe(e Event) {
+
+func (t *requestTiming) observe(e wire.Event) {
 	if !((e.Type == "text_delta" || e.Type == "reasoning_delta") && e.Text != "") && e.Type != "tool_start" {
 		return
 	}
@@ -106,7 +60,8 @@ func (t *requestTiming) observe(e Event) {
 		t.text = &v
 	}
 }
-func (t *requestTiming) snapshot() M {
+
+func (t *requestTiming) snapshot() shared.M {
 	value := func(p *int64) any {
 		if p == nil {
 			return nil
@@ -117,17 +72,18 @@ func (t *requestTiming) snapshot() M {
 	if t.first != nil {
 		generation = *t.last - *t.first
 	}
-	return M{"queue_ms": t.queue.Milliseconds(), "retry_ms": t.retry.Milliseconds(), "ttft_ms": value(t.first), "first_reasoning_ms": value(t.reason), "first_text_ms": value(t.text), "generation_ms": generation, "total_ms": time.Since(t.start).Milliseconds()}
+	return shared.M{"queue_ms": t.queue.Milliseconds(), "retry_ms": t.retry.Milliseconds(), "ttft_ms": value(t.first), "first_reasoning_ms": value(t.reason), "first_text_ms": value(t.text), "generation_ms": generation, "total_ms": time.Since(t.start).Milliseconds()}
 }
+
 func (a *App) upstreamHeaders(token, session, id string) http.Header {
 	// ZCode 3.17.2 sends the desktop app version, not the inference API version.
-	version := str(fallback(a.configValue("app_version"), defaultHTTPClientVersion))
+	version := shared.Str(shared.Fallback(a.configValue("app_version"), settings.DefaultHTTPClientVersion))
 	clientPlatform := platform()
 	osCategory := runtime.GOOS
 	if osCategory == "darwin" {
 		osCategory = "macos"
 	}
-	clientOSVersion := osVersion()
+	clientOSVersion := childproc.OSVersion()
 	tz := os.Getenv("TZ")
 	if tz == "" {
 		tz = time.Now().Location().String()
@@ -139,92 +95,45 @@ func (a *App) upstreamHeaders(token, session, id string) http.Header {
 		}
 	}
 	h := http.Header{}
-	for k, v := range map[string]string{"authorization": "Bearer " + token, "x-api-key": token, "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "ZCode/" + version, "x-zcode-app-version": version, "x-platform": clientPlatform, "x-client-language": "zh-CN", "x-client-timezone": tz, "x-os-category": osCategory, "x-os-version": clientOSVersion, "x-release-channel": "production", "http-referer": "https://zcode.z.ai", "x-title": "Z Code@electron", "x-zcode-agent": "glm", "x-session-id": session, "x-request-id": id, "x-query-id": uuidv7(), "x-zcode-trace-id": uuid(), "x-zcode-session-type": "main", "x-zcode-query-source": "main_turn"} {
+	for k, v := range map[string]string{"authorization": "Bearer " + token, "x-api-key": token, "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "ZCode/" + version, "x-zcode-app-version": version, "x-platform": clientPlatform, "x-client-language": "zh-CN", "x-client-timezone": tz, "x-os-category": osCategory, "x-os-version": clientOSVersion, "x-release-channel": "production", "http-referer": "https://zcode.z.ai", "x-title": "Z Code@electron", "x-zcode-agent": "glm", "x-session-id": session, "x-request-id": id, "x-query-id": shared.UUIDv7(), "x-zcode-trace-id": shared.UUID(), "x-zcode-session-type": "main", "x-zcode-query-source": "main_turn"} {
 		h.Set(k, v)
 	}
 	return h
 }
 
 func requestMetadataUserID(deviceMid, session string) string {
-	return js(M{
+	return shared.JSON(shared.M{
 		"device_id":    deviceMid,
 		"account_uuid": "",
 		"session_id":   session,
 	})
 }
 
-func providerFailure(v M, status int, retry string) *Failure {
-	e := obj(v["error"])
-	f := &Failure{Status: status, RetryAfter: retryAfter(retry, time.Now())}
-	for _, value := range []any{e["code"], v["code"], e["type"], "upstream_http_error"} {
-		if code := strings.TrimSpace(str(value)); code != "" {
-			f.Code = code
-			break
-		}
-	}
-	for _, value := range []any{e["message"], e["msg"], v["msg"], v["message"], fmt.Sprintf("上游 HTTP %d", status)} {
-		if message := strings.TrimSpace(str(value)); message != "" {
-			f.Message = message
-			break
-		}
-	}
-	f.Detail = failureDetail(f)
-	return f
-}
-
-func upstreamHTTPFailure(res *http.Response, body []byte) *Failure {
-	v := obj(parse(string(body), nil))
-	f := providerFailure(v, res.StatusCode, res.Header.Get("Retry-After"))
-	f.Detail["body"] = failureBody(string(body))
-	f.Detail["http_status"] = res.StatusCode
-	f.Detail["response_headers"] = failureResponseHeaders(res.Header)
-	if res.StatusCode == http.StatusProxyAuthRequired {
-		f.Kind, f.Code, f.Message, f.Retryable = "network", "proxy_auth_failed", "代理鉴权失败", true
-		return f
-	}
-	if len(v) > 0 {
-		return f
-	}
-	page := strings.ToLower(string(body))
-	switch {
-	case (res.StatusCode == 403 || res.StatusCode == 405) && strings.Contains(page, "errors.aliyun.com/") && strings.Contains(page, "block_message"):
-		f.Kind, f.Code = "risk", "upstream_waf_blocked"
-		f.Message = "上游安全网关拦截"
-	case riskBlockMessage(page):
-		f.Kind, f.Code, f.Message = "account_risk", "upstream_risk_blocked", "账号风控拒绝"
-	case strings.TrimSpace(string(body)) == "":
-		f.Message += "：上游返回空响应体"
-	default:
-		f.Message += "：上游返回非 JSON 错误响应"
-	}
-	return f
-}
-
 var errStopSSE = errors.New("message_stop")
 
-func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (result *Result, failure *Failure) {
+func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions) (result *wire.Result, failure *fault.Failure) {
 	if o.Timing == nil {
 		o.Timing = newTiming()
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
-	params := obj(a.configValue("http"))
+	params := shared.Obj(a.configValue("http"))
 	timers := []*time.Timer{}
 	timer := func(code, label string, d time.Duration) *time.Timer {
 		if d <= 0 {
 			return nil
 		}
-		t := time.AfterFunc(d, func() { cancel(&Failure{Kind: "timeout", Code: code, Message: label}) })
+		t := time.AfterFunc(d, func() { cancel(&fault.Failure{Kind: "timeout", Code: code, Message: label}) })
 		timers = append(timers, t)
 		return t
 	}
-	timer("inference_timeout", "上游推理超时", ms(params["total_timeout_ms"]))
-	firstTimer := timer("first_token_timeout", "上游首字超时", ms(params["first_token_timeout_ms"]))
-	idle := timer("stream_idle_timeout", "上游流空闲超时", ms(params["idle_timeout_ms"]))
+	timer("inference_timeout", "上游推理超时", shared.Ms(params["total_timeout_ms"]))
+	firstTimer := timer("first_token_timeout", "上游首字超时", shared.Ms(params["first_token_timeout_ms"]))
+	idle := timer("stream_idle_timeout", "上游流空闲超时", shared.Ms(params["idle_timeout_ms"]))
 	var admission *time.Timer
 	if o.Admission > 0 {
 		admission = time.AfterFunc(o.Admission, func() {
-			cancel(&Failure{Kind: "rate_limit", Code: "throttle_window_exhausted", Message: "限流重试超时"})
+			cancel(&fault.Failure{Kind: "rate_limit", Code: "throttle_window_exhausted", Message: "限流重试超时"})
 		})
 		timers = append(timers, admission)
 	}
@@ -235,7 +144,7 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 	}()
 	resetIdle := func() {
 		if idle != nil {
-			idle.Reset(ms(params["idle_timeout_ms"]))
+			idle.Reset(shared.Ms(params["idle_timeout_ms"]))
 		}
 	}
 	admitted := false
@@ -253,19 +162,19 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 	}
 	committed := false
 	var res *http.Response
-	requestDetail := M{}
+	requestDetail := shared.M{}
 	var requestSecrets []string
 	defer func() {
 		if failure == nil {
 			return
 		}
-		failure.Detail = failureDetail(failure)
+		failure.Detail = fault.FailureDetail(failure)
 		for key, value := range requestDetail {
 			failure.Detail[key] = value
 		}
 		if res != nil {
 			failure.Detail["http_status"] = res.StatusCode
-			failure.Detail["response_headers"] = failureResponseHeaders(res.Header)
+			failure.Detail["response_headers"] = fault.FailureResponseHeaders(res.Header)
 		}
 		// Upstream errors occasionally echo a credential in free-form text.
 		for _, key := range []string{"message", "body"} {
@@ -278,33 +187,32 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 				failure.Detail[key] = value
 			}
 		}
-		defer func() { failure.Message = conciseFailureMessage(failure) }()
+		defer func() { failure.Message = fault.ConciseFailureMessage(failure) }()
 		failure.Committed = committed
 		if parent.Err() != nil {
 			failure.Kind, failure.Code, failure.Message = "canceled", "canceled", "客户端已断开"
 			return
 		}
-		if cause, ok := context.Cause(ctx).(*Failure); ok {
+		if cause, ok := context.Cause(ctx).(*fault.Failure); ok {
 			failure.Kind, failure.Code, failure.Message = cause.Kind, cause.Code, cause.Message
 		}
 	}()
-	r := &Result{Calls: []any{}, Usage: M{}}
-	session := uuid()
+	r := &wire.Result{Calls: []any{}, Usage: shared.M{}}
+	session := shared.UUID()
 	if o.Affinity != "" {
-		session = hash(o.Affinity)[:32]
+		session = shared.Hash(o.Affinity)[:32]
 	}
-	r.SessionID = session
-	upstreamBody := clone(o.Upstream)
-	metadata := obj(upstreamBody["metadata"])
+	upstreamBody := shared.Clone(o.Upstream)
+	metadata := shared.Obj(upstreamBody["metadata"])
 	metadata["user_id"] = requestMetadataUserID(
-		str(account["device_mid"]),
+		shared.Str(account["device_mid"]),
 		session,
 	)
 	upstreamBody["metadata"] = metadata
-	requestID := uuid()
+	requestID := shared.UUID()
 	ctx, release, e := a.pinOutboundProxy(ctx, account)
 	if e != nil {
-		return nil, asProxyFailure(e)
+		return nil, routing.AsProxyFailure(e)
 	}
 	defer release()
 	defer func() { a.prepareProxyFailover(ctx, failure) }()
@@ -321,21 +229,21 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 	}()
 	client, e := a.client(ctx)
 	if e != nil {
-		return nil, &Failure{Kind: "invalid", Message: e.Error()}
+		return nil, &fault.Failure{Kind: "invalid", Message: e.Error()}
 	}
 	for verificationAttempt := 0; ; verificationAttempt++ {
-		var f *Failure
-		verification, f = a.captchaHeaders(ctx, account, captchaPurposeInference, verificationAttempt > 0)
+		var f *fault.Failure
+		verification, f = a.captchaHeaders(ctx, account, captchasdk.CaptchaPurposeInference, verificationAttempt > 0)
 		if f != nil {
 			return nil, f
 		}
-		req, err := http.NewRequestWithContext(ctx, "POST", a.origin+"/api/v1/zcode-plan/anthropic/v1/messages", strings.NewReader(js(upstreamBody)))
+		req, err := http.NewRequestWithContext(ctx, "POST", a.origin+"/api/v1/zcode-plan/anthropic/v1/messages", strings.NewReader(shared.JSON(upstreamBody)))
 		if err != nil {
-			return nil, &Failure{Message: err.Error()}
+			return nil, &fault.Failure{Message: err.Error()}
 		}
-		tokens := a.tokens(str(account["id"]))
-		if loginJWTExpired(tokens) {
-			return nil, &Failure{Kind: "auth", Code: "login_expired", Status: 401, Message: "ZCode 登录已过期，请重新授权"}
+		tokens := a.tokens(shared.Str(account["id"]))
+		if accountdata.LoginJWTExpired(tokens) {
+			return nil, &fault.Failure{Kind: "auth", Code: "login_expired", Status: 401, Message: "ZCode 登录已过期，请重新授权"}
 		}
 		token := tokens["zcode_jwt"]
 		if failure := validateCaptchaRequestToken(verification, account, token); failure != nil {
@@ -344,18 +252,18 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 		req.Header = a.upstreamHeaders(token, session, requestID)
 		// Keep the source header and metadata tied to the account's existing
 		// device identity, as the official 3.18.2 client does.
-		if device := str(account["device_mid"]); device != "" {
+		if device := shared.Str(account["device_mid"]); device != "" {
 			req.Header.Set("X-Device-Mid", device)
 		}
 		for key, values := range verification.Headers {
 			req.Header[key] = values
 		}
-		requestDetail = M{"request_id": req.Header.Get("X-Request-Id"), "trace_id": req.Header.Get("X-Zcode-Trace-Id"), "query_id": req.Header.Get("X-Query-Id"), "session_id": session}
+		requestDetail = shared.M{"request_id": req.Header.Get("X-Request-Id"), "trace_id": req.Header.Get("X-Zcode-Trace-Id"), "query_id": req.Header.Get("X-Query-Id"), "session_id": session}
 		requestSecrets = append(requestSecrets, token, req.Header.Get("X-Aliyun-Captcha-Verify-Param"))
 		r.TraceID = req.Header.Get("X-Zcode-Trace-Id")
 		res, e = client.Do(req)
 		if e != nil {
-			return nil, transportFailure(ctx, e)
+			return nil, routing.TransportFailure(ctx, e)
 		}
 		resetIdle()
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
@@ -369,18 +277,18 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 		b, readError := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 		res.Body.Close()
 		if readError != nil {
-			failure := transportFailure(ctx, readError)
-			failure.Detail = failureDetail(failure)
-			failure.Detail["body"] = failureBody(string(b))
+			failure := routing.TransportFailure(ctx, readError)
+			failure.Detail = fault.FailureDetail(failure)
+			failure.Detail["body"] = fault.FailureBody(string(b))
 			if res.StatusCode == http.StatusTooManyRequests {
 				failure.Kind, failure.Code, failure.Status, failure.Message = "rate_limit", "rate_limit_error", res.StatusCode, "请求频率受限"
-				failure.RetryAfter = retryAfter(res.Header.Get("Retry-After"), time.Now())
+				failure.RetryAfter = fault.RetryAfter(res.Header.Get("Retry-After"), time.Now())
 			}
 			return nil, failure
 		}
-		failure := upstreamHTTPFailure(res, b)
-		captchaMode := str(fallback(obj(a.configValue("http", "captcha"))["mode"], "off"))
-		if captchaExpired(failure) {
+		failure := fault.UpstreamHTTPFailure(res, b)
+		captchaMode := shared.Str(shared.Fallback(shared.Obj(a.configValue("http", "captcha"))["mode"], "off"))
+		if captchasdk.CaptchaExpired(failure) {
 			failure.Kind, failure.Retryable = "risk", false
 			if verification.Headers.Get("X-Aliyun-Captcha-Verify-Param") != "" {
 				a.rejectCaptchaVerification(verification)
@@ -398,22 +306,22 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 	}
 	defer res.Body.Close()
 	if !strings.Contains(res.Header.Get("Content-Type"), "text/event-stream") {
-		body, readError := io.ReadAll(io.LimitReader(res.Body, failureBodyLimit+1))
-		detail := M{"body": failureBody(string(body))}
+		body, readError := io.ReadAll(io.LimitReader(res.Body, fault.FailureBodyLimit+1))
+		detail := shared.M{"body": fault.FailureBody(string(body))}
 		if readError != nil {
-			detail["read_error"] = boundedFailureText(readError.Error())
+			detail["read_error"] = fault.BoundedFailureText(readError.Error())
 		}
-		return nil, &Failure{Status: 502, Code: "upstream_invalid_content_type", Message: "上游未返回 SSE 响应", Detail: detail}
+		return nil, &fault.Failure{Status: 502, Code: "upstream_invalid_content_type", Message: "上游未返回 SSE 响应", Detail: detail}
 	}
-	content := map[int]M{}
+	content := map[int]shared.M{}
 	buffers := map[int]*contentBuffer{}
 	var text, reasoning strings.Builder
 	open := map[int]bool{}
-	usage := M{}
-	nativePending := []Frame{}
+	usage := shared.M{}
+	nativePending := []wire.Frame{}
 	pendingBytes := 0
 	nativeStarted, stopped := false, false
-	emit := func(ev Event) error {
+	emit := func(ev wire.Event) error {
 		o.Timing.observe(ev)
 		if ((ev.Type == "text_delta" || ev.Type == "reasoning_delta") && ev.Text != "") || ev.Type == "tool_start" {
 			admit()
@@ -426,58 +334,58 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 		}
 		return o.OnEvent(ev)
 	}
-	e = readSSE(res.Body, func(f Frame) error {
+	e = wire.ReadSSE(res.Body, func(f wire.Frame) error {
 		resetIdle()
 		if f.Data == "" {
 			return nil
 		}
-		v := parse(f.Data, nil)
+		v := shared.Parse(f.Data, nil)
 		event, ok := v.(map[string]any)
 		if !ok {
-			return &Failure{Status: 502, Code: "upstream_invalid_sse_json", Message: "上游 SSE JSON 无效", Detail: M{"body": failureBody(f.Data)}}
+			return &fault.Failure{Status: 502, Code: "upstream_invalid_sse_json", Message: "上游 SSE JSON 无效", Detail: shared.M{"body": fault.FailureBody(f.Data)}}
 		}
-		typ := str(event["type"])
-		idx := int(integer(event["index"]))
+		typ := shared.Str(event["type"])
+		idx := int(shared.Integer(event["index"]))
 		if typ == "error" {
-			failure := providerFailure(event, 502, "")
-			failure.Detail["body"] = failureBody(f.Data)
+			failure := fault.ProviderFailure(event, 502, "")
+			failure.Detail["body"] = fault.FailureBody(f.Data)
 			return failure
 		}
 		if typ == "message_start" {
-			r.Native = clone(obj(event["message"]))
-			usage = clone(obj(r.Native["usage"]))
+			r.Native = shared.Clone(shared.Obj(event["message"]))
+			usage = shared.Clone(shared.Obj(r.Native["usage"]))
 			if len(r.Native) > 0 {
 				a.acceptCaptchaVerification(ctx, &verification)
 			}
 		}
 		if typ == "content_block_start" {
 			if open[idx] {
-				return invalid("上游内容块重复开始")
+				return fault.Invalid("上游内容块重复开始")
 			}
 			open[idx] = true
-			b := clone(obj(event["content_block"]))
+			b := shared.Clone(shared.Obj(event["content_block"]))
 			content[idx] = b
 			buffer := &contentBuffer{}
-			buffer.text.WriteString(str(b["text"]))
-			buffer.thinking.WriteString(str(b["thinking"]))
-			buffer.signature.WriteString(str(b["signature"]))
+			buffer.text.WriteString(shared.Str(b["text"]))
+			buffer.thinking.WriteString(shared.Str(b["thinking"]))
+			buffer.signature.WriteString(shared.Str(b["signature"]))
 			buffers[idx] = buffer
-			if str(b["type"]) == "tool_use" {
-				if e := emit(Event{Type: "tool_start", Index: idx, ID: str(b["id"]), Name: str(b["name"])}); e != nil {
+			if shared.Str(b["type"]) == "tool_use" {
+				if e := emit(wire.Event{Type: "tool_start", Index: idx, ID: shared.Str(b["id"]), Name: shared.Str(b["name"])}); e != nil {
 					return e
 				}
 			}
-			if truth(b["text"]) {
-				s := str(b["text"])
+			if shared.Truth(b["text"]) {
+				s := shared.Str(b["text"])
 				text.WriteString(s)
-				if e := emit(Event{Type: "text_delta", Text: s}); e != nil {
+				if e := emit(wire.Event{Type: "text_delta", Text: s}); e != nil {
 					return e
 				}
 			}
-			if truth(b["thinking"]) {
-				s := str(b["thinking"])
+			if shared.Truth(b["thinking"]) {
+				s := shared.Str(b["thinking"])
 				reasoning.WriteString(s)
-				if e := emit(Event{Type: "reasoning_delta", Text: s}); e != nil {
+				if e := emit(wire.Event{Type: "reasoning_delta", Text: s}); e != nil {
 					return e
 				}
 			}
@@ -485,33 +393,33 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 		if typ == "content_block_delta" {
 			b := content[idx]
 			if b == nil || !open[idx] {
-				return providerFailure(M{"message": "上游内容块缺少 start 事件"}, 502, "")
+				return fault.ProviderFailure(shared.M{"message": "上游内容块缺少 start 事件"}, 502, "")
 			}
-			d := obj(event["delta"])
+			d := shared.Obj(event["delta"])
 			buffer := buffers[idx]
-			switch str(d["type"]) {
+			switch shared.Str(d["type"]) {
 			case "text_delta":
-				s := str(d["text"])
+				s := shared.Str(d["text"])
 				buffer.text.WriteString(s)
 				text.WriteString(s)
-				if e := emit(Event{Type: "text_delta", Text: s}); e != nil {
+				if e := emit(wire.Event{Type: "text_delta", Text: s}); e != nil {
 					return e
 				}
 			case "thinking_delta":
-				s := str(d["thinking"])
+				s := shared.Str(d["thinking"])
 				buffer.thinking.WriteString(s)
 				reasoning.WriteString(s)
-				if e := emit(Event{Type: "reasoning_delta", Text: s}); e != nil {
+				if e := emit(wire.Event{Type: "reasoning_delta", Text: s}); e != nil {
 					return e
 				}
 			case "signature_delta":
-				buffer.signature.WriteString(str(d["signature"]))
+				buffer.signature.WriteString(shared.Str(d["signature"]))
 			case "citations_delta":
-				b["citations"] = append(arr(b["citations"]), d["citation"])
+				b["citations"] = append(shared.Arr(b["citations"]), d["citation"])
 			case "input_json_delta":
-				s := str(d["partial_json"])
+				s := shared.Str(d["partial_json"])
 				buffer.partial.WriteString(s)
-				if e := emit(Event{Type: "tool_delta", Index: idx, Delta: s}); e != nil {
+				if e := emit(wire.Event{Type: "tool_delta", Index: idx, Delta: s}); e != nil {
 					return e
 				}
 			}
@@ -527,57 +435,57 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 					}
 				}
 			}
-			if str(b["type"]) == "tool_use" {
+			if shared.Str(b["type"]) == "tool_use" {
 				partial := buffer.partial.String()
 				if partial == "" {
-					if e := emit(Event{Type: "tool_delta", Index: idx, Delta: js(first(b["input"], M{}))}); e != nil {
+					if e := emit(wire.Event{Type: "tool_delta", Index: idx, Delta: shared.JSON(shared.First(b["input"], shared.M{}))}); e != nil {
 						return e
 					}
 				} else {
-					input := parse(partial, nil)
+					input := shared.Parse(partial, nil)
 					if input == nil {
-						return providerFailure(M{"message": "上游工具参数 JSON 不完整"}, 502, "")
+						return fault.ProviderFailure(shared.M{"message": "上游工具参数 JSON 不完整"}, 502, "")
 					}
 					b["input"] = input
 				}
-				arguments := first(b["input"], M{})
+				arguments := shared.First(b["input"], shared.M{})
 				if o.Tools != nil {
-					if e := o.Tools.validateCall(ctx, str(b["name"]), arguments); e != nil {
+					if e := o.Tools.ValidateCall(ctx, shared.Str(b["name"]), arguments); e != nil {
 						return e
 					}
 				}
-				r.Calls = append(r.Calls, M{"id": b["id"], "name": b["name"], "arguments": arguments})
-				if e := emit(Event{Type: "tool_end", Index: idx}); e != nil {
+				r.Calls = append(r.Calls, shared.M{"id": b["id"], "name": b["name"], "arguments": arguments})
+				if e := emit(wire.Event{Type: "tool_end", Index: idx}); e != nil {
 					return e
 				}
 			}
 		}
 		if typ == "message_delta" {
 			if r.Native == nil {
-				return providerFailure(M{"message": "上游缺少 message_start"}, 502, "")
+				return fault.ProviderFailure(shared.M{"message": "上游缺少 message_start"}, 502, "")
 			}
-			maps.Copy(r.Native, obj(event["delta"]))
-			maps.Copy(usage, obj(event["usage"]))
+			maps.Copy(r.Native, shared.Obj(event["delta"]))
+			maps.Copy(usage, shared.Obj(event["usage"]))
 		}
 		if typ == "message_stop" {
 			if len(open) > 0 {
-				return providerFailure(M{"message": "上游事件流提前结束，内容块未关闭"}, 502, "")
+				return fault.ProviderFailure(shared.M{"message": "上游事件流提前结束，内容块未关闭"}, 502, "")
 			}
 			stopped = true
 			admit()
 		}
 		if o.Stream && o.Protocol == "anthropic" {
-			b, d := obj(event["content_block"]), obj(event["delta"])
-			visible := stopped || str(b["type"]) == "tool_use" || truth(b["text"]) || truth(b["thinking"]) || truth(d["text"]) || truth(d["thinking"])
+			b, d := shared.Obj(event["content_block"]), shared.Obj(event["delta"])
+			visible := stopped || shared.Str(b["type"]) == "tool_use" || shared.Truth(b["text"]) || shared.Truth(b["thinking"]) || shared.Truth(d["text"]) || shared.Truth(d["thinking"])
 			nativeStarted = nativeStarted || visible
 			nativePending = append(nativePending, f)
 			pendingBytes += len(f.Raw)
 			if !nativeStarted && pendingBytes > 1<<20 {
-				return providerFailure(M{"message": "上游 SSE 前导事件超过 1MB"}, 502, "")
+				return fault.ProviderFailure(shared.M{"message": "上游 SSE 前导事件超过 1MB"}, 502, "")
 			}
 			if nativeStarted {
 				for _, p := range nativePending {
-					if e := emit(Event{Type: "native_event", Frame: p}); e != nil {
+					if e := emit(wire.Event{Type: "native_event", Frame: p}); e != nil {
 						return e
 					}
 				}
@@ -591,13 +499,13 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 		return nil
 	})
 	if e != nil && e != errStopSSE {
-		if f, ok := e.(*Failure); ok {
+		if f, ok := e.(*fault.Failure); ok {
 			return nil, f
 		}
-		return nil, &Failure{Kind: "network", Code: "upstream_stream_error", Message: e.Error(), Retryable: true}
+		return nil, &fault.Failure{Kind: "network", Code: "upstream_stream_error", Message: e.Error(), Retryable: true}
 	}
 	if !stopped || r.Native == nil {
-		return nil, &Failure{Status: 502, Code: "truncated_stream", Kind: "server", Message: "上游事件流提前结束，缺少 message_stop", Retryable: true}
+		return nil, &fault.Failure{Status: 502, Code: "truncated_stream", Kind: "server", Message: "上游事件流提前结束，缺少 message_stop", Retryable: true}
 	}
 	indices := []int{}
 	for i := range content {
@@ -610,7 +518,7 @@ func (a *App) inferHTTP(parent context.Context, account M, o inferOptions) (resu
 	}
 	r.Native["content"], r.Native["usage"] = blocks, usage
 	r.Text, r.Reasoning = text.String(), reasoning.String()
-	r.FinishReason = str(r.Native["stop_reason"])
-	r.Usage = normalizeUsage(merge(usage, M{"input_tokens": num(usage["input_tokens"]) + num(usage["cache_read_input_tokens"]) + num(usage["cache_creation_input_tokens"])}))
+	r.FinishReason = shared.Str(r.Native["stop_reason"])
+	r.Usage = wire.NormalizeUsage(shared.Merge(usage, shared.M{"input_tokens": shared.Num(usage["input_tokens"]) + shared.Num(usage["cache_read_input_tokens"]) + shared.Num(usage["cache_creation_input_tokens"])}))
 	return r, nil
 }

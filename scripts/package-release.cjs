@@ -48,7 +48,17 @@ if (goos === 'windows' && process.platform === 'win32') {
   execFileSync('powershell.exe', ['-NoProfile', '-Command', '$ErrorActionPreference = "Stop"; Compress-Archive -LiteralPath $env:Z2A_PACKAGE_DIRECTORY -DestinationPath $env:Z2A_PACKAGE_ARCHIVE'], { env: { ...process.env, Z2A_PACKAGE_DIRECTORY: directory, Z2A_PACKAGE_ARCHIVE: archive } });
 } else if (goos === 'windows') execFileSync('zip', ['-qr', archive, name], { cwd: output });
 else execFileSync('tar', ['-czf', archive, name], { cwd: output });
-const entries = (goos === 'windows' && process.platform !== 'win32' ? execFileSync('unzip', ['-Z1', archive], { encoding: 'utf8' }) : execFileSync('tar', ['-tf', archive], { encoding: 'utf8' })).trim().split(/\r?\n/).map(entry => entry.replaceAll('\\', '/'));
-for (const file of [binary, ...sharedFiles, ...(goos === 'windows' ? ['scripts/start.ps1', 'scripts/stop.ps1'] : [])]) assert.ok(entries.includes(`${name}/${file}`), `Archive missing ${file}`);
-assert.ok(entries.every(entry => entry.startsWith(name + '/') && !/(^|\/)(data|node_modules|\.git)(\/|$)/.test(entry) && !entry.endsWith('/config.json')), 'Archive contains runtime data or an unexpected path');
+// Inspect extracted names through Node: native archive listings use the host's
+// code page on Windows and corrupt non-ASCII paths when decoded as UTF-8.
+const checkDirectory = fs.mkdtempSync(path.join(output, '.verify-'));
+assert.equal(path.dirname(checkDirectory), output);
+try {
+  if (goos === 'windows' && process.platform !== 'win32') execFileSync('unzip', ['-q', archive, '-d', checkDirectory]);
+  else execFileSync('tar', ['-xf', archive, '-C', checkDirectory]);
+  const entries = fs.readdirSync(checkDirectory, { recursive: true }).map(entry => entry.replaceAll('\\', '/'));
+  for (const file of [binary, ...sharedFiles, ...(goos === 'windows' ? ['scripts/start.ps1', 'scripts/stop.ps1'] : [])]) assert.ok(entries.includes(`${name}/${file}`), `Archive missing ${file}`);
+  assert.ok(entries.every(entry => (entry === name || entry.startsWith(name + '/')) && !/(^|\/)(data|node_modules|\.git)(\/|$)/.test(entry) && !entry.endsWith('/config.json')), 'Archive contains runtime data or an unexpected path');
+} finally {
+  fs.rmSync(checkDirectory, { recursive: true, force: true });
+}
 console.log(`Verified release archive, required files and binary architecture: ${archive}`);

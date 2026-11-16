@@ -881,7 +881,10 @@ main[data-page="logs"] { gap: 18px; }
 .daily-claim-row .account-identity { flex-direction: row; align-items: center; gap: 14px; min-width: 0; }
 .daily-claim-row .account-row-family { margin-left: 4px; }
 .daily-claim-row .account-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.daily-claim-row > .btn { min-width: 64px; min-height: 30px; height: 30px; padding: 0 12px; font-size: 12px; }
+.daily-claim-action { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.daily-claim-action > .btn { min-width: 64px; min-height: 30px; height: 30px; padding: 0 12px; font-size: 12px; }
+.daily-claim-row.needs-verification { box-shadow: inset 2px 0 var(--primary); }
+.daily-claim-row.query-stale { box-shadow: inset 2px 0 var(--warn); }
 .daily-claim-grants { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 20px; text-align: right; }
 .daily-claim-grants > div { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
 .daily-claim-grants strong { display: block; font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.025em; white-space: nowrap; }
@@ -1252,7 +1255,7 @@ main[data-page="logs"] { gap: 18px; }
   .daily-claim-row { gap: 10px; padding: 8px 16px; }
   .daily-claim-row .account-identity { flex-direction: column; align-items: flex-start; gap: 0; }
   .daily-claim-row .account-row-family { display: none; }
-  .daily-claim-row > .btn { min-width: 52px; padding-inline: 10px; }
+  .daily-claim-action > .btn { min-width: 52px; padding-inline: 10px; }
   .daily-claim-grants { max-width: 115px; }
   .daily-claim-grants > div { flex-direction: column; gap: 0; align-items: flex-end; }
   .daily-claim-grants span { width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

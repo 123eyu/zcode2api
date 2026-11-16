@@ -5,20 +5,22 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"zcode2api/internal/server/fault"
+	"zcode2api/internal/server/shared"
 )
 
 const logPageSize = 20
 
 func publicUsageLogs(rows []any) []any {
 	for _, v := range rows {
-		m := obj(v)
-		m["timings"] = parse(m["timings"], nil)
-		m["error_detail"] = parse(m["error_detail"], nil)
-		if str(m["error_message"]) != "" {
+		m := shared.Obj(v)
+		m["timings"] = shared.Parse(m["timings"], nil)
+		m["error_detail"] = shared.Parse(m["error_detail"], nil)
+		if shared.Str(m["error_message"]) != "" {
 			if m["error_detail"] == nil {
-				m["error_detail"] = M{"message": m["error_message"]}
+				m["error_detail"] = shared.M{"message": m["error_message"]}
 			}
-			m["error_message"] = conciseFailureMessage(&Failure{Code: str(m["error_code"]), Message: str(m["error_message"])})
+			m["error_message"] = fault.ConciseFailureMessage(&fault.Failure{Code: shared.Str(m["error_code"]), Message: shared.Str(m["error_message"])})
 		}
 	}
 	return rows
@@ -51,13 +53,13 @@ func logInteger(r *http.Request, name string, fallback int64) (int64, error) {
 func logChoice(rows []any, value, label string) []any {
 	choices := []any{}
 	for _, v := range rows {
-		r := obj(v)
-		if str(r[value]) != "" {
-			text := str(r[label])
+		r := shared.Obj(v)
+		if shared.Str(r[value]) != "" {
+			text := shared.Str(r[label])
 			if text == "" {
-				text = str(r[value])
+				text = shared.Str(r[value])
 			}
-			choices = append(choices, M{"value": str(r[value]), "label": text})
+			choices = append(choices, shared.M{"value": shared.Str(r[value]), "label": text})
 		}
 	}
 	return choices
@@ -80,9 +82,9 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		return bad(err)
 	}
 	if q.Get("snapshot") == "" {
-		snapshot = integer(a.row("SELECT COALESCE(MAX(id),0) n FROM " + table)["n"])
+		snapshot = shared.Integer(a.row("SELECT COALESCE(MAX(id),0) n FROM " + table)["n"])
 	}
-	asOf, err := logInteger(r, "as_of", nowMS())
+	asOf, err := logInteger(r, "as_of", shared.NowMS())
 	if err != nil {
 		return bad(err)
 	}
@@ -117,7 +119,7 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 			s.add(column+"=?", value)
 		}
 	}
-	choices := M{}
+	choices := shared.M{}
 	if kind == "logs" {
 		switch status := q.Get("status"); status {
 		case "", "all":
@@ -145,16 +147,16 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		choices["keys"] = logChoice(a.rows("SELECT DISTINCT u.key_id,k.name FROM usage_log u LEFT JOIN keys k ON k.id=u.key_id WHERE u.id<=? ORDER BY COALESCE(k.name,u.key_id)", snapshot), "key_id", "name")
 		errors := []any{}
 		for _, v := range a.rows("SELECT COALESCE(error_code,'') code,MAX(error_message) message FROM usage_log WHERE id<=? AND COALESCE(status,'')<>'success' GROUP BY COALESCE(error_code,'') ORDER BY code", snapshot) {
-			r := obj(v)
-			code := str(r["code"])
-			label := conciseFailureMessage(&Failure{Code: code, Message: str(r["message"])})
+			r := shared.Obj(v)
+			code := shared.Str(r["code"])
+			label := fault.ConciseFailureMessage(&fault.Failure{Code: code, Message: shared.Str(r["message"])})
 			value := code
 			if value == "" {
 				value, label = "__uncoded__", "未提供错误码"
 			} else {
 				label += "（" + code + "）"
 			}
-			errors = append(errors, M{"value": value, "label": label})
+			errors = append(errors, shared.M{"value": value, "label": label})
 		}
 		choices["errors"] = errors
 	} else if kind == "sched" {
@@ -198,9 +200,9 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		}
 		// Search current short summaries as well as the raw text of old records.
 		if kind == "logs" {
-			for _, choice := range arr(choices["errors"]) {
-				c := obj(choice)
-				if strings.Contains(strings.ToLower(str(c["label"])), strings.ToLower(term)) {
+			for _, choice := range shared.Arr(choices["errors"]) {
+				c := shared.Obj(choice)
+				if strings.Contains(strings.ToLower(shared.Str(c["label"])), strings.ToLower(term)) {
 					if c["value"] == "__uncoded__" {
 						continue
 					}
@@ -217,7 +219,7 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		aggregate += ",COALESCE(SUM(u.status='success'),0) success,COALESCE(SUM(u.status='busy'),0) busy,COALESCE(SUM(u.status='canceled'),0) canceled,COALESCE(SUM(COALESCE(u.status,'') NOT IN ('success','busy','canceled')),0) failed,COALESCE(SUM(COALESCE(u.tokens_in,0)+COALESCE(u.tokens_out,0)),0) tokens,COUNT(u.ttft_ms) ttft_count"
 	}
 	summary := a.row("SELECT "+aggregate+" FROM "+from+where, s.args...)
-	total := integer(summary["total"])
+	total := shared.Integer(summary["total"])
 	page, err := logInteger(r, "page", 1)
 	if err != nil {
 		return bad(err)
@@ -231,11 +233,11 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 	}
 	if kind == "logs" {
 		items = publicUsageLogs(items)
-		n := integer(summary["ttft_count"])
+		n := shared.Integer(summary["ttft_count"])
 		if n > 0 {
 			args := append(append([]any{}, s.args...), n/2)
 			summary["p50"] = a.row("SELECT u.ttft_ms value FROM "+from+where+" AND u.ttft_ms IS NOT NULL ORDER BY u.ttft_ms LIMIT 1 OFFSET ?", args...)["value"]
 		}
 	}
-	return M{"items": items, "total": total, "page": page, "pages": pages, "page_size": logPageSize, "snapshot": snapshot, "as_of": asOf, "summary": summary, "filters": choices}, 200, nil
+	return shared.M{"items": items, "total": total, "page": page, "pages": pages, "page_size": logPageSize, "snapshot": snapshot, "as_of": asOf, "summary": summary, "filters": choices}, 200, nil
 }

@@ -6,6 +6,9 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"zcode2api/internal/server/fault"
+	routing "zcode2api/internal/server/proxy"
+	"zcode2api/internal/server/shared"
 )
 
 // Guard state is shared by inference, management requests and SDK executions.
@@ -15,7 +18,7 @@ type upstreamCooldown struct {
 	generation uint64
 	probing    bool
 	failures   int
-	failure    Failure
+	failure    fault.Failure
 }
 
 type upstreamRequestScope struct {
@@ -32,32 +35,33 @@ func (s upstreamRequestScope) keys() []string {
 	return keys
 }
 
-func (a *App) upstreamScope(ctx context.Context, account M, target string, authenticated bool) upstreamRequestScope {
+func (a *App) upstreamScope(ctx context.Context, account shared.M, target string, authenticated bool) upstreamRequestScope {
 	origin := strings.TrimRight(target, "/")
 	if parsed, err := url.Parse(target); err == nil && parsed.Host != "" {
 		origin = strings.ToLower(parsed.Scheme + "://" + parsed.Host)
 	}
-	scope := upstreamRequestScope{exit: "exit|" + origin + "|" + hash(selectedProxy(ctx))}
-	if authenticated && str(account["id"]) != "" {
-		scope.account = "account|" + origin + "|" + str(account["id"])
-		if device := str(account["device_mid"]); device != "" {
-			scope.device = "device|" + origin + "|" + hash(device)
+	scope := upstreamRequestScope{exit: "exit|" + origin + "|" + shared.Hash(routing.SelectedProxy(ctx))}
+	if authenticated && shared.Str(account["id"]) != "" {
+		scope.account = "account|" + origin + "|" + shared.Str(account["id"])
+		if device := shared.Str(account["device_mid"]); device != "" {
+			scope.device = "device|" + origin + "|" + shared.Hash(device)
 		}
 	}
 	return scope
 }
 
-func (a *App) captchaRequestScope(ctx context.Context, account, scene M) upstreamRequestScope {
+func (a *App) captchaRequestScope(ctx context.Context, account, scene shared.M) upstreamRequestScope {
 	scope := a.upstreamScope(ctx, account, a.origin, true)
-	identity := str(scene["region"]) + "|" + str(scene["prefix"])
+	identity := shared.Str(scene["region"]) + "|" + shared.Str(scene["prefix"])
 	// The SDK does not receive account.device_mid. Its device restriction must
 	// not be attributed to that unrelated account header or escaped by a route change.
-	scope.device = "sdk-device|" + a.origin + "|" + hash(identity)
-	scope.verification = "verification|" + scope.exit + "|" + hash(identity+"|"+str(scene["sceneId"]))
+	scope.device = "sdk-device|" + a.origin + "|" + shared.Hash(identity)
+	scope.verification = "verification|" + scope.exit + "|" + shared.Hash(identity+"|"+shared.Str(scene["sceneId"]))
 	return scope
 }
 
 type upstreamAdmissionKey struct{}
+
 type upstreamAdmission struct {
 	app         *App
 	generations map[string]uint64
@@ -65,11 +69,11 @@ type upstreamAdmission struct {
 
 // Nested SDK/config calls inherit admission from the enclosing inference call.
 // A newer refusal invalidates that admission; an older success cannot clear it.
-func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestScope) (context.Context, func(*Failure), *Failure) {
+func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestScope) (context.Context, func(*fault.Failure), *fault.Failure) {
 	if ctx.Err() != nil {
-		return ctx, func(*Failure) {}, &Failure{Kind: "canceled", Code: "canceled", Message: "请求已取消"}
+		return ctx, func(*fault.Failure) {}, &fault.Failure{Kind: "canceled", Code: "canceled", Message: "请求已取消"}
 	}
-	baseDelay := min(15*time.Minute, max(time.Second, ms(fallback(a.retryParams()["rate_limit_retry_interval_ms"], 1000))))
+	baseDelay := min(15*time.Minute, max(time.Second, shared.Ms(shared.Fallback(a.retryParams()["rate_limit_retry_interval_ms"], 1000))))
 	parent, _ := ctx.Value(upstreamAdmissionKey{}).(upstreamAdmission)
 	admitted := upstreamAdmission{app: a, generations: map[string]uint64{}}
 	if parent.app == a {
@@ -93,9 +97,9 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 			failure := entry.failure
 			failure.Committed, failure.ProxyFailover, failure.Attempts = false, false, 0
 			failure.RetryAfter = max(time.Second, entry.until.Sub(now))
-			failure.cooldownRecorded = true
+			failure.CooldownRecorded = true
 			a.mu.Unlock()
-			return ctx, func(*Failure) {}, &failure
+			return ctx, func(*fault.Failure) {}, &failure
 		}
 	}
 	for _, key := range keys {
@@ -112,9 +116,9 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 	}
 	a.mu.Unlock()
 	done := false
-	finish := func(failure *Failure) {
+	finish := func(failure *fault.Failure) {
 		if failure != nil {
-			classify(failure)
+			fault.Classify(failure)
 		}
 		a.mu.Lock()
 		pauseKey := ""
@@ -131,7 +135,7 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 		if failure != nil && failure.Kind == "auth" {
 			pauseKey = scope.account
 		}
-		if failure != nil && !failure.cooldownRecorded {
+		if failure != nil && !failure.CooldownRecorded {
 			key := ""
 			delay := baseDelay
 			switch {
@@ -166,13 +170,13 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 				delay = min(15*time.Minute, delay*time.Duration(1<<uint(entry.failures-1)))
 				// Retry-After is a minimum, including when it exceeds our backoff cap.
 				delay = max(delay, failure.RetryAfter)
-				entry.until = maxTime(entry.until, time.Now().Add(delay))
+				entry.until = shared.MaxTime(entry.until, time.Now().Add(delay))
 				a.cooldownGeneration++
 				entry.generation, entry.probing = a.cooldownGeneration, false
 				failure.RetryAfter = max(time.Second, time.Until(entry.until))
 				entry.failure = *failure
 			}
-			failure.cooldownRecorded = true
+			failure.CooldownRecorded = true
 		}
 		for key, generation := range probes {
 			entry := a.upstreamCooldowns[key]
@@ -183,7 +187,7 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 				delete(a.upstreamCooldowns, key)
 			} else {
 				entry.probing = false
-				entry.until = maxTime(entry.until, time.Now().Add(baseDelay))
+				entry.until = shared.MaxTime(entry.until, time.Now().Add(baseDelay))
 			}
 		}
 		a.notifyAvailableLocked()
@@ -191,20 +195,13 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 	return context.WithValue(ctx, upstreamAdmissionKey{}, admitted), finish, nil
 }
 
-func maxTime(first, second time.Time) time.Time {
-	if first.After(second) {
-		return first
-	}
-	return second
-}
-
-func upstreamRequestFailure(ctx context.Context, err error) *Failure {
-	var failure *Failure
+func upstreamRequestFailure(ctx context.Context, err error) *fault.Failure {
+	var failure *fault.Failure
 	if errors.As(err, &failure) {
-		return classify(failure)
+		return fault.Classify(failure)
 	}
 	if ctx.Err() != nil {
-		return &Failure{Kind: "canceled", Code: "canceled", Message: "请求已取消"}
+		return &fault.Failure{Kind: "canceled", Code: "canceled", Message: "请求已取消"}
 	}
-	return transportFailure(ctx, err)
+	return routing.TransportFailure(ctx, err)
 }
