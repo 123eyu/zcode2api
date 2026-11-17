@@ -44,11 +44,11 @@
 
 ## 快速开始
 
-| 使用方式 | 本机需要安装 Go 吗？ | 说明 |
+| 使用方式 | 需要 Go？ | 说明 |
 | --- | --- | --- |
 | Releases 完整发行包 | 不需要 | 下载已编译的程序，解压即可运行 |
-| Windows / Linux / macOS 源码运行 | 需要 Go 1.26+ | Windows 启动脚本会自动调用 Go 编译源码 |
-| Docker Compose | 不需要 | 由 Docker 构建和运行，本机需安装 Docker Compose |
+| Windows / Linux / macOS 源码运行 | Go 1.26+ | Windows 启动脚本自动编译源码 |
+| Docker Compose | 不需要 | 需安装 Docker Compose，由 Docker 构建和运行 |
 
 ### 可执行文件
 

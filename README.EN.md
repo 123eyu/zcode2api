@@ -44,11 +44,11 @@ Handles Alibaba Cloud's invisible CAPTCHA SDK integration and risk-control error
 
 ## Quick start
 
-| Method | Go required on the host? | Notes |
+| Method | Go required? | Notes |
 | --- | --- | --- |
-| Full release package | No | Download the prebuilt package, extract and run |
-| Run from source on Windows / Linux / macOS | Go 1.26+ | The Windows startup script automatically builds the source with Go |
-| Docker Compose | No | Docker builds and runs the application; Docker Compose is required on the host |
+| Full release package | No | Download, extract and run the prebuilt application |
+| Run from source (Windows / Linux / macOS) | Go 1.26+ | The Windows startup script builds the source automatically |
+| Docker Compose | No | Requires Docker Compose; Docker handles building and running |
 
 ### Prebuilt binaries
 

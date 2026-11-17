@@ -44,11 +44,11 @@ Alibaba Cloud の不可視 CAPTCHA SDK の連携とリスク判定時のエラ�
 
 ## クイックスタート
 
-| 利用方法 | ホスト側に Go は必要？ | 説明 |
+| 利用方法 | Go は必要？ | 説明 |
 | --- | --- | --- |
-| 完全なリリースパッケージ | 不要 | ビルド済みパッケージをダウンロードし、展開して実行 |
-| Windows / Linux / macOS でソースから実行 | Go 1.26+ が必要 | Windows の起動スクリプトが Go で自動ビルド |
-| Docker Compose | 不要 | Docker でビルド・実行。ホスト側に Docker Compose が必要 |
+| 完全なリリースパッケージ | 不要 | ビルド済みのプログラムを展開して実行 |
+| ソースから実行（Windows / Linux / macOS） | Go 1.26+ | Windows の起動スクリプトが自動ビルド |
+| Docker Compose | 不要 | Docker Compose が必要。Docker でビルド・実行 |
 
 ### ビルド済み実行ファイル
 
