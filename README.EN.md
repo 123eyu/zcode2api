@@ -44,9 +44,15 @@ Handles Alibaba Cloud's invisible CAPTCHA SDK integration and risk-control error
 
 ## Quick start
 
+| Method | Go required on the host? | Notes |
+| --- | --- | --- |
+| Full release package | No | Download the prebuilt package, extract and run |
+| Run from source on Windows / Linux / macOS | Go 1.26+ | The Windows startup script automatically builds the source with Go |
+| Docker Compose | No | Docker builds and runs the application; Docker Compose is required on the host |
+
 ### Prebuilt binaries
 
-Download the full archive for your OS and architecture from [Releases](https://github.com/7sen1ot/zcode2api/releases), extract it and run from its root directory. Go is not required.
+Download the full release package for your platform from [Releases](https://github.com/7sen1ot/zcode2api/releases) (not `Source code`), extract it and run from its root directory:
 
 Windows (PowerShell):
 
@@ -63,40 +69,44 @@ chmod +x ./zcode2api
 
 ### Run from source
 
-Requires Git and Go 1.26+.
+Install Go 1.26+ and get the source with Git, or download and extract **Code → Download ZIP**:
 
 ```sh
 git clone https://github.com/7sen1ot/zcode2api.git
 cd zcode2api
-go run . --root .
 ```
 
-On Windows, source checkouts and full release packages also support `.\scripts\start.ps1` to start in the background and `.\scripts\stop.ps1` to stop. The source workflow builds the executable automatically.
+On Windows, use PowerShell in the project root to build automatically and run in the background:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1  # Start
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop.ps1   # Stop
+```
+
+On any platform, use `go run . --root .` to run in the foreground; press `Ctrl+C` to stop.
 
 ### Docker Compose
 
-Requires Git and Docker Compose. This build includes Node.js and jsdom for automatic CAPTCHA verification.
+Install Docker Compose, get the source and run from the project root:
 
 ```sh
-git clone https://github.com/7sen1ot/zcode2api.git
-cd zcode2api
 docker compose build --build-arg CAPTCHA_RUNTIME=1
 docker compose up -d
 ```
 
-Add `--build-arg PROXY_RUNTIME=1` for subscription-based proxy nodes, or `--build-arg GRAMMAR_RUNTIME=1` for grammar validation of custom tools, as needed.
+This build includes Node.js and jsdom. Add `--build-arg PROXY_RUNTIME=1` for subscription-based proxy nodes, or `--build-arg GRAMMAR_RUNTIME=1` for grammar validation.
 
 ### Access and configuration
 
-If you run the application directly and need automatic server-side verification, install Node.js 18+ and install jsdom from the project or extracted release root:
+For automatic verification outside Docker, install Node.js 18+ (including npm) and run from the project or extracted release root:
 
 ```sh
 npm --prefix captcha_node ci --omit=dev --ignore-scripts
 ```
 
-Open the console at [http://127.0.0.1:6789](http://127.0.0.1:6789). The default admin password is in `data/admin-password.txt`. Keep the `data/` directory: it stores accounts, settings and logs.
+Console: [http://127.0.0.1:6789](http://127.0.0.1:6789). The default admin password is in `data/admin-password.txt`. Keep the `data/` directory, which stores accounts, settings and logs.
 
-Configure runtime settings in the web console, or copy `config.example.json` to `config.json`. Settings saved through the web console take precedence.
+Configure settings in the web console, or copy `config.example.json` to `config.json`. Web console settings take precedence.
 
 ## Client setup
 

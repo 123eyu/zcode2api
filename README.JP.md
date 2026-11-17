@@ -44,9 +44,15 @@ Alibaba Cloud の不可視 CAPTCHA SDK の連携とリスク判定時のエラ�
 
 ## クイックスタート
 
+| 利用方法 | ホスト側に Go は必要？ | 説明 |
+| --- | --- | --- |
+| 完全なリリースパッケージ | 不要 | ビルド済みパッケージをダウンロードし、展開して実行 |
+| Windows / Linux / macOS でソースから実行 | Go 1.26+ が必要 | Windows の起動スクリプトが Go で自動ビルド |
+| Docker Compose | 不要 | Docker でビルド・実行。ホスト側に Docker Compose が必要 |
+
 ### ビルド済み実行ファイル
 
-[Releases](https://github.com/7sen1ot/zcode2api/releases) から OS とアーキテクチャに合う完全なアーカイブをダウンロードし、展開先のルートで実行します。Go のインストールは不要です。
+[Releases](https://github.com/7sen1ot/zcode2api/releases) から環境に合う完全なリリースパッケージ（`Source code` 以外）をダウンロードし、展開先のルートで実行します。
 
 Windows（PowerShell）：
 
@@ -63,40 +69,44 @@ chmod +x ./zcode2api
 
 ### ソースから実行
 
-Git と Go 1.26+ が必要です。
+Go 1.26+ をインストールし、Git でソースを取得します。**Code → Download ZIP** からダウンロードして展開することもできます。
 
 ```sh
 git clone https://github.com/7sen1ot/zcode2api.git
 cd zcode2api
-go run . --root .
 ```
 
-Windows のソースまたは完全なリリースパッケージでは、`.\scripts\start.ps1` でバックグラウンド起動、`.\scripts\stop.ps1` で停止できます。ソースから起動する場合は自動ビルドされます。
+Windows では、プロジェクトのルートで PowerShell を使い、自動ビルドしてバックグラウンドで実行します。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\start.ps1  # 起動
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\stop.ps1   # 停止
+```
+
+各環境で `go run . --root .` によるフォアグラウンド実行も可能です。`Ctrl+C` で停止します。
 
 ### Docker Compose
 
-Git と Docker Compose が必要です。以下のビルドには、CAPTCHA の自動検証に必要な Node.js と jsdom が含まれます。
+Docker Compose をインストールし、ソースを取得してプロジェクトのルートで実行します。
 
 ```sh
-git clone https://github.com/7sen1ot/zcode2api.git
-cd zcode2api
 docker compose build --build-arg CAPTCHA_RUNTIME=1
 docker compose up -d
 ```
 
-ノードのサブスクリプションを使うプロキシには `--build-arg PROXY_RUNTIME=1`、custom ツールの grammar 検証には `--build-arg GRAMMAR_RUNTIME=1` を必要に応じて追加してください。
+このビルドには Node.js と jsdom が含まれます。サブスクリプション型プロキシノードには `--build-arg PROXY_RUNTIME=1`、grammar 検証には `--build-arg GRAMMAR_RUNTIME=1` を追加してください。
 
 ### アクセスと設定
 
-プログラムを直接実行し、サーバー側の自動検証を利用する場合は、Node.js 18+ をインストールしたうえで、プロジェクトまたは展開先のルートで jsdom をインストールしてください。
+Docker 以外で自動検証を利用する場合は、Node.js 18+（npm を含む）をインストールし、プロジェクトまたは展開先のルートで実行します。
 
 ```sh
 npm --prefix captcha_node ci --omit=dev --ignore-scripts
 ```
 
-管理画面 [http://127.0.0.1:6789](http://127.0.0.1:6789) を開きます。初期管理パスワードは `data/admin-password.txt` に保存されます。アカウント、設定、ログを保存する `data/` ディレクトリは保持してください。
+管理画面：[http://127.0.0.1:6789](http://127.0.0.1:6789)。初期管理パスワードは `data/admin-password.txt` にあります。アカウント、設定、ログを保存する `data/` ディレクトリは保持してください。
 
-実行時の設定は管理画面から変更するか、`config.example.json` を `config.json` にコピーして指定できます。管理画面で保存した設定が優先されます。
+管理画面で設定を変更するか、`config.example.json` を `config.json` にコピーします。管理画面の設定が優先されます。
 
 ## クライアント設定
 
