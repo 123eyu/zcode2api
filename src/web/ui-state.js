@@ -36,7 +36,7 @@ globalThis.Z2AUI = (() => {
       rows.push({ bucket, reqs: Number(row?.reqs) || 0, ok: Number(row?.ok) || 0,
         tokens: (Number(row?.tin) || 0) + (Number(row?.tout) || 0), partial: ts < start + offset * 60000 || ts + step > shifted });
     }
-    return { rows, offset, start, end };
+    return { rows, offset };
   }
   function paginate(items, page = 1, pageSize = 25) {
     const size = Math.max(1, Math.min(100, Math.floor(Number(pageSize)) || 25));

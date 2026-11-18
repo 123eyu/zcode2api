@@ -206,9 +206,9 @@ func (d toolDefinition) chatCall(id string, arguments any) (shared.M, error) {
 		}
 		return shared.M{"id": id, "type": "custom", "custom": shared.M{"name": d.Name, "input": input}}, nil
 	}
-	value := shared.JSON(arguments)
-	if s, ok := arguments.(string); ok {
-		value = s
+	value, ok := arguments.(string)
+	if !ok {
+		value = shared.JSON(arguments)
 	}
 	return shared.M{"id": id, "type": "function", "function": shared.M{"name": d.Name, "arguments": value}}, nil
 }

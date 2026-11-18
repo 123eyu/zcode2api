@@ -373,17 +373,15 @@ func (a *App) handleInference(w http.ResponseWriter, r *http.Request, body, k sh
 		}
 		return
 	}
-	response, e := wire.BuildResponse(protocol, result, model, id, tools)
-	if e != nil {
-		if stream != nil {
-			stream.Fail(e.(*fault.Failure))
-		} else {
-			a.sendFailure(w, e.(*fault.Failure), protocol)
-		}
-		return
-	}
+	var response shared.M
 	if stream != nil {
-		response = stream.Complete(result, response)
+		response = stream.Complete(result)
+	} else {
+		response, e = wire.BuildResponse(protocol, result, model, id, tools)
+		if e != nil {
+			a.sendFailure(w, e.(*fault.Failure), protocol)
+			return
+		}
 	}
 	if protocol == "responses" && body["store"] != false {
 		a.rememberResponse(shared.Str(k["id"]), affinity, inputItems(payload["input"]), response)

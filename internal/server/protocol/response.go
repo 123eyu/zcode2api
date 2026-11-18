@@ -80,13 +80,17 @@ func BuildResponse(protocol string, r *Result, model, id string, tools *ToolCata
 		}
 		output = append(output, item)
 	}
+	return responsesResult(r, model, id, time.Now().Unix(), output), nil
+}
+
+func responsesResult(r *Result, model, id string, created int64, output []any) shared.M {
 	status := "completed"
 	var incomplete any
 	if lengthFinish(r.FinishReason) {
 		status = "incomplete"
 		incomplete = shared.M{"reason": "max_output_tokens"}
 	}
-	return shared.M{"id": id, "object": "response", "created_at": time.Now().Unix(), "status": status, "model": model, "output": output, "output_text": r.Text, "incomplete_details": incomplete, "usage": responsesUsage(r.Usage)}, nil
+	return shared.M{"id": id, "object": "response", "created_at": created, "status": status, "model": model, "output": output, "output_text": r.Text, "incomplete_details": incomplete, "usage": responsesUsage(r.Usage)}
 }
 
 func ErrorShape(f *fault.Failure, protocol string) (int, shared.M) {

@@ -29,7 +29,7 @@ RUN apt-get update \
        esac \
     && case "$GRAMMAR_RUNTIME" in \
          0) ;; \
-         1) apt-get install -y --no-install-recommends python3 python3-venv \
+         1) apt-get install -y --no-install-recommends python3-venv \
            && python3 -m venv /app/grammar_python/.venv \
            && /app/grammar_python/.venv/bin/python -m pip install --no-cache-dir --only-binary=:all: -r /app/grammar_python/requirements.txt ;; \
          *) echo 'GRAMMAR_RUNTIME must be 0 or 1' >&2; exit 1 ;; \

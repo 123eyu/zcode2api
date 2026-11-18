@@ -523,7 +523,7 @@ async function pageSettings(main) {
         default_reasoning_level: submitted['s-level'], app_version: submitted['s-ver'], zcode_version_auto_update: submitted['s-zcode-version-auto'], zcode_version_check_interval_sec: Math.round(Number(submitted['s-zcode-version-interval']) * Number(submitted['s-zcode-version-unit'])),
         zcode_template_mode: submitted['s-template-mode'], zcode_subagent_template: submitted['s-subagent-template'],
         ...Object.fromEntries(Object.entries(subagentFields).map(([key, id]) => [key, submitted[id]])),
-        inference_driver: 'http', http: { ...JSON.parse(submitted['s-http']), client_version: submitted['s-http-version'], captcha: captchaValues(submitted) }, outbound_proxy: outboundValues(submitted), aliases: JSON.parse(submitted['s-aliases']), retry: JSON.parse(submitted['s-retry']),
+        http: { ...JSON.parse(submitted['s-http']), client_version: submitted['s-http-version'], captcha: captchaValues(submitted) }, outbound_proxy: outboundValues(submitted), aliases: JSON.parse(submitted['s-aliases']), retry: JSON.parse(submitted['s-retry']),
       } });
       if (response.ok === false) throw new Error(response.error || '保存失败');
       s.zcode_version_auto_update = submitted['s-zcode-version-auto'];

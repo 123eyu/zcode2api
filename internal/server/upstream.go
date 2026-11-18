@@ -214,13 +214,12 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 	if o.Affinity != "" {
 		session = shared.Hash(o.Affinity)[:32]
 	}
-	upstreamBody := shared.Clone(o.Upstream)
-	metadata := shared.Obj(upstreamBody["metadata"])
+	metadata := maps.Clone(shared.Obj(o.Upstream["metadata"]))
 	metadata["user_id"] = requestMetadataUserID(
 		shared.Str(account["device_mid"]),
 		session,
 	)
-	upstreamBody["metadata"] = metadata
+	upstreamBody := shared.Merge(o.Upstream, shared.M{"metadata": metadata})
 	requestID := shared.UUID()
 	ctx, release, e := a.pinOutboundProxy(ctx, account)
 	if e != nil {

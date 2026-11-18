@@ -266,12 +266,12 @@ func (s *Stream) toolEvent(e Event) error {
 	return nil
 }
 
-func (s *Stream) Complete(r *Result, response shared.M) shared.M {
+func (s *Stream) Complete(r *Result) shared.M {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.terminal = true
 	if s.protocol == "anthropic" {
-		s.terminal = true
-		return response
+		return nil
 	}
 	if s.protocol == "chat" {
 		s.chunk(shared.M{}, chatFinishReason(r))
@@ -279,18 +279,11 @@ func (s *Stream) Complete(r *Result, response shared.M) shared.M {
 			s.write("data: " + shared.JSON(shared.M{"id": s.id, "object": "chat.completion.chunk", "created": s.created, "model": s.model, "choices": []any{}, "usage": chatUsage(r.Usage)}) + "\n\n")
 		}
 		s.write("data: [DONE]\n\n")
-	} else {
-		s.closeBlock()
-		response["created_at"] = s.created
-		response["output"] = s.completedOutput()
-		response["output_text"] = r.Text
-		typ := "response.completed"
-		if lengthFinish(r.FinishReason) {
-			typ = "response.incomplete"
-		}
-		s.event(typ, shared.M{"response": response})
+		return nil
 	}
-	s.terminal = true
+	s.closeBlock()
+	response := responsesResult(r, s.model, s.id, s.created, s.completedOutput())
+	s.event("response."+shared.Str(response["status"]), shared.M{"response": response})
 	return response
 }
 
