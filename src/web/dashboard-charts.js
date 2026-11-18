@@ -1,7 +1,7 @@
 'use strict';
 
 const dashboardChartLayout = { width: 1120, height: 282, left: 68, right: 66, top: 34, bottom: 235 };
-const dashboardChartColors = ['#ff4b16', '#ffbd0b', '#438cff', '#9470ed', '#25a887', '#ec7ba5'];
+const dashboardChartColors = ['orange', 'amber', 'blue', 'violet', 'teal', 'pink'].map(color => `var(--chart-${color})`);
 const chartCoord = value => Number(value).toFixed(2);
 function dashboardChartMaximum(value) {
   const raw = Math.max(4, value), power = 10 ** Math.floor(Math.log10(raw));
@@ -97,7 +97,7 @@ function renderCacheTrendChart(root, stats) {
       return `${row.rate !== null ? `<circle class="dashboard-chart-point cache" cx="${chartCoord(rate.x)}" cy="${chartCoord(rate.y)}" r="3"/><text class="dashboard-chart-value cache" x="${chartCoord(rate.x)}" y="${chartCoord(rate.y < bottom - 25 ? rate.y + 18 : rate.y - 10)}" text-anchor="middle">${row.rate.toFixed(1)}%</text>` : ''}${row.tokens ? `<circle class="dashboard-chart-point tokens" cx="${chartCoord(tokens.x)}" cy="${chartCoord(tokens.y)}" r="3"/><text class="dashboard-chart-value tokens" x="${chartCoord(tokens.x)}" y="${chartCoord(tokens.y - 12)}" text-anchor="middle">${fmtQuota(row.tokens)}</text>` : ''}${index % 2 === 0 || index === rows.length - 1 ? `<text class="dashboard-chart-tick" x="${chartCoord(rate.x)}" y="${bottom + 25}" text-anchor="middle">${row.bucket.slice(11, 16)}</text>` : ''}`;
     }).join('')}</g>
     ${rows.map((row, index) => `<g class="dashboard-chart-hit" data-chart-index="${index}" role="button" tabindex="${index === selected ? 0 : -1}" aria-label="${esc(caption(row))}，缓存命中率 ${rateText(row)}，总 Token ${fmtInt(row.tokens)}"><rect class="dashboard-chart-hit-area" x="${chartCoord(Math.max(left, left + index * step - step / 2))}" y="${top}" width="${chartCoord(index === 0 || index === rows.length - 1 ? step / 2 : step)}" height="${bottom - top}"/><line class="dashboard-chart-crosshair" x1="${chartCoord(ratePoints[index].x)}" x2="${chartCoord(ratePoints[index].x)}" y1="${top}" y2="${bottom}"/></g>`).join('')}
-    </svg></div>${!rows.some(row => row.reqs) ? '<span class="dashboard-chart-empty">暂无调用数据</span>' : ''}${dashboardChartLegend([{ name: '缓存命中率（左轴）', color: '#1680ff' }, { name: '总 Token（右轴）', color: '#eb8b00' }])}<div class="dashboard-chart-tooltip" role="tooltip" hidden></div>`;
+    </svg></div>${!rows.some(row => row.reqs) ? '<span class="dashboard-chart-empty">暂无调用数据</span>' : ''}${dashboardChartLegend([{ name: '缓存命中率（左轴）', color: 'var(--trend-cache)' }, { name: '总 Token（右轴）', color: 'var(--trend-tokens)' }])}<div class="dashboard-chart-tooltip" role="tooltip" hidden></div>`;
   bindDashboardChart(root, index => {
     const row = rows[index];
     return `<strong>${esc(caption(row))}</strong><div><span>缓存命中率</span><b class="cache">${rateText(row)}</b></div><p>命中 ${fmtInt(row.cached)} / 输入 ${fmtInt(row.input)}</p><div><span>总 Token</span><b>${fmtInt(row.tokens)}</b></div><div><span>请求数</span><b>${fmtInt(row.reqs)}</b></div>`;
@@ -133,7 +133,7 @@ function renderDailyTokenChart(root, stats) {
       const bars = models.map(model => {
         const value = data?.get(model.name) || 0, barHeight = value / maximum * (bottom - top);
         stacked += barHeight;
-        return value ? `<rect class="dashboard-chart-bar" x="${chartCoord(x - barWidth / 2)}" y="${chartCoord(bottom - stacked)}" width="${chartCoord(barWidth)}" height="${chartCoord(barHeight)}" fill="${model.color}"/>` : '';
+        return value ? `<rect class="dashboard-chart-bar" x="${chartCoord(x - barWidth / 2)}" y="${chartCoord(bottom - stacked)}" width="${chartCoord(barWidth)}" height="${chartCoord(barHeight)}" style="fill:${model.color}"/>` : '';
       }).join('');
       return `${bars}${row.tokens && (rows.length <= 14 || index === peak || index === selected) ? `<text class="dashboard-chart-value" x="${chartCoord(x)}" y="${chartCoord(bottom - stacked - 12)}" text-anchor="middle">${fmtQuota(row.tokens)}</text>` : ''}${index % Math.ceil(rows.length / 8) === 0 || index === rows.length - 1 ? `<text class="dashboard-chart-tick" x="${chartCoord(x)}" y="${bottom + 25}" text-anchor="middle">${dateLabel(row)}</text>` : ''}`;
     }).join('')}</g>

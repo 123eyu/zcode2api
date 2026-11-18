@@ -191,13 +191,8 @@ document.addEventListener('click', async (e) => {
     saveToken(''); showLogin();
     return;
   }
-  const themeBtn = e.target.closest('#theme-btn');
-  if (themeBtn) {
-    const root = document.documentElement;
-    root.classList.remove('theme-swap');
-    void root.offsetWidth;
-    root.classList.add('theme-swap');
-    setTheme(root.classList.contains('dark') ? 'light' : 'dark');
+  if (e.target.closest('#theme-btn')) {
+    setTheme(document.documentElement.classList.contains('dark') ? 'light' : 'dark');
   }
 });
 
@@ -902,8 +897,8 @@ function renderAccPage(accounts, groups) {
 
     const page = UI.paginate(list, f.page, f.size || 25);
     f.page = page.page;
-    tbl.innerHTML = `<p class="account-scroll-hint">窄屏可左右滚动查看各列，点击账号名称查看完整信息。</p><div class="tablecard account-table compact-account-table" tabindex="0" role="region" aria-label="账号管理横向列表"><table><colgroup><col class="account-name-col"><col style="width:95px"><col style="width:150px"><col style="width:115px"><col style="width:145px"><col style="width:100px"><col style="width:160px"></colgroup><thead>
-      <tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col">可用额度 <span class="table-hint">Token</span></th><th scope="col" class="align-right" title="来自上游余额快照差额，可能包含外部客户端请求">24 小时消耗</th><th scope="col">最近到期</th><th scope="col">分组</th><th scope="col">操作</th></tr></thead><tbody>
+    tbl.innerHTML = `<p class="account-scroll-hint">左右滚动查看更多列</p><div class="tablecard account-table compact-account-table" tabindex="0" role="region" aria-label="账号管理横向列表"><table><colgroup><col class="account-name-col"><col style="width:95px"><col style="width:150px"><col style="width:115px"><col style="width:145px"><col style="width:100px"><col style="width:160px"></colgroup><thead>
+      <tr><th scope="col">账号</th><th scope="col">状态</th><th scope="col"><span class="cell-grid account-row-quota"><span>可用额度</span><span class="table-hint">Token</span></span></th><th scope="col" class="align-right" title="来自上游余额快照差额，可能包含外部客户端请求">24 小时消耗</th><th scope="col">最近到期</th><th scope="col">分组</th><th scope="col" class="align-right">操作</th></tr></thead><tbody>
       ${page.items.map(a => `<tr data-acc-id="${esc(a.id)}">
         <td>${accountNameMarkup(a)}</td>
         <td><span class="badge ${esc(a.status)}" title="${esc(a.last_error || '')}">● ${esc(ACC_STATUS[a.status] || a.status)}</span></td>
@@ -911,7 +906,7 @@ function renderAccPage(accounts, groups) {
         <td class="align-right" title="${esc(fmtInt(a.delta24h))} Token">${fmtQuota(a.delta24h)}</td>
         <td class="account-row-expiry" title="${esc(a.card_expires_at ? fmtTime(a.card_expires_at) + '，' + fmtPlanRemaining(a.card_expires_at - Date.now()) : '到期时间未知')}">${a.card_expires_at ? esc(fmtCompactTime(a.card_expires_at)) : '未知'}</td>
         <td><span class="account-row-group" title="${esc(gmap[a.group_id] || '待分组')}">${esc(gmap[a.group_id] || '待分组')}</span></td>
-        <td><div class="cell-inline cell-actions">
+        <td class="align-right"><div class="cell-inline cell-actions">
           <button class="ibtn" data-act="renew" data-id="${esc(a.id)}" aria-label="续期" title="更新账号凭据">${icon('refresh', 14)}</button>
           <button class="ibtn" data-act="verify" data-id="${esc(a.id)}" aria-label="验证连通性" title="验证连通性">${icon('zap', 14)}</button>
           <button class="ibtn" data-act="edit" data-id="${esc(a.id)}" aria-label="编辑账号" title="编辑账号">${icon('pencil', 14)}</button>
@@ -922,7 +917,11 @@ function renderAccPage(accounts, groups) {
   }
 }
 
-function btnLoading(btn, on) { btn.classList.toggle('loading', !!on); }
+function btnLoading(btn, on) {
+  btn.classList.toggle('loading', !!on);
+  if (on) btn.setAttribute('aria-busy', 'true');
+  else btn.removeAttribute('aria-busy');
+}
 
 async function buttonAction(button, action, errorPrefix = '') {
   if (button.disabled) return;
@@ -1487,10 +1486,10 @@ async function pageGroups(main) {
   ${pagehead('分组调度链', '按分组顺序选择账号池，再根据各组策略选择账号。',
     `<button class="btn primary" id="add-group">${icon('plus', 14)}新建分组</button>`)}
   <section id="group-list" style="animation-delay:50ms">
-  ${groups.length ? `<div class="tablecard fade-up"><table><tr><th>名称</th><th>角色</th><th>账号类型</th><th>调度策略</th><th>临期窗口</th><th class="align-right">操作</th></tr>
+  ${groups.length ? `<div class="tablecard fade-up"><table><tr><th>名称</th><th>角色</th><th>账号类型</th><th>调度策略</th><th class="align-right">临期窗口</th><th class="align-right">操作</th></tr>
     ${groups.map((g) => `<tr><td><div class="cell-name">${avatarMarkup(g.name, g.id)}<span class="nm"><b>${esc(g.name)}</b></span></div></td>
       <td><span class="badge ${g.role === 'primary' ? 'active' : ''}">${esc(({ primary: '主力', backup: '备用' })[g.role] || g.role)}</span></td><td>${esc(ACCOUNT_FAMILY_LABELS[g.family_filter] || g.family_filter || '全部类型')}</td>
-      <td>${esc(policyLabel(g.policy))}</td><td>${g.urgent_window_min} 分钟</td>
+      <td>${esc(policyLabel(g.policy))}</td><td class="align-right">${g.urgent_window_min} 分钟</td>
       <td class="align-right"><div class="cell-inline cell-actions"><button class="btn danger" data-del="${esc(g.id)}">删除</button></div></td></tr>`).join('')}</table></div>`
     : '<p class="muted">暂无分组。</p>'}</section>`;
   $('#add-group').addEventListener('click', () => {
