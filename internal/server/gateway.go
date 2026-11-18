@@ -18,8 +18,8 @@ import (
 func (a *App) GatewayHandler() http.Handler {
 	return a.guard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-zcode-instruction-mode")
-		w.Header().Set("Access-Control-Expose-Headers", "X-Zcode-Instruction-Mode, X-Zcode-Compatibility, X-Zcode-Grammar-Validation, Retry-After, X-Retry-Attempts")
+		w.Header().Set("Access-Control-Allow-Headers", "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-zcode-instruction-mode, x-zcode-session-type, x-zcode-query-source, x-zcode-template-mode")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Zcode-Instruction-Mode, X-Zcode-Compatibility, X-Zcode-Grammar-Validation, X-Zcode-Session-Type, X-Zcode-Query-Source, X-Zcode-Template-Mode, Retry-After, X-Retry-Attempts")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
@@ -229,7 +229,66 @@ func inputItems(v any) []any {
 	return shared.Arr(v)
 }
 
+// Matches ZCode runner-attribution.ts at fec975905a2abd4c07e35c40d51fa097a2258ec9.
+var querySourcePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
+func (a *App) parseInferenceSource(r *http.Request) (inferenceSource, error) {
+	cfg := a.config("zcode_template_mode", "zcode_subagent_template", "zcode_subagent_insert_enabled", "zcode_subagent_harness_enabled", "zcode_subagent_files_enabled", "zcode_subagent_comments_enabled")
+	mode := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Zcode-Template-Mode")))
+	explicitMode := mode != ""
+	source := inferenceSource{
+		SessionType: strings.ToLower(strings.TrimSpace(r.Header.Get("X-Zcode-Session-Type"))),
+		QuerySource: strings.TrimSpace(r.Header.Get("X-Zcode-Query-Source")),
+	}
+	switch source.SessionType {
+	case "", "main", "subagent":
+	default:
+		return source, fault.Invalid("X-Zcode-Session-Type 仅支持 main 或 subagent")
+	}
+	if !explicitMode {
+		mode = shared.Str(shared.Fallback(cfg["zcode_template_mode"], wire.TemplateMain))
+		if source.SessionType == "main" {
+			mode = wire.TemplateMain
+		} else if source.SessionType == "subagent" {
+			mode = wire.TemplateSubagent
+		}
+	}
+	custom := shared.Str(cfg["zcode_subagent_template"])
+	if mode == wire.TemplateSubagent && shared.Truth(cfg["zcode_subagent_insert_enabled"]) && strings.TrimSpace(custom) == "" {
+		custom = defaultSubagentInsert
+	}
+	template, err := wire.NewSystemTemplate(mode, custom)
+	if err != nil {
+		return source, err
+	}
+	template.InsertEnabled = shared.Truth(cfg["zcode_subagent_insert_enabled"])
+	template.HarnessEnabled = shared.Truth(cfg["zcode_subagent_harness_enabled"])
+	template.FilesEnabled = shared.Truth(cfg["zcode_subagent_files_enabled"])
+	template.CommentsEnabled = shared.Truth(cfg["zcode_subagent_comments_enabled"])
+	if explicitMode && source.SessionType != "" && source.SessionType != template.SessionType() {
+		return source, fault.Invalid("X-Zcode-Session-Type 与 X-Zcode-Template-Mode 不一致")
+	}
+	source.Template, source.SessionType = template, template.SessionType()
+	if source.QuerySource == "" {
+		source.QuerySource = template.QuerySource()
+	} else if !querySourcePattern.MatchString(source.QuerySource) {
+		// Official attribution omits invalid query sources instead of sending them.
+		source.QuerySource = ""
+	}
+	return source, nil
+}
+
 func (a *App) handleInference(w http.ResponseWriter, r *http.Request, body, k shared.M, protocol, model string) {
+	source, failure := a.parseInferenceSource(r)
+	if failure != nil {
+		a.sendFailure(w, failure.(*fault.Failure), protocol)
+		return
+	}
+	w.Header().Set("X-Zcode-Session-Type", source.SessionType)
+	w.Header().Set("X-Zcode-Template-Mode", source.Template.Mode)
+	if source.QuerySource != "" {
+		w.Header().Set("X-Zcode-Query-Source", source.QuerySource)
+	}
 	payload := shared.Clone(body)
 	var inheritedAffinity string
 	if protocol == "responses" && shared.Truth(body["previous_response_id"]) {
@@ -257,7 +316,7 @@ func (a *App) handleInference(w http.ResponseWriter, r *http.Request, body, k sh
 		a.sendFailure(w, e.(*fault.Failure), protocol)
 		return
 	}
-	upstream, e := wire.BuildRequest(payload, protocol, model, level, tools, instructions)
+	upstream, e := wire.BuildRequest(payload, protocol, model, level, tools, instructions, source.Template)
 	if e != nil {
 		a.sendFailure(w, e.(*fault.Failure), protocol)
 		return
@@ -293,7 +352,7 @@ func (a *App) handleInference(w http.ResponseWriter, r *http.Request, body, k sh
 		}
 		sticky = math.Max(0, shared.Num(a.configValue("conversation_affinity_minutes")))
 	}
-	o := inferOptions{Key: k, Body: payload, Upstream: upstream, Tools: tools, Protocol: protocol, Model: model, Level: level, ID: id, IP: a.ip(r), Affinity: affinity, Sticky: sticky, Stream: shared.Truth(body["stream"]), Timing: newTiming()}
+	o := inferOptions{Key: k, Body: payload, Upstream: upstream, Tools: tools, Source: source, Protocol: protocol, Model: model, Level: level, ID: id, IP: a.ip(r), Affinity: affinity, Sticky: sticky, Stream: shared.Truth(body["stream"]), Timing: newTiming()}
 	ctx, cancel := a.operationContext(r.Context(), 0)
 	defer cancel()
 	w.Header().Set("X-Inference-Driver", "http")

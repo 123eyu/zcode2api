@@ -225,7 +225,7 @@ func ResponseMessages(input any, instructions *InstructionContext, tools *ToolCa
 	return out, nil
 }
 
-func BuildRequest(body shared.M, protocol, model, level string, catalog *ToolCatalog, instructions *InstructionContext) (shared.M, error) {
+func BuildRequest(body shared.M, protocol, model, level string, catalog *ToolCatalog, instructions *InstructionContext, template SystemTemplate) (shared.M, error) {
 	body = cleanZCodeClientPrompt(body, protocol)
 	if len(shared.Arr(body["functions"])) > 0 || body["function_call"] != nil {
 		return nil, fault.Invalid("请使用 tools，不支持旧版 functions")
@@ -315,7 +315,7 @@ func BuildRequest(body shared.M, protocol, model, level string, catalog *ToolCat
 			request["output_config"] = shared.M{"format": shared.M{"type": "json_schema", "schema": shared.First(shared.Obj(format["json_schema"])["schema"], format["schema"])}}
 		}
 	}
-	upstreamSystem, e := upstreamSystemBlocks(system)
+	upstreamSystem, e := upstreamSystemBlocks(system, template)
 	if e != nil {
 		return nil, e
 	}

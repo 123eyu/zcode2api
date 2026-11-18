@@ -8,6 +8,12 @@
   "daily_claim_enabled": true,
   "daily_claim_time": "19:02",
   "default_reasoning_level": "low",
+  "zcode_template_mode": "main",
+  "zcode_subagent_template": "",
+  "zcode_subagent_insert_enabled": false,
+  "zcode_subagent_harness_enabled": false,
+  "zcode_subagent_files_enabled": false,
+  "zcode_subagent_comments_enabled": false,
   "outbound_proxy": {
     "enabled": false,
     "source": "manual",

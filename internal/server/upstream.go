@@ -23,9 +23,16 @@ import (
 
 type contentBuffer struct{ text, thinking, signature, partial strings.Builder }
 
+type inferenceSource struct {
+	SessionType string
+	QuerySource string
+	Template    wire.SystemTemplate
+}
+
 type inferOptions struct {
 	Key, Body, Upstream                      shared.M
 	Tools                                    *wire.ToolCatalog
+	Source                                   inferenceSource
 	Protocol, Model, Level, ID, IP, Affinity string
 	Sticky                                   float64
 	Stream                                   bool
@@ -77,7 +84,7 @@ func (t *requestTiming) snapshot() shared.M {
 	return shared.M{"queue_ms": t.queue.Milliseconds(), "retry_ms": t.retry.Milliseconds(), "ttft_ms": value(t.first), "first_reasoning_ms": value(t.reason), "first_text_ms": value(t.text), "generation_ms": generation, "total_ms": time.Since(t.start).Milliseconds()}
 }
 
-func (a *App) upstreamHeaders(token, session, id string) http.Header {
+func (a *App) upstreamHeaders(token, session, id string, source inferenceSource) http.Header {
 	// ZCode 3.17.2 sends the desktop app version, not the inference API version.
 	version := shared.Str(shared.Fallback(a.configValue("app_version"), settings.DefaultHTTPClientVersion))
 	clientPlatform := platform()
@@ -97,8 +104,11 @@ func (a *App) upstreamHeaders(token, session, id string) http.Header {
 		}
 	}
 	h := http.Header{}
-	for k, v := range map[string]string{"authorization": "Bearer " + token, "x-api-key": token, "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "ZCode/" + version, "x-zcode-app-version": version, "x-platform": clientPlatform, "x-client-language": "zh-CN", "x-client-timezone": tz, "x-os-category": osCategory, "x-os-version": clientOSVersion, "x-release-channel": "production", "http-referer": "https://zcode.z.ai", "x-title": "Z Code@electron", "x-zcode-agent": "glm", "x-session-id": session, "x-request-id": id, "x-query-id": shared.UUIDv7(), "x-zcode-trace-id": shared.UUID(), "x-zcode-session-type": "main", "x-zcode-query-source": "main_turn"} {
+	for k, v := range map[string]string{"authorization": "Bearer " + token, "x-api-key": token, "content-type": "application/json", "anthropic-version": "2023-06-01", "user-agent": "ZCode/" + version, "x-zcode-app-version": version, "x-platform": clientPlatform, "x-client-language": "zh-CN", "x-client-timezone": tz, "x-os-category": osCategory, "x-os-version": clientOSVersion, "x-release-channel": "production", "http-referer": "https://zcode.z.ai", "x-title": "Z Code@electron", "x-zcode-agent": "glm", "x-session-id": session, "x-request-id": id, "x-query-id": shared.UUIDv7(), "x-zcode-trace-id": shared.UUID(), "x-zcode-session-type": source.SessionType} {
 		h.Set(k, v)
+	}
+	if source.QuerySource != "" {
+		h.Set("X-Zcode-Query-Source", source.QuerySource)
 	}
 	return h
 }
@@ -253,7 +263,7 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		if failure := validateCaptchaRequestToken(verification, account, token); failure != nil {
 			return nil, failure
 		}
-		req.Header = a.upstreamHeaders(token, session, requestID)
+		req.Header = a.upstreamHeaders(token, session, requestID, o.Source)
 		// Keep the source header and metadata tied to the account's existing
 		// device identity, as the official 3.18.2 client does.
 		if device := shared.Str(account["device_mid"]); device != "" {
@@ -262,7 +272,7 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		for key, values := range verification.Headers {
 			req.Header[key] = values
 		}
-		requestDetail = shared.M{"request_id": req.Header.Get("X-Request-Id"), "trace_id": req.Header.Get("X-Zcode-Trace-Id"), "query_id": req.Header.Get("X-Query-Id"), "session_id": session}
+		requestDetail = shared.M{"request_id": req.Header.Get("X-Request-Id"), "trace_id": req.Header.Get("X-Zcode-Trace-Id"), "query_id": req.Header.Get("X-Query-Id"), "session_id": session, "session_type": o.Source.SessionType, "query_source": o.Source.QuerySource, "template_mode": o.Source.Template.Mode}
 		requestSecrets = append(requestSecrets, token, req.Header.Get("X-Aliyun-Captcha-Verify-Param"))
 		r.TraceID = req.Header.Get("X-Zcode-Trace-Id")
 		if o.OnAttempt != nil {

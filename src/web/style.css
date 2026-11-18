@@ -1071,6 +1071,12 @@ main[data-page="logs"] { gap: 18px; }
 .settings-version-schedule .settings-version-actions { min-height: 36px; }
 .settings-version-interval { display: grid; grid-template-columns: minmax(0, 1fr) 96px; gap: 8px; }
 .settings-code-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.settings-template-mode { max-width: 420px; }
+.template-identity { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--muted); }
+.template-identity code { min-width: 0; font-size: 12px; overflow-wrap: anywhere; }
+.template-component-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.template-custom-fields[hidden] { display: none; }
+@media (prefers-reduced-motion: no-preference) { .template-custom-fields:not([hidden]) { animation: fade-up 160ms var(--ease-out); } }
 .code-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .code-field-wide { grid-column: 1 / -1; }
 .code-field .json-hint:empty { display: none; }

@@ -1438,6 +1438,7 @@ async function pageSettings(main) {
   const versionIntervalUnit = versionIntervalSeconds % 86400 === 0 ? 86400 : versionIntervalSeconds % 3600 === 0 ? 3600 : 60;
   const captcha = { mode: 'off', claim_runtime: 'jsdom', playwright_path: '', browser_path: '', node_path: 'node', jsdom_path: '', simulate_canvas_webgl: true, timeout_ms: 30000, ticket_ttl_ms: 75000, ...s.http.captcha };
   const proxy = { enabled: false, source: 'manual', urls: [], subscription_url: '', preferred_node: '', mihomo_path: 'mihomo', refresh_interval_sec: 3600, ...s.outbound_proxy };
+  const subagentFields = { zcode_subagent_insert_enabled: 's-subagent-insert', zcode_subagent_harness_enabled: 's-subagent-harness', zcode_subagent_files_enabled: 's-subagent-files', zcode_subagent_comments_enabled: 's-subagent-comments' };
   delete httpParams.client_version;
   delete httpParams.captcha;
   main.innerHTML = `${pagehead('设置', '',
@@ -1446,6 +1447,20 @@ async function pageSettings(main) {
     <form id="settings-form" class="settings-form control-comfortable" novalidate>
       <p id="settings-error" class="inline-notice error hidden" role="alert"></p>
       ${settingsUpdateMarkup()}
+      <details class="settings-section formcard" id="template-panel" open><summary class="settings-section-summary disclosure-heading"><span><strong>请求模板</strong></span></summary>
+      <div class="settings-panel settings-section-body settings-section-content"><div class="network-settings-fields">
+        <label class="f settings-template-mode"><span>模板类型 ${infoTip('main 固定使用原始三段式模板。subagent 可独立勾选正文内容；保存后同时切换模板与请求头。', '请求模板')}</span><select id="s-template-mode" required><option value="main">main（默认原始三段式）</option><option value="subagent">subagent</option></select></label>
+        <div class="network-settings-fields template-custom-fields" id="s-subagent-options" hidden>
+          <div class="template-identity"><code aria-label="固定身份标识">You are ZCode, an interactive agent</code>${infoTip('身份标识不可修改。全部取消勾选时，模板正文为空；勾选正文时保留固定的代理开头。', '固定身份标识')}</div>
+          <div class="settings-fields template-component-options" role="group" aria-label="subagent 可选正文">
+            <label class="settings-check"><input id="s-subagent-insert" type="checkbox"><span>Web 插入内容</span></label>
+            <label class="settings-check"><input id="s-subagent-harness" type="checkbox"><span>Harness</span></label>
+            <label class="settings-check"><input id="s-subagent-files" type="checkbox"><span>Files &amp; URLs</span></label>
+            <label class="settings-check"><input id="s-subagent-comments" type="checkbox"><span>Inline Code Comments</span></label>
+          </div>
+          <div class="code-field template-custom-fields" id="s-template-custom-fields" hidden><label class="f" for="s-subagent-template"><span>插入内容 ${infoTip('留空使用内置的 internal/server/system-prompt.md。此处内容排在勾选的固定段落之前；客户端 system / developer 指令仍会追加。', '插入内容')}</span></label><textarea id="s-subagent-template" class="code-input" rows="10" spellcheck="false" maxlength="262144" placeholder="留空使用 internal/server/system-prompt.md">${esc(s.zcode_subagent_template || '')}</textarea></div>
+        </div>
+      </div></div></details>
       <details class="settings-section formcard" id="poll-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>额度轮询</strong></span></summary>
       <div class="settings-panel settings-section-body settings-section-content"><div class="settings-fields">
         <label class="f">轮询间隔（秒）<input id="s-poll" type="number" min="1" step="1" required value="${s.poll_interval_sec}"><small>两次余额检查之间的基础间隔</small></label>
@@ -1520,6 +1535,16 @@ async function pageSettings(main) {
   };
   captchaTTLField.addEventListener('input', validateCaptchaTTL);
   $('#s-level').value = s.default_reasoning_level || 'low';
+  $('#s-template-mode').value = s.zcode_template_mode || 'main';
+  for (const [key, id] of Object.entries(subagentFields)) $('#' + id).checked = !!s[key];
+  const syncTemplateFields = () => {
+    const subagent = $('#s-template-mode').value === 'subagent', insert = subagent && $('#s-subagent-insert').checked, editor = $('#s-subagent-template');
+    $('#s-subagent-options').hidden = !subagent;
+    for (const id of Object.values(subagentFields)) $('#' + id).disabled = !subagent;
+    $('#s-template-custom-fields').hidden = !insert;
+    editor.disabled = !insert;
+    editor.setCustomValidity(insert && new TextEncoder().encode(editor.value).length > 262144 ? '自定义插入内容不能超过 256 KiB' : '');
+  };
   $('#s-captcha-mode').value = captcha.mode;
   $('#s-claim-runtime').value = captcha.claim_runtime;
   $('#s-proxy-source').value = proxy.source;
@@ -1538,7 +1563,7 @@ async function pageSettings(main) {
     versionSync.title = s.zcode_version_status?.error || (checked ? '最近检查：' + new Date(checked).toLocaleString() + '\n下次检查：' + new Date(Number(checked) + (Number(s.zcode_version_check_interval_sec) || 432000) * 1000).toLocaleString() : '查询 ZCode 官方稳定版清单');
   };
   const captchaFields = { mode: 's-captcha-mode', claim_runtime: 's-claim-runtime', playwright_path: 's-playwright-path', browser_path: 's-browser-path', timeout_ms: 's-captcha-timeout', simulate_canvas_webgl: 's-captcha-canvas', node_path: 's-captcha-node', jsdom_path: 's-captcha-jsdom', ticket_ttl_ms: 's-captcha-ttl' };
-  const ids = ['s-poll', 's-jitter', 's-conc', 's-level', 's-ver', 's-http-version', 's-zcode-version-auto', 's-zcode-version-interval', 's-zcode-version-unit', 's-aliases', 's-retry', 's-http', ...Object.values(captchaFields), 's-proxy-enabled', 's-proxy-source', 's-proxy-urls', 's-proxy-subscription', 's-proxy-node', 's-proxy-mihomo', 's-proxy-refresh'];
+  const ids = ['s-poll', 's-jitter', 's-conc', 's-level', 's-template-mode', 's-subagent-template', ...Object.values(subagentFields), 's-ver', 's-http-version', 's-zcode-version-auto', 's-zcode-version-interval', 's-zcode-version-unit', 's-aliases', 's-retry', 's-http', ...Object.values(captchaFields), 's-proxy-enabled', 's-proxy-source', 's-proxy-urls', 's-proxy-subscription', 's-proxy-node', 's-proxy-mihomo', 's-proxy-refresh'];
   const fields = ids.map(id => $('#' + id));
   const values = () => Object.fromEntries(fields.map(input => [input.id, input.type === 'checkbox' ? input.checked : input.value]));
   const apply = data => fields.forEach(input => { if (Object.hasOwn(data, input.id)) { if (input.type === 'checkbox') input.checked = !!data[input.id]; else input.value = data[input.id]; syncSelect(input); } });
@@ -1580,6 +1605,10 @@ async function pageSettings(main) {
   try {
     const draft = JSON.parse(sessionStorage.getItem(draftKey) || 'null');
     if (draft && typeof draft === 'object' && !Array.isArray(draft)) {
+      if (draft['s-template-mode'] === 'subagent_custom') {
+        draft['s-template-mode'] = 'subagent';
+        for (const id of Object.values(subagentFields)) if (!Object.hasOwn(draft, id)) draft[id] = true;
+      }
       try {
         const oldHttp = JSON.parse(draft['s-http']);
         if (oldHttp && Object.hasOwn(oldHttp, 'client_version') && !Object.hasOwn(draft, 's-http-version')) {
@@ -1751,13 +1780,13 @@ async function pageSettings(main) {
     if (captchaPathIDs.includes(e.target.id)) {
       clearTimeout(captchaRuntimeTimer); captchaRuntimeRequest++; runtimePending(); captchaRuntimeTimer = setTimeout(checkCaptchaRuntime, 250);
     }
-    validateJSON(); syncNetworkFields(); updateDirty(); if (e.target.id.startsWith('s-proxy-')) $('#s-proxy-result').classList.add('hidden');
+    validateJSON(); syncTemplateFields(); syncNetworkFields(); updateDirty(); if (e.target.id.startsWith('s-proxy-')) $('#s-proxy-result').classList.add('hidden');
   } });
   form.addEventListener('change', e => { if (ids.includes(e.target.id)) {
     if (e.target.id === 's-proxy-source') { resetProxyNodeSelection(); $('#s-proxy-result').classList.add('hidden'); if ($('#s-proxy-source').value === 'subscription') void checkMihomo(); }
     if (e.target.id === 's-proxy-mihomo') void checkMihomo();
     if (captchaPathIDs.includes(e.target.id) || e.target.id === captchaFields.claim_runtime) void checkCaptchaRuntime();
-    syncNetworkFields(); updateDirty();
+    syncTemplateFields(); syncNetworkFields(); updateDirty();
   } });
   $('#s-mihomo-install').addEventListener('click', async () => {
     const button = $('#s-mihomo-install'), result = $('#s-mihomo-status');
@@ -1795,7 +1824,7 @@ async function pageSettings(main) {
     } catch (error) { result.textContent = '检测失败：' + error.message; }
     finally { button.disabled = false; btnLoading(button, false); }
   });
-  validateJSON(); validateCaptchaTTL(); syncNetworkFields(); updateDirty();
+  validateJSON(); validateCaptchaTTL(); syncTemplateFields(); syncNetworkFields(); updateDirty();
   void checkCaptchaRuntime();
   if (mihomoPath() !== (proxy.mihomo_path.trim() || 'mihomo')) void checkMihomo();
   const initialProxy = outboundValues();
@@ -1818,6 +1847,8 @@ async function pageSettings(main) {
       const response = await api('/api/settings', { method: 'PUT', body: {
         poll_interval_sec: Number(submitted['s-poll']), poll_jitter_sec: Number(submitted['s-jitter']), poll_concurrency: Number(submitted['s-conc']),
         default_reasoning_level: submitted['s-level'], app_version: submitted['s-ver'], zcode_version_auto_update: submitted['s-zcode-version-auto'], zcode_version_check_interval_sec: Math.round(Number(submitted['s-zcode-version-interval']) * Number(submitted['s-zcode-version-unit'])),
+        zcode_template_mode: submitted['s-template-mode'], zcode_subagent_template: submitted['s-subagent-template'],
+        ...Object.fromEntries(Object.entries(subagentFields).map(([key, id]) => [key, submitted[id]])),
         inference_driver: 'http', http: { ...JSON.parse(submitted['s-http']), client_version: submitted['s-http-version'], captcha: captchaValues(submitted) }, outbound_proxy: outboundValues(submitted), aliases: JSON.parse(submitted['s-aliases']), retry: JSON.parse(submitted['s-retry']),
       } });
       if (response.ok === false) throw new Error(response.error || '保存失败');

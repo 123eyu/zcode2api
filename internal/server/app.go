@@ -138,6 +138,7 @@ func New(root, data string, web fs.FS, buildVersion string) (*App, error) {
 	migrateHTTPVersion := !shared.Truth(a.setting("http_client_version_3_17_2_migrated", false))
 	migrateBalancePoll := !shared.Truth(a.setting("balance_poll_30s_migrated", false))
 	clean := settings.KnownConfig(cfg, saved)
+	settings.MigrateTemplateSettings(clean)
 	for k, v := range clean {
 		if k == "http" || k == "retry" || k == "outbound_proxy" {
 			v = settings.DeepMerge(shared.Obj(cfg[k]), shared.Obj(v), false)

@@ -14,6 +14,7 @@ import (
 	captchasdk "zcode2api/internal/server/captcha"
 	settings "zcode2api/internal/server/config"
 	"zcode2api/internal/server/fault"
+	wire "zcode2api/internal/server/protocol"
 	routing "zcode2api/internal/server/proxy"
 	"zcode2api/internal/server/shared"
 )
@@ -390,6 +391,10 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 			}
 			over[k] = v
 			next[k] = v
+		}
+		if _, err := wire.NewSystemTemplate(shared.Str(next["zcode_template_mode"]), shared.Str(next["zcode_subagent_template"])); err != nil {
+			a.configMu.Unlock()
+			return adminError(400, err.Error())
 		}
 		if e := routing.ValidateOutboundProxy(next["outbound_proxy"]); e != nil {
 			a.configMu.Unlock()

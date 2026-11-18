@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	captchasdk "zcode2api/internal/server/captcha"
+	wire "zcode2api/internal/server/protocol"
 	routing "zcode2api/internal/server/proxy"
 	"zcode2api/internal/server/shared"
 )
@@ -12,6 +13,25 @@ import (
 var VersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 func ValidateSettings(b shared.M) error {
+	if value, present := b["zcode_template_mode"]; present {
+		mode, ok := value.(string)
+		if !ok || (mode != wire.TemplateMain && mode != wire.TemplateSubagent) {
+			return fmt.Errorf("模板模式仅支持 main 或 subagent")
+		}
+	}
+	for _, key := range []string{"zcode_subagent_insert_enabled", "zcode_subagent_harness_enabled", "zcode_subagent_files_enabled", "zcode_subagent_comments_enabled"} {
+		if value, present := b[key]; present {
+			if _, ok := value.(bool); !ok {
+				return fmt.Errorf("%s 必须为布尔值", key)
+			}
+		}
+	}
+	if value, present := b["zcode_subagent_template"]; present {
+		custom, ok := value.(string)
+		if !ok || len(custom) > wire.MaxCustomTemplateBytes {
+			return fmt.Errorf("自定义模板必须为不超过 256 KiB 的文本")
+		}
+	}
 	if value, present := b["zcode_version_check_interval_sec"]; present {
 		if !shared.IntegerInRange(value, minZCodeVersionCheckIntervalSec, maxZCodeVersionCheckIntervalSec) {
 			return fmt.Errorf("ZCode 版本检查间隔须为 1 分钟到 365 天之间的整数秒数")
