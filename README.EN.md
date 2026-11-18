@@ -17,28 +17,27 @@
 
 </div>
 
-A reverse proxy gateway for ZCode free accounts, supporting OpenAI Chat Completions, Responses and Anthropic Messages (recommended) protocols.
+zcode2api is a reverse proxy gateway for free ZCode accounts. It supports multi-account scheduling and automatic card claims, and works with OpenAI Chat Completions, OpenAI Responses and Anthropic Messages (recommended).
 
-Supports account scheduling and automatic card claims.
+In the console, select `subagent` under **设置 → 请求模板** (Settings → Request Templates). The gateway switches to a subagent system template that omits the network security guidance from ZCode's default template. To add a custom prompt to forwarded requests, enable **Web 插入内容** (Insert Prompt), enter the prompt and save.
 
 ## Screenshots
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/仪表盘1.png" alt="Dashboard 1" width="100%"><br>Dashboard 1</td>
-    <td width="50%" align="center"><img src="docs/仪表盘2.png" alt="Dashboard 2" width="100%"><br>Dashboard 2</td>
+    <td width="50%"><img src="docs/仪表盘.png" alt="Dashboard" width="100%"></td>
+    <td width="50%"><img src="docs/设置.png" alt="Settings" width="100%"></td>
   </tr>
+</table>
+
+### `subagent` request examples
+
+Prompt changes apply to client requests forwarded by the gateway. The upstream service independently handles content moderation, risk controls and account enforcement. Follow the provider's terms of service. Abuse may lead to an account ban, and users are responsible for the consequences.
+
+<table>
   <tr>
-    <td width="50%" align="center"><img src="docs/账号管理.png" alt="Accounts" width="100%"><br>Accounts</td>
-    <td width="50%" align="center"><img src="docs/领卡中心.png" alt="Card claims" width="100%"><br>Card claims</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><img src="docs/用量.png" alt="Usage" width="100%"><br>Usage</td>
-    <td width="50%" align="center"><img src="docs/日志.png" alt="Logs" width="100%"><br>Logs</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><img src="docs/密钥.png" alt="API keys" width="100%"><br>API keys</td>
-    <td width="50%" align="center"><img src="docs/设置.png" alt="Settings" width="100%"><br>Settings</td>
+    <td width="50%"><img src="docs/subagent2.png" alt="Model response shown in the client" width="100%"></td>
+    <td width="50%"><img src="docs/subagent1.png" alt="Safety block notice shown in the client" width="100%"></td>
   </tr>
 </table>
 
@@ -94,7 +93,7 @@ docker compose build
 docker compose up -d
 ```
 
-For SDK verification, see [Docker verification runtime](docs/network.EN.md#docker). Add `--build-arg PROXY_RUNTIME=1` for subscription-based proxy nodes or `--build-arg GRAMMAR_RUNTIME=1` for grammar validation.
+For SDK verification, see [Docker verification runtime (Chinese)](docs/network.md#docker). Add `--build-arg PROXY_RUNTIME=1` for subscription-based proxy nodes or `--build-arg GRAMMAR_RUNTIME=1` for grammar validation.
 
 ### Access and configuration
 
@@ -129,9 +128,13 @@ curl http://127.0.0.1:6780/v1/chat/completions \
 | Document | Contents |
 | --- | --- |
 | [Configuration and retries (Chinese)](docs/configuration.md) | Parameters and environment variables, version updates, quota refresh, scheduled card claims, scheduling and logs |
-| [SDK verification and log errors](docs/network.EN.md) | Runtime setup, inference verification policies and [error codes](docs/network.EN.md#log-errors) |
-| [Proxies and security verification (Chinese)](docs/network.md) | Node selection and failover, ticket management and manual verification |
+| [Proxies and security verification (Chinese)](docs/network.md) | Node selection and failover, [SDK verification](docs/network.md#安全验证), ticket management, manual verification and [error codes](docs/network.md#故障排查) |
 | [Protocol compatibility (Chinese)](docs/protocol-compatibility.md) | Tool calls, grammar validation, system prompt deduplication and instruction conversion limitations |
+
+## References
+
+- The frontend UI draws on [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager).
+- The built-in jailbreak prompt draws on [kimik3.1.md](https://github.com/togg53192-cmd/jailbreaks/blob/main/Moonshot%20AI/kimik3.1.md) and [《巴别语》 by 洺熙师傅](https://mp.weixin.qq.com/s/WQohsXHbB8dUJisEpfm22g).
 
 ## Contributing
 

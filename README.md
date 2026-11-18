@@ -17,28 +17,27 @@
 
 </div>
 
-面向 ZCode 免费账号的反向代理网关，兼容 OpenAI Chat Completions、Responses 和 Anthropic Messages 协议（推荐）。
+zcode2api 是面向 ZCode 免费账号的反向代理网关，支持多账号调度和自动领卡。兼容 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages（推荐）。
 
-支持多账号调度和自动领卡。
+在控制台「设置 → 请求模板」中选择 `subagent`，网关会切换到子代理系统模板，省略 ZCode 默认模板中的网络安全提示段落。开启「Web 插入内容」，填写自定义提示词并保存，即可将其注入转发请求。
 
 ## 界面预览
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/仪表盘1.png" alt="仪表盘1" width="100%"><br>仪表盘1</td>
-    <td width="50%" align="center"><img src="docs/仪表盘2.png" alt="仪表盘2" width="100%"><br>仪表盘2</td>
+    <td width="50%"><img src="docs/仪表盘.png" alt="仪表盘" width="100%"></td>
+    <td width="50%"><img src="docs/设置.png" alt="设置" width="100%"></td>
   </tr>
+</table>
+
+### `subagent` 请求示例
+
+提示词调整作用于网关转发的客户端请求。内容审核、风控和账号处置由上游服务端独立执行。请遵守平台服务条款，滥用可能导致账号封禁，相关后果由使用者自行承担。
+
+<table>
   <tr>
-    <td width="50%" align="center"><img src="docs/账号管理.png" alt="账号管理" width="100%"><br>账号管理</td>
-    <td width="50%" align="center"><img src="docs/领卡中心.png" alt="领卡中心" width="100%"><br>领卡中心</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><img src="docs/用量.png" alt="用量" width="100%"><br>用量</td>
-    <td width="50%" align="center"><img src="docs/日志.png" alt="日志" width="100%"><br>日志</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><img src="docs/密钥.png" alt="密钥" width="100%"><br>密钥</td>
-    <td width="50%" align="center"><img src="docs/设置.png" alt="设置" width="100%"><br>设置</td>
+    <td width="50%"><img src="docs/subagent2.png" alt="客户端显示的模型回复" width="100%"></td>
+    <td width="50%"><img src="docs/subagent1.png" alt="客户端显示的安全拦截提示" width="100%"></td>
   </tr>
 </table>
 

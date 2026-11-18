@@ -17,28 +17,27 @@
 
 </div>
 
-ZCode の無料アカウント向けリバースプロキシゲートウェイです。OpenAI Chat Completions、Responses、Anthropic Messages（推奨）の各プロトコルに対応しています。
+zcode2api は ZCode の無料アカウント向けリバースプロキシゲートウェイです。複数アカウントの振り分けとカードの自動取得に対応し、OpenAI Chat Completions、OpenAI Responses、Anthropic Messages（推奨）を利用できます。
 
-複数アカウントの振り分けとカードの自動取得に対応します。
+管理画面の「设置 → 请求模板」（設定 → リクエストテンプレート）で `subagent` を選ぶと、ゲートウェイは ZCode の既定テンプレートに含まれるネットワークセキュリティの指示を省いたサブエージェント用のシステムテンプレートに切り替わります。「Web 插入内容」（プロンプトの挿入）を有効にしてカスタムプロンプトを入力し、保存すると、転送リクエストに反映されます。
 
 ## スクリーンショット
 
 <table>
   <tr>
-    <td width="50%" align="center"><img src="docs/仪表盘1.png" alt="ダッシュボード1" width="100%"><br>ダッシュボード1</td>
-    <td width="50%" align="center"><img src="docs/仪表盘2.png" alt="ダッシュボード2" width="100%"><br>ダッシュボード2</td>
+    <td width="50%"><img src="docs/仪表盘.png" alt="ダッシュボード" width="100%"></td>
+    <td width="50%"><img src="docs/设置.png" alt="設定" width="100%"></td>
   </tr>
+</table>
+
+### `subagent` リクエストの例
+
+プロンプトの変更は、ゲートウェイが転送するクライアントリクエストに適用されます。コンテンツ審査、リスク管理、アカウントの措置は上流サービスが独自に行います。サービスの利用規約に従ってください。悪用によってアカウントが停止される場合があり、その結果は利用者自身の責任となります。
+
+<table>
   <tr>
-    <td width="50%" align="center"><img src="docs/账号管理.png" alt="アカウント管理" width="100%"><br>アカウント管理</td>
-    <td width="50%" align="center"><img src="docs/领卡中心.png" alt="カード取得" width="100%"><br>カード取得</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><img src="docs/用量.png" alt="使用量" width="100%"><br>使用量</td>
-    <td width="50%" align="center"><img src="docs/日志.png" alt="ログ" width="100%"><br>ログ</td>
-  </tr>
-  <tr>
-    <td width="50%" align="center"><img src="docs/密钥.png" alt="API キー" width="100%"><br>API キー</td>
-    <td width="50%" align="center"><img src="docs/设置.png" alt="設定" width="100%"><br>設定</td>
+    <td width="50%"><img src="docs/subagent2.png" alt="クライアントに表示されたモデルの応答" width="100%"></td>
+    <td width="50%"><img src="docs/subagent1.png" alt="クライアントに表示された安全性フィルターの通知" width="100%"></td>
   </tr>
 </table>
 
@@ -94,7 +93,7 @@ docker compose build
 docker compose up -d
 ```
 
-SDK 検証を利用する場合は [Docker の検証ランタイム](docs/network.JP.md#docker)を参照してください。サブスクリプション型プロキシノードには `--build-arg PROXY_RUNTIME=1`、grammar 検証には `--build-arg GRAMMAR_RUNTIME=1` を追加してください。
+SDK 検証を利用する場合は [Docker の検証ランタイム（中国語）](docs/network.md#docker)を参照してください。サブスクリプション型プロキシノードには `--build-arg PROXY_RUNTIME=1`、grammar 検証には `--build-arg GRAMMAR_RUNTIME=1` を追加してください。
 
 ### アクセスと設定
 
@@ -129,9 +128,13 @@ curl http://127.0.0.1:6780/v1/chat/completions \
 | ドキュメント | 内容 |
 | --- | --- |
 | [設定とリトライ（中国語）](docs/configuration.md) | パラメーターと環境変数、バージョン更新、利用枠の更新、カードの定時取得、アカウントの振り分け、ログ |
-| [SDK 検証とログのエラー](docs/network.JP.md) | ランタイムの設定、推論時の検証ポリシーと[エラーコード](docs/network.JP.md#ログのエラー説明) |
-| [プロキシとセキュリティ検証（中国語）](docs/network.md) | ノードの選択と切り替え、チケット管理、手動検証 |
+| [プロキシとセキュリティ検証（中国語）](docs/network.md) | ノードの選択と切り替え、[SDK 検証](docs/network.md#安全验证)、チケット管理、手動検証、[エラーコード](docs/network.md#故障排查) |
 | [プロトコル互換性（中国語）](docs/protocol-compatibility.md) | ツール呼び出し、grammar 検証、システムプロンプトの重複除去、指示変換の制限 |
+
+## 参考資料
+
+- フロントエンド UI は [workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) を参考にしています。
+- 組み込みのジェイルブレイク用プロンプトは [kimik3.1.md](https://github.com/togg53192-cmd/jailbreaks/blob/main/Moonshot%20AI/kimik3.1.md) と [洺熙师傅の『巴别语』](https://mp.weixin.qq.com/s/WQohsXHbB8dUJisEpfm22g) を参考にしています。
 
 ## コントリビューションガイド
 

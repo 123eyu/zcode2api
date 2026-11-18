@@ -1099,6 +1099,7 @@ html.dark .select-option[aria-selected="true"] { font-weight: 500; }
 .update-panel-body progress::-webkit-progress-value { background: var(--primary); border-radius: inherit; transition: width 240ms var(--ease-out); }
 .update-panel-body progress::-moz-progress-bar { background: var(--primary); border-radius: inherit; }
 .update-notes { border-top: 1px solid var(--border); padding-top: 14px; }
+.update-notes h3 { margin: 0; font-size: 13px; font-weight: 600; }
 .update-notes pre { margin: 14px 0; max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; line-height: 1.7; color: var(--muted-fg); }
 @media (max-width: 600px) { .update-toolbar { align-items: flex-start; flex-direction: column; } .update-actions { width: 100%; } .update-actions .btn { flex: 1; } }
 .proxy-small-button.btn { height: 24px; padding: 0 9px; font-size: 11px; flex: none; }
