@@ -76,13 +76,17 @@
 
 ### 推理模式
 
+在「设置 → 上游安全验证」选择推理策略并保存。运行环境见[依赖与配置](#依赖与配置)。
+
 | `http.captcha.mode` | 行为 |
 | --- | --- |
 | `off`（默认） | 推理不运行验证 SDK |
-| `auto` | 遵循上游 `enabled` 和 `skip_model_request`，明确要求验证时强制取票 |
+| `auto`（推荐） | 遵循上游 `enabled` 和 `skip_model_request`，明确要求验证时强制取票 |
 | `always` | 场景启用时，每次推理前取票 |
 
 推理验证已启用、票据失效且尚未输出时，在原出口重新验证一次。依赖缺失、超时、资源 HTTP 错误或未知 SDK 拒绝分别返回具体错误；只有[明确的出口故障](#出口故障与切换)才触发节点切换。
+
+开始输出正文、思考或工具调用后，网关会直接返回后续验证错误，避免重放整轮请求。
 
 ### 票据预取续期
 
@@ -94,7 +98,7 @@
 
 ### 依赖与配置
 
-jsdom 验证需安装 Node.js 18+，无需 Chrome。在项目或发行包根目录安装 jsdom：
+Node.js 18+（含 npm）即可运行 jsdom 验证。安装命令在项目或发行包根目录执行。
 
 ```sh
 npm --prefix captcha_node ci --omit=dev --ignore-scripts
@@ -125,16 +129,18 @@ SDK 支持直连及带或不带认证的 HTTP/HTTPS 代理；订阅节点通过 
 
 ### Docker
 
-需要后台验证时加入 `CAPTCHA_RUNTIME=1`；需要订阅代理时加入 `PROXY_RUNTIME=1`。两者默认均为 `0`：
+需要 jsdom 验证时，在构建命令中加入 `CAPTCHA_RUNTIME=1`。订阅代理可另加 `--build-arg PROXY_RUNTIME=1`。两项默认均为 `0`。
 
 ```sh
-docker compose build --build-arg CAPTCHA_RUNTIME=1 --build-arg PROXY_RUNTIME=1
+docker compose build --build-arg CAPTCHA_RUNTIME=1
 docker compose up -d
 ```
 
 ## 故障排查
 
-排查时保留 HTTP 状态、错误码、请求 ID 和追踪 ID；仅凭 403 或 405 无法判断原因。代理故障、WAF、`3012` 和 `F001` 的分类见[出口故障与切换](#出口故障与切换)，其余常见错误如下：
+调用记录中的 `error_message` 是中文分类摘要，`error_code` 是具体错误码。排查时保留 HTTP 状态、错误码、`request_id` 和 `trace_id`。日志入口与筛选方式见[日志保存与筛选](configuration.md#日志保存与筛选)。
+
+遇到 403 或 405 时，结合具体错误码判断原因。代理故障、WAF、`3012` 和 `F001` 的分类见[出口故障与切换](#出口故障与切换)。
 
 | 错误码 / 提示 | 含义与处理方式 |
 | --- | --- |

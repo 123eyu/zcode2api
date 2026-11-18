@@ -29,7 +29,7 @@ if (goos === 'windows') {
 }
 const sharedFiles = [
   'LICENSE', 'README.md', 'README.EN.md', 'README.JP.md', 'CHANGELOG.md', 'SECURITY.md', 'config.example.json',
-  'docs/configuration.md', 'docs/network.md',
+  'docs/configuration.md', 'docs/network.md', 'docs/network.EN.md', 'docs/network.JP.md',
   'docs/protocol-compatibility.md', 'grammar_python/requirements.txt',
   'captcha_node/package.json', 'captcha_node/package-lock.json',
   ...fs.readdirSync(path.join(root, 'docs')).filter(file => file.endsWith('.png')).map(file => `docs/${file}`),
