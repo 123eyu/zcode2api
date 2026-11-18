@@ -1,18 +1,16 @@
 function settingsUpdateMarkup() {
-  return `<details class="settings-section formcard" id="update-panel">
-    <summary class="settings-section-summary disclosure-heading"><span><strong>版本更新</strong></span><span class="pill" id="update-summary">${esc(RUNTIME?.version || '未读取')}</span></summary>
-    <div class="settings-panel settings-section-body update-panel-body">
-      <div class="update-versions"><div><span>当前版本</span><strong id="update-current">${esc(RUNTIME?.version || '—')}</strong></div><div><span>最新发行版本</span><strong id="update-latest">未检查</strong></div></div>
+  return `<div class="update-panel-body">
+      <div class="settings-fields update-versions"><div><span>当前版本</span><strong id="update-current">${esc(RUNTIME?.version || '—')}</strong></div><div><span>最新发行版本</span><strong id="update-latest">未检查</strong></div></div>
       <div class="update-toolbar"><a class="text-action update-repository" href="https://github.com/7sen1ot/zcode2api" target="_blank" rel="noopener noreferrer">7sen1ot/zcode2api ↗</a><div class="update-actions"><a class="btn" id="update-manual" href="https://github.com/7sen1ot/zcode2api/releases" target="_blank" rel="noopener noreferrer" hidden>下载发行包 ↗</a><button type="button" class="btn" id="update-check">${icon('refresh', 14)}检查更新</button><button type="button" class="btn primary" id="update-install" hidden>更新并重启</button></div></div>
       <progress id="update-progress" aria-label="发行包下载进度" hidden></progress>
       <p id="update-message" class="update-message" role="status" aria-live="polite"></p>
       <details class="update-notes" id="update-notes" hidden><summary class="disclosure-link">发布说明</summary><pre id="update-notes-content"></pre><a id="update-release" class="text-action" href="https://github.com/7sen1ot/zcode2api/releases" target="_blank" rel="noopener noreferrer">在 GitHub 查看 ↗</a></details>
-    </div>
-  </details>`;
+    </div>`;
 }
 
 async function mountSettingsUpdate(main) {
   const panel = $('#update-panel', main), check = $('#update-check', panel), install = $('#update-install', panel);
+  const summary = $('#update-summary', main);
   const message = $('#update-message', panel), progress = $('#update-progress', panel);
   const session = TOKEN;
   let info, requesting = false, timer, reconnecting = false, stopped = false, reconnectSince = 0;
@@ -29,7 +27,8 @@ async function mountSettingsUpdate(main) {
     const state = info?.state || {}, busy = !!info?.busy;
     $('#update-current', panel).textContent = info?.current_version || RUNTIME?.version || '—';
     $('#update-latest', panel).textContent = info?.latest_version || '未检查';
-    $('#update-summary', panel).textContent = busy ? '更新中' : info?.available ? '有新版本' : info?.current_version || RUNTIME?.version || '未检查';
+    summary.hidden = !busy && !info?.available;
+    summary.textContent = busy ? '更新中' : '可更新';
     check.disabled = requesting || busy;
     check.classList.toggle('loading', requesting && !busy);
     install.hidden = !info?.available;

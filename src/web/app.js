@@ -53,6 +53,10 @@ const ICONS = {
   import: '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="m10 17 5-5-5-5"/><path d="M15 12H3"/>',
   export: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',
   refresh: '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42m0-14.14-1.42 1.42m-11.3 11.3-1.42 1.42"/>',
+  moon: '<path d="M20.99 12.92a9 9 0 1 1-9.91-9.91c.4-.04.62.43.38.74a6.5 6.5 0 0 0 8.79 8.79c.31-.24.78-.02.74.38"/>',
+  'chevron-left': '<path d="m15 18-6-6 6-6"/>',
+  'chevron-right': '<path d="m9 18 6-6-6-6"/>',
   search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
   activity: '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>',
   gauge: '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
@@ -198,10 +202,12 @@ document.addEventListener('click', async (e) => {
 });
 
 function applyThemeBtn() {
-  const label = $('#theme-btn-label');
-  const theme = document.documentElement.classList.contains('dark') ? '深色' : '浅色';
-  if (label) label.textContent = theme;
-  $('#theme-btn')?.setAttribute('aria-label', `${theme}，切换亮/暗主题`);
+  const button = $('#theme-btn');
+  const dark = document.documentElement.classList.contains('dark');
+  button.innerHTML = icon(dark ? 'moon' : 'sun', 17);
+  const label = dark ? '切换为浅色主题' : '切换为深色主题';
+  button.setAttribute('aria-label', label);
+  button.title = label;
 }
 function setTheme(mode) {
   if (mode === 'system') localStorage.removeItem('z2a_theme');
@@ -216,10 +222,15 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 applyThemeBtn();
 
 function routeValues() {
-  if (currentPage === 'dashboard') return { hours: window._dashboardHours && window._dashboardHours !== 'all' ? window._dashboardHours : '', days: window._dashboardDays === 30 ? 30 : '' };
+  if (currentPage === 'dashboard') return {
+    hours: window._dashboardHours && window._dashboardHours !== 'all' ? window._dashboardHours : '',
+    days: window._dashboardDays === 30 ? 30 : '',
+    chart: window._dashboardChart === 'daily' ? 'daily' : '',
+  };
   if (currentPage === 'accounts') { const f = window._accFilter || {}; return { q: f.q, status: f.status === 'all' ? '' : f.status, sort: f.sort === 'default' ? '' : f.sort, page: f.page > 1 ? f.page : '', size: f.size && f.size !== 25 ? f.size : '' }; }
   if (currentPage === 'usage') { const f = window._usageDetail || {}; return { hours: window._usageHours || 24, tab: f.tab || 'model', page: f.pages?.[f.tab] || 1 }; }
   if (currentPage === 'logs') return Z2ALogs.routeValues();
+  if (currentPage === 'settings') return { section: settingsSection };
   return {};
 }
 function syncRoute(replace = true) {
@@ -233,7 +244,12 @@ function restoreRoute(route) {
   const valid = (value, choices, fallback) => choices.includes(value) ? value : fallback;
   const page = Math.max(1, Math.min(100000, Math.floor(Number(q.page)) || 1));
   currentPage = route.page;
-  if (currentPage === 'dashboard') { window._dashboardHours = valid(q.hours, ['all', '24', '168', '720'], 'all'); window._dashboardDays = Number(valid(q.days, ['7', '30'], '7')); }
+  settingsSection = currentPage === 'settings' ? readSettingsSection(q.section) : '';
+  if (currentPage === 'dashboard') {
+    window._dashboardHours = valid(q.hours, ['all', '24', '168', '720'], 'all');
+    window._dashboardDays = Number(valid(q.days, ['7', '30'], '7'));
+    window._dashboardChart = valid(q.chart, ['cache', 'daily'], 'cache');
+  }
   if (currentPage === 'accounts') window._accFilter = { q: (q.q || '').slice(0, 200), status: valid(q.status, ['active', 'needs_relogin', 'cooldown', 'expired', 'web_only'], 'all'), sort: valid(q.sort, ['remaining', 'expiring'], 'default'), page, size: Number(valid(q.size, ['25', '50', '100'], '25')) };
   if (currentPage === 'usage') { window._usageHours = Number(valid(q.hours, ['24', '168', '720'], '24')); const tab = valid(q.tab, ['model', 'key', 'account', 'status'], 'model'); window._usageDetail = { tab, pages: { [tab]: page } }; }
   if (currentPage === 'logs') Z2ALogs.restoreRoute(q);
@@ -246,6 +262,7 @@ async function navigateTo(page) {
   if (!PAGES.some(p => p[0] === page) || page === currentPage) return false;
   if (!await mayLeaveSettings()) return false;
   currentPage = page;
+  settingsSection = '';
   delete $('#main').dataset.fp;
   syncRoute(false);
   renderNav();
@@ -255,29 +272,50 @@ async function navigateTo(page) {
 }
 window.addEventListener('hashchange', async () => {
   if (location.hash === '#main' || location.hash === routeURL) return;
+  const route = UI.readRoute(location.hash);
+  if (currentPage === 'settings' && route.page === 'settings') {
+    settingsSection = readSettingsSection(route.query.section);
+    syncRoute();
+    if (showSettingsSection?.({ focus: true })) return;
+  }
   if (!await mayLeaveSettings()) { history.replaceState(null, '', routeURL); return; }
-  restoreRoute(UI.readRoute(location.hash));
+  restoreRoute(route);
   delete $('#main').dataset.fp;
   syncRoute(); renderNav(); await render();
   window.scrollTo({ top: 0, behavior: 'instant' });
 });
 function renderNav() {
   const nav = $('#nav');
-  const dock = document.createElement('div');
-  dock.className = 'dock';
-  for (const entry of PAGES) {
-    if (entry === '|') { dock.appendChild(h('<span class="dock-sep"></span>')); continue; }
-    const [id, label, ic] = entry;
-    const b = h(`<button class="dock-item${id === currentPage ? ' active' : ''}" data-page="${id}" aria-label="${label}" ${id === currentPage ? 'aria-current="page"' : ''}>
-      <span class="di">${icon(ic, 16)}</span><span class="tip">${label}</span>
-    </button>`);
-    b.addEventListener('click', () => navigateTo(id));
-    dock.appendChild(b);
+  if (!nav.firstElementChild) {
+    nav.innerHTML = `<div class="dock">${PAGES.map(entry => {
+      if (entry === '|') return '<span class="dock-sep" aria-hidden="true"></span>';
+      const [id, label, symbol] = entry;
+      return `<button type="button" class="dock-item" data-page="${id}" aria-label="${label}">
+        <span class="di">${icon(symbol, 16)}</span><span class="tip" aria-hidden="true">${label}</span>
+      </button>`;
+    }).join('')}</div>`;
   }
-  nav.innerHTML = '';
-  nav.appendChild(dock);
-  applyThemeBtn();
+  for (const item of $$('.dock-item', nav)) {
+    const active = item.dataset.page === currentPage;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  }
 }
+
+function isPlainLinkClick(e) {
+  return e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey;
+}
+
+$('#app-view').addEventListener('click', async e => {
+  const item = e.target.closest('.dock-item, .toolbar-brand');
+  if (!item || (item.matches('a') && !isPlainLinkClick(e))) return;
+  e.preventDefault();
+  if (await navigateTo(item.dataset.page)) {
+    const heading = $('#main h1');
+    if (heading) { heading.tabIndex = -1; heading.focus({ preventScroll: true }); }
+  }
+});
 
 let pendingRender = null;
 let renderTask = null;
@@ -670,16 +708,27 @@ function bindAccountPager(root, state, paint) {
 }
 
 const ACCOUNT_FAMILY_LABELS = { bigmodel: '国内账号', zai: '国际账号' };
+const AVATAR_HUES = [245, 168, 304, 15, 75, 205];
 
 function loginProviderLabel(provider) {
   return ({ zai_cn: 'Z.ai 国内', zai: 'Z.ai 国际', bigmodel: 'BigModel（旧版）' })[provider] || 'ZCode';
+}
+
+function avatarMarkup(name, id) {
+  let hash = 0;
+  for (const character of String(id || name || '')) {
+    hash = (Math.imul(hash, 31) + character.codePointAt(0)) >>> 0;
+  }
+  const hue = AVATAR_HUES[hash % AVATAR_HUES.length];
+  const initial = Array.from(name || '?')[0];
+  return `<span class="avatar" style="--avatar-hue:${hue}" aria-hidden="true">${esc(initial)}</span>`;
 }
 
 function accountNameMarkup(a, action = 'detail') {
   const name = a.platform_name || '未获取官方名称';
   const officialID = a.customer_id == null || a.customer_id === '' ? '未获取官方 ID' : String(a.customer_id);
   const family = loginProviderLabel(a.login_provider || a.family);
-  return `<button type="button" class="account-name-button" data-act="${action}" data-id="${esc(a.id)}" title="${esc(name)} · ${esc(officialID)}"><span class="avatar">${esc(Array.from(a.platform_name || '?')[0])}</span><span class="account-identity"><span class="account-row-name">${esc(name)}</span><span class="account-row-id">${esc(officialID)}</span></span><span class="account-row-family">${family}</span></button>`;
+  return `<button type="button" class="account-name-button" data-act="${action}" data-id="${esc(a.id)}" title="${esc(name)} · ${esc(officialID)}">${avatarMarkup(a.platform_name, a.id)}<span class="account-identity"><span class="account-row-name">${esc(name)}</span><span class="account-row-id">${esc(officialID)}</span></span><span class="account-row-family">${family}</span></button>`;
 }
 
 async function pageDashboard(main) {
@@ -713,14 +762,48 @@ async function pageDashboard(main) {
       ${statcard('24 小时缓存命中率', cacheRate, { icon: 'layers', hint: `${fmtQuota(cached)} / ${fmtQuota(cacheInput)} 输入 Token`, description: '近 24 小时缓存读取 Token ÷ 输入 Token；输入已包含缓存读取，不含缓存写入。' })}
       ${statcard('24 小时忙碌率', busyPct, { tone: Number.parseFloat(busyPct) >= 30 ? 'warning' : 'neutral', icon: 'gauge', hint: `${fmtInt(d.busy_24h.busy)} / ${fmtInt(d.busy_24h.total)} 次网关请求` })}
     </section>
-    <section class="dashboard-chart-card"><header class="dashboard-chart-heading"><h2>近 24 小时缓存命中率趋势</h2>${infoTip('按服务本地整点汇总：缓存读取 Token ÷ 输入 Token。总 Token 为输入与输出之和。首尾为部分小时；无输入的时段不标注命中率。', '缓存趋势')}</header><div id="dashboard-cache" class="dashboard-chart"></div></section>
-    <section class="dashboard-chart-card"><header class="dashboard-chart-heading"><h2>每日 Token 用量</h2><select id="dashboard-days" class="round" aria-label="每日用量时间范围"><option value="7">近 7 天</option><option value="30">近 30 天</option></select></header><div id="dashboard-daily" class="dashboard-chart"></div></section>`;
+    <section class="dashboard-chart-card" aria-labelledby="dashboard-trend-title">
+      <header class="dashboard-chart-heading">
+        <div class="dashboard-chart-title"><h2 id="dashboard-trend-title">趋势</h2><span id="dashboard-cache-tip">${infoTip('按服务本地整点汇总：缓存读取 Token ÷ 输入 Token。总 Token 为输入与输出之和。首尾为部分小时；无输入的时段不标注命中率。', '缓存趋势')}</span></div>
+        <select id="dashboard-trend-mode" class="round" aria-label="趋势图">
+          <option value="cache">近 24 小时缓存命中率</option>
+          <option value="7">每日 Token 用量 · 近 7 天</option>
+          <option value="30">每日 Token 用量 · 近 30 天</option>
+        </select>
+      </header>
+      <div id="dashboard-trend"></div>
+    </section>`;
 
-  const dailyRange = $('#dashboard-days', main);
-  dailyRange.value = String(days);
-  dailyRange.addEventListener('change', () => { window._dashboardDays = Number(dailyRange.value); delete main.dataset.fp; syncRoute(); render({ swap: true }); });
-  renderCacheTrendChart($('#dashboard-cache', main), d.cache_trend_24h);
-  renderDailyTokenChart($('#dashboard-daily', main), d.daily_usage);
+  const trendMode = $('#dashboard-trend-mode', main);
+  const trend = $('#dashboard-trend', main), cacheTip = $('#dashboard-cache-tip', main);
+  trendMode.value = window._dashboardChart === 'daily' ? String(days) : 'cache';
+  const paintTrend = () => {
+    const cache = trendMode.value === 'cache';
+    cacheTip.hidden = !cache;
+    trend.removeAttribute('aria-busy');
+    const chart = h('<div class="dashboard-chart"></div>');
+    trend.replaceChildren(chart);
+    if (cache) renderCacheTrendChart(chart, d.cache_trend_24h);
+    else renderDailyTokenChart(chart, d.daily_usage);
+  };
+  paintTrend();
+  trendMode.addEventListener('change', () => {
+    const cache = trendMode.value === 'cache';
+    window._dashboardChart = cache ? 'cache' : 'daily';
+    if (!cache) window._dashboardDays = Number(trendMode.value);
+    syncRoute();
+    if (cache || window._dashboardDays === days) {
+      paintTrend();
+      return;
+    }
+    cacheTip.hidden = true;
+    trend.setAttribute('aria-busy', 'true');
+    void render({ swap: true }).finally(() => {
+      if (!trend.isConnected || !trend.hasAttribute('aria-busy')) return;
+      trend.replaceChildren();
+      trend.removeAttribute('aria-busy');
+    });
+  });
   const range = $('#dashboard-hours', main);
   range.value = hours;
   range.addEventListener('change', () => {
@@ -1364,7 +1447,7 @@ async function pageKeys(main) {
         <div class="kv"><b>模型白名单</b><input id="k-models" value="${esc(k.model_whitelist.join(','))}" placeholder="逗号分隔，空=全部"></div>
         <div class="kv"><b>IP 白名单</b><input id="k-ips" value="${esc(k.ip_whitelist.join(','))}" placeholder="逗号分隔，支持 1.2.3.*，空=不限"></div>
         <div class="kv"><b>黏住分钟</b><input id="k-sticky" type="number" value="${k.sticky_minutes}"></div>
-        <div class="kv"><b>启用</b><input id="k-enabled" type="checkbox" ${k.enabled ? 'checked' : ''}></div>
+        <div class="kv"><label for="k-enabled">启用</label><input id="k-enabled" type="checkbox" ${k.enabled ? 'checked' : ''}></div>
         <div class="row" style="margin-top:12px"><button class="btn primary" id="k-save">保存</button></div></div>`);
       const m = modal('编辑密钥', form);
       $('#k-save', form).addEventListener('click', event => buttonAction(event.currentTarget, async () => {
@@ -1405,7 +1488,7 @@ async function pageGroups(main) {
     `<button class="btn primary" id="add-group">${icon('plus', 14)}新建分组</button>`)}
   <section id="group-list" style="animation-delay:50ms">
   ${groups.length ? `<div class="tablecard fade-up"><table><tr><th>名称</th><th>角色</th><th>账号类型</th><th>调度策略</th><th>临期窗口</th><th class="align-right">操作</th></tr>
-    ${groups.map((g) => `<tr><td><div class="cell-name"><span class="avatar">${esc((g.name || '?').slice(0, 1))}</span><span class="nm"><b>${esc(g.name)}</b></span></div></td>
+    ${groups.map((g) => `<tr><td><div class="cell-name">${avatarMarkup(g.name, g.id)}<span class="nm"><b>${esc(g.name)}</b></span></div></td>
       <td><span class="badge ${g.role === 'primary' ? 'active' : ''}">${esc(({ primary: '主力', backup: '备用' })[g.role] || g.role)}</span></td><td>${esc(ACCOUNT_FAMILY_LABELS[g.family_filter] || g.family_filter || '全部类型')}</td>
       <td>${esc(policyLabel(g.policy))}</td><td>${g.urgent_window_min} 分钟</td>
       <td class="align-right"><div class="cell-inline cell-actions"><button class="btn danger" data-del="${esc(g.id)}">删除</button></div></td></tr>`).join('')}</table></div>`
@@ -1429,439 +1512,6 @@ async function pageGroups(main) {
   });
 }
 
-async function pageSettings(main) {
-  const [s, mihomo] = await Promise.all([api('/api/settings'), api('/api/settings/proxy/mihomo').catch(() => ({ unavailable: true }))]);
-  const [mihomoOS, mihomoArch] = (mihomo.platform || '').split('/');
-  const mihomoTarget = mihomo.platform ? `${({ windows: 'Windows', linux: 'Linux', darwin: 'macOS' })[mihomoOS] || mihomoOS} / ${({ amd64: 'x64', arm64: 'ARM64' })[mihomoArch] || mihomoArch}` : '';
-  const httpParams = { ...s.http };
-  const versionIntervalSeconds = Number(s.zcode_version_check_interval_sec) || 432000;
-  const versionIntervalUnit = versionIntervalSeconds % 86400 === 0 ? 86400 : versionIntervalSeconds % 3600 === 0 ? 3600 : 60;
-  const captcha = { mode: 'off', claim_runtime: 'jsdom', playwright_path: '', browser_path: '', node_path: 'node', jsdom_path: '', simulate_canvas_webgl: true, timeout_ms: 30000, ticket_ttl_ms: 75000, ...s.http.captcha };
-  const proxy = { enabled: false, source: 'manual', urls: [], subscription_url: '', preferred_node: '', mihomo_path: 'mihomo', refresh_interval_sec: 3600, ...s.outbound_proxy };
-  const subagentFields = { zcode_subagent_insert_enabled: 's-subagent-insert', zcode_subagent_harness_enabled: 's-subagent-harness', zcode_subagent_files_enabled: 's-subagent-files', zcode_subagent_comments_enabled: 's-subagent-comments' };
-  delete httpParams.client_version;
-  delete httpParams.captcha;
-  main.innerHTML = `${pagehead('设置', '',
-    '<button type="submit" form="settings-form" class="btn primary settings-save" id="s-save" aria-describedby="settings-state" disabled>保存设置</button>')}
-    <p id="settings-state" class="visually-hidden" role="status" aria-live="polite"></p>
-    <form id="settings-form" class="settings-form control-comfortable" novalidate>
-      <p id="settings-error" class="inline-notice error hidden" role="alert"></p>
-      ${settingsUpdateMarkup()}
-      <details class="settings-section formcard" id="template-panel" open><summary class="settings-section-summary disclosure-heading"><span><strong>请求模板</strong></span></summary>
-      <div class="settings-panel settings-section-body settings-section-content"><div class="network-settings-fields">
-        <label class="f settings-template-mode"><span>模板类型 ${infoTip('main 固定使用原始三段式模板。subagent 可独立勾选正文内容；保存后同时切换模板与请求头。', '请求模板')}</span><select id="s-template-mode" required><option value="main">main（默认原始三段式）</option><option value="subagent">subagent</option></select></label>
-        <div class="network-settings-fields template-custom-fields" id="s-subagent-options" hidden>
-          <div class="template-identity"><code aria-label="固定身份标识">You are ZCode, an interactive agent</code>${infoTip('身份标识不可修改。全部取消勾选时，模板正文为空；勾选正文时保留固定的代理开头。', '固定身份标识')}</div>
-          <div class="settings-fields template-component-options" role="group" aria-label="subagent 可选正文">
-            <label class="settings-check"><input id="s-subagent-insert" type="checkbox"><span>Web 插入内容</span></label>
-            <label class="settings-check"><input id="s-subagent-harness" type="checkbox"><span>Harness</span></label>
-            <label class="settings-check"><input id="s-subagent-files" type="checkbox"><span>Files &amp; URLs</span></label>
-            <label class="settings-check"><input id="s-subagent-comments" type="checkbox"><span>Inline Code Comments</span></label>
-          </div>
-          <div class="code-field template-custom-fields" id="s-template-custom-fields" hidden><label class="f" for="s-subagent-template"><span>插入内容 ${infoTip('留空使用内置的 internal/server/system-prompt.md。此处内容排在勾选的固定段落之前；客户端 system / developer 指令仍会追加。', '插入内容')}</span></label><textarea id="s-subagent-template" class="code-input" rows="10" spellcheck="false" maxlength="262144" placeholder="留空使用 internal/server/system-prompt.md">${esc(s.zcode_subagent_template || '')}</textarea></div>
-        </div>
-      </div></div></details>
-      <details class="settings-section formcard" id="poll-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>额度轮询</strong></span></summary>
-      <div class="settings-panel settings-section-body settings-section-content"><div class="settings-fields">
-        <label class="f">轮询间隔（秒）<input id="s-poll" type="number" min="1" step="1" required value="${s.poll_interval_sec}"><small>两次余额检查之间的基础间隔</small></label>
-        <label class="f">随机抖动（秒）<input id="s-jitter" type="number" min="0" step="1" required value="${s.poll_jitter_sec}"><small>分散多个账号的请求时间</small></label>
-        <label class="f">轮询并发<input id="s-conc" type="number" min="1" step="1" required value="${s.poll_concurrency}"><small>同时检查余额的账号数量</small></label>
-      </div></div></details>
-      <details class="settings-section formcard" id="captcha-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>上游安全验证</strong></span></summary>
-      <div class="settings-panel settings-section-body settings-section-content"><div class="network-settings-fields">
-        <div class="settings-subsection"><h3>模型 API 推理 · Node.js + jsdom</h3><div class="settings-fields">
-          <label class="f">模型推理验证策略<select id="s-captcha-mode" aria-describedby="s-captcha-mode-hint"><option value="off">关闭模型推理验证</option><option value="auto">按上游要求验证</option><option value="always">每次推理前验证</option></select><small id="s-captcha-mode-hint" aria-live="polite"></small></label>
-          <label class="f"><span>jsdom 依赖目录 ${infoTip('用于模型推理验证，以及选择 jsdom 的手动领卡。定时领卡不使用 jsdom。', 'jsdom 适用范围')}</span><input id="s-captcha-jsdom" value="${esc(captcha.jsdom_path)}" placeholder="留空使用 captcha_node"><small id="s-jsdom-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
-        </div><label class="settings-check"><input id="s-captcha-canvas" type="checkbox" ${captcha.simulate_canvas_webgl ? 'checked' : ''}><span>启用 jsdom 渲染接口模拟 ${infoTip('仅为 jsdom 验证补充 Canvas、WebGL 等兼容接口，不影响真实浏览器，也不保证通过上游验证。', '渲染接口模拟')}</span></label></div>
-        <div class="settings-subsection"><h3>领卡验证</h3><div class="settings-fields">
-          <div class="field-group f"><span>定时领卡验证方式</span><strong>服务端真实浏览器（固定）</strong><small id="s-claim-browser-status" class="runtime-status" role="status" aria-live="polite">正在检测浏览器依赖…</small></div>
-          <label class="f"><span>手动领卡验证方式 ${infoTip('仅影响点击“领取”或“全部领取”时的服务端验证。需要人工操作时，仍可在当前网页完成验证；不改变定时领卡或模型推理的方式。', '手动领卡验证')}</span><select id="s-claim-runtime"><option value="jsdom">Node.js + jsdom</option><option value="browser">服务端真实浏览器</option></select></label>
-        </div><div class="settings-fields">
-          <div class="mihomo-field" id="claim-browser-fields"><div class="mihomo-field-heading"><label for="s-browser-path">服务端浏览器路径</label><span>${infoTip('需要 Node.js、Playwright 及 Chromium 内核浏览器，支持 Chromium / Chrome / Edge。定时领取前 3 分钟预热，最晚保留至计划时间后 10 分钟，完成后提前退出。手动领取选择浏览器时按需启动，空闲 30 秒退出。不使用个人浏览器配置。', '领卡浏览器')} <button type="button" class="btn proxy-small-button" id="s-browser-install" disabled>检测中…</button></span></div><input id="s-browser-path" value="${esc(captcha.browser_path)}" placeholder="自动检测 Chromium / Chrome / Edge"><small id="s-browser-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></div>
-          <label class="f"><span>Playwright 驱动目录 ${infoTip('定时领卡必需；手动领卡选择真实浏览器时也使用此驱动。可填写 playwright-core、playwright 包目录，或包含它的 node_modules / 项目目录。留空自动检测，指定后只使用该目录。', 'Playwright 搜索路径')}</span><input id="s-playwright-path" value="${esc(captcha.playwright_path)}" placeholder="自动检测，或填写已有 Playwright 目录"><small id="s-playwright-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
-        </div></div>
-        <div class="settings-subsection"><h3>通用设置</h3><div class="settings-fields">
-          <label class="f"><span>Node.js 可执行文件 ${infoTip('模型推理验证、定时领卡和手动领卡的服务端验证均需要 Node.js 18 或以上版本。', 'Node.js 依赖')}</span><input id="s-captcha-node" value="${esc(captcha.node_path)}" placeholder="node"><small id="s-node-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
-          <label class="f">验证超时（毫秒）<input id="s-captcha-timeout" type="number" min="5000" max="120000" step="1" required value="${captcha.timeout_ms}"></label>
-          <label class="f"><span>jsdom 票据预取有效期（毫秒） ${infoTip('仅用于模型推理和手动领卡的 jsdom 验证；连续验证成功后按需预取。真实浏览器按需取票，不使用预取。设为 0 关闭预取。', '票据预取')}</span><input id="s-captcha-ttl" type="number" min="0" max="90000" step="1" required value="${captcha.ticket_ttl_ms}"></label>
-        </div></div>
-      </div></div></details>
-      <details class="settings-section formcard" id="proxy-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>出站代理</strong></span><span class="pill" id="s-proxy-summary">${proxy.enabled ? '已启用' : '未启用'}</span></summary>
-      <div class="settings-panel settings-section-body"><div class="network-settings-fields">
-        <div class="settings-fields"><label class="settings-check"><input id="s-proxy-enabled" type="checkbox" ${proxy.enabled ? 'checked' : ''}><span>启用全局代理<small>关闭后全局使用直连</small></span></label>
-          <label class="f">代理来源<select id="s-proxy-source"><option value="manual">HTTP / HTTPS 地址列表</option><option value="subscription">节点订阅（需要 Mihomo）</option></select></label></div>
-        <div id="proxy-manual-fields"><label class="f">代理地址（每行一个）<textarea id="s-proxy-urls" class="code-input" rows="3" spellcheck="false" placeholder="http://127.0.0.1:7890&#10;http://user:password@proxy.example:8080">${esc(proxy.urls.join('\n'))}</textarea><small>仅支持 HTTP/HTTPS 代理；订阅链接请切换到“节点订阅”。</small></label></div>
-        <div id="proxy-subscription-fields" class="network-settings-fields">
-          <label class="f">HTTPS 订阅地址<input id="s-proxy-subscription" type="text" autocomplete="off" spellcheck="false" value="${esc(proxy.subscription_url)}" placeholder="https://provider.example/subscribe?token=…"><small>支持 VLESS TCP/WS、Hysteria2、HTTP/HTTPS，最多 64 个节点。</small></label>
-          <div class="settings-fields"><div class="mihomo-field"><div class="mihomo-field-heading"><label for="s-proxy-mihomo">Mihomo 可执行文件</label><span class="mihomo-field-actions"><a class="text-action" href="https://github.com/MetaCubeX/mihomo/releases/tag/v1.19.33" target="_blank" rel="noopener noreferrer">手动下载</a><button type="button" class="btn proxy-small-button" id="s-mihomo-install" ${mihomo.installed || mihomo.supported === false ? 'disabled' : ''} title="${esc(mihomoTarget ? `安装到服务端 ${mihomoTarget}` : '安装 Mihomo')}">${mihomo.installed ? '已安装' : '安装 Mihomo'}</button></span></div><input id="s-proxy-mihomo" value="${esc(proxy.mihomo_path)}" placeholder="mihomo"><small id="s-mihomo-status" role="status" aria-live="polite">${mihomo.installed ? '已检测到可执行文件' : mihomo.supported === false ? '当前平台请手动安装 Mihomo' : mihomo.unavailable ? '暂时无法检测安装状态' : '可填写已有路径或点击安装'}</small></div>
-            <label class="f"><span class="proxy-field-heading">订阅刷新间隔（秒）</span><input id="s-proxy-refresh" type="number" min="60" max="86400" step="1" value="${proxy.refresh_interval_sec}"></label></div>
-        </div>
-        <input id="s-proxy-node" type="hidden" value="${esc(proxy.preferred_node)}">
-        <section class="proxy-node-box" id="proxy-node-box" aria-labelledby="s-proxy-nodes-heading"><div class="proxy-node-heading"><h3 id="s-proxy-nodes-heading">代理节点</h3><span id="s-proxy-node-count">未加载</span></div><div class="proxy-node-content">
-          <div class="proxy-test-actions"><small id="s-proxy-node-status" role="status" aria-live="polite">加载节点后可指定代理，选择后保存生效。</small><button type="button" class="btn proxy-small-button" id="s-proxy-load">加载节点</button></div>
-          <div id="s-proxy-nodes" class="proxy-node-list" role="radiogroup" aria-label="使用的代理节点"></div>
-        </div></section>
-        <div class="proxy-test-actions"><button type="button" class="btn" id="s-proxy-test">检测当前代理配置</button></div>
-        <div id="s-proxy-result" class="proxy-test-results hidden" role="status" aria-live="polite"></div>
-      </div></div></details>
-      <details class="settings-section formcard" id="gateway-panel"><summary class="settings-section-summary disclosure-heading"><span><strong>网关与模型</strong></span></summary>
-      <div class="settings-panel settings-section-body settings-section-content"><div class="network-settings-fields">
-        <label class="f">默认思考强度<select id="s-level" required aria-describedby="s-level-hint"><option value="low">低（low）</option><option value="high">高（high）</option><option value="max">最高（max）</option></select><small id="s-level-hint">优先级：客户端 → 密钥 → 此处设置。低强度仍开启思考；客户端关闭思考时不覆盖。始终思考的模型可能返回 1210，请在客户端开启思考。</small></label>
-        <div class="settings-subsection"><div class="advanced-fields">
-          <div class="settings-fields settings-version-schedule">
-            <div class="settings-version-actions">
-              <label class="settings-check" title="按设置间隔检查官方稳定版，同时更新推理、额度与领卡版本；获取失败时保留当前版本。关闭后可手动设置。"><input id="s-zcode-version-auto" type="checkbox" ${s.zcode_version_auto_update ? 'checked' : ''}><span>自动跟随 ZCode 稳定版</span></label>
-              <button type="button" class="btn proxy-small-button" id="s-zcode-version-sync">立即同步</button>
-            </div>
-            <div class="field-group f"><label for="s-zcode-version-interval">版本检查间隔</label><div class="settings-version-interval" title="从上次检查时间起计算，保存后立即生效；重启不会重复检查。"><input id="s-zcode-version-interval" type="number" min="1" step="any" required value="${versionIntervalSeconds / versionIntervalUnit}"><select id="s-zcode-version-unit" aria-label="版本检查间隔单位"><option value="60">分钟</option><option value="3600">小时</option><option value="86400">天</option></select></div></div>
-          </div>
-          <div class="settings-fields">
-            <label class="f">额度与领卡 API 版本<input id="s-ver" value="${esc(s.app_version)}" pattern="[0-9]+\\.[0-9]+\\.[0-9]+" title="请输入三段数字版本，例如 3.17.2" required><small>用于管理请求的版本标识，不改变设备指纹或上游验证规则。</small></label>
-            <label class="f">推理 API 版本<input id="s-http-version" value="${esc(s.http.client_version || '3.17.2')}" pattern="[0-9]+\\.[0-9]+\\.[0-9]+" title="请输入三段数字版本，例如 3.17.2" required><small>对应 http.client_version，仅调整推理请求的版本标识。</small></label>
-          </div>
-          <div class="settings-code-grid">
-            <div class="code-field"><label class="f" for="s-aliases">模型别名（JSON 对象）</label><textarea id="s-aliases" class="code-input" spellcheck="false" rows="6" aria-describedby="s-aliases-hint">${esc(JSON.stringify(s.aliases, null, 2))}</textarea><p id="s-aliases-hint" class="json-hint" data-for="s-aliases" aria-live="polite"></p></div>
-            <div class="code-field"><label class="f" for="s-retry">重试参数（JSON 对象）</label><textarea id="s-retry" class="code-input" spellcheck="false" rows="6" aria-describedby="s-retry-hint">${esc(JSON.stringify(s.retry, null, 2))}</textarea><p id="s-retry-hint" class="json-hint" data-for="s-retry" aria-live="polite"></p></div>
-            <div class="code-field code-field-wide"><label class="f" for="s-http">HTTP 超时（JSON 对象，毫秒）<small>total_timeout_ms 为 0 表示不限制整轮时长；client_version 使用上方“推理 API 版本”设置。</small></label><textarea id="s-http" class="code-input" spellcheck="false" rows="5" aria-describedby="s-http-hint">${esc(JSON.stringify(httpParams, null, 2))}</textarea><p id="s-http-hint" class="json-hint" data-for="s-http" aria-live="polite"></p></div>
-          </div>
-        </div></div></div></div></details>
-    </form>`;
-  const form = $('#settings-form'), save = $('#s-save'), status = $('#settings-state');
-  void mountSettingsUpdate(main);
-  const captchaTTLField = $('#s-captcha-ttl');
-  const validateCaptchaTTL = () => {
-    const value = Number(captchaTTLField.value);
-    captchaTTLField.setCustomValidity(value === 0 || (Number.isInteger(value) && value >= 30000 && value <= 90000) ? '' : '请输入 0（关闭预取）或 30000 到 90000 的整数');
-  };
-  captchaTTLField.addEventListener('input', validateCaptchaTTL);
-  $('#s-level').value = s.default_reasoning_level || 'low';
-  $('#s-template-mode').value = s.zcode_template_mode || 'main';
-  for (const [key, id] of Object.entries(subagentFields)) $('#' + id).checked = !!s[key];
-  const syncTemplateFields = () => {
-    const subagent = $('#s-template-mode').value === 'subagent', insert = subagent && $('#s-subagent-insert').checked, editor = $('#s-subagent-template');
-    $('#s-subagent-options').hidden = !subagent;
-    for (const id of Object.values(subagentFields)) $('#' + id).disabled = !subagent;
-    $('#s-template-custom-fields').hidden = !insert;
-    editor.disabled = !insert;
-    editor.setCustomValidity(insert && new TextEncoder().encode(editor.value).length > 262144 ? '自定义插入内容不能超过 256 KiB' : '');
-  };
-  $('#s-captcha-mode').value = captcha.mode;
-  $('#s-claim-runtime').value = captcha.claim_runtime;
-  $('#s-proxy-source').value = proxy.source;
-  const versionAuto = $('#s-zcode-version-auto'), versionSync = $('#s-zcode-version-sync');
-  const versionInterval = $('#s-zcode-version-interval'), versionUnit = $('#s-zcode-version-unit');
-  versionUnit.value = String(versionIntervalUnit);
-  let versionSyncing = false;
-  const syncVersionFields = () => {
-    const automatic = versionAuto.checked;
-    $('#s-ver').disabled = automatic; $('#s-http-version').disabled = automatic;
-    const unit = Number(versionUnit.value);
-    versionInterval.min = String(60 / unit); versionInterval.max = String(31536000 / unit);
-    syncSelect(versionUnit);
-    versionSync.disabled = !automatic || !s.zcode_version_auto_update || settingsDirty || settingsSaving || versionSyncing;
-    const checked = s.zcode_version_status?.checked_at;
-    versionSync.title = s.zcode_version_status?.error || (checked ? '最近检查：' + new Date(checked).toLocaleString() + '\n下次检查：' + new Date(Number(checked) + (Number(s.zcode_version_check_interval_sec) || 432000) * 1000).toLocaleString() : '查询 ZCode 官方稳定版清单');
-  };
-  const captchaFields = { mode: 's-captcha-mode', claim_runtime: 's-claim-runtime', playwright_path: 's-playwright-path', browser_path: 's-browser-path', timeout_ms: 's-captcha-timeout', simulate_canvas_webgl: 's-captcha-canvas', node_path: 's-captcha-node', jsdom_path: 's-captcha-jsdom', ticket_ttl_ms: 's-captcha-ttl' };
-  const ids = ['s-poll', 's-jitter', 's-conc', 's-level', 's-template-mode', 's-subagent-template', ...Object.values(subagentFields), 's-ver', 's-http-version', 's-zcode-version-auto', 's-zcode-version-interval', 's-zcode-version-unit', 's-aliases', 's-retry', 's-http', ...Object.values(captchaFields), 's-proxy-enabled', 's-proxy-source', 's-proxy-urls', 's-proxy-subscription', 's-proxy-node', 's-proxy-mihomo', 's-proxy-refresh'];
-  const fields = ids.map(id => $('#' + id));
-  const values = () => Object.fromEntries(fields.map(input => [input.id, input.type === 'checkbox' ? input.checked : input.value]));
-  const apply = data => fields.forEach(input => { if (Object.hasOwn(data, input.id)) { if (input.type === 'checkbox') input.checked = !!data[input.id]; else input.value = data[input.id]; syncSelect(input); } });
-  const captchaValues = data => Object.fromEntries(Object.entries(captchaFields).map(([key, id]) => {
-    let value = data[id];
-    if (key.endsWith('_path')) value = value.trim() || (key === 'node_path' ? 'node' : '');
-    else if (key.endsWith('_ms')) value = Number(value);
-    return [key, value];
-  }));
-  let fingerprint = JSON.stringify(values()), savedAt = '';
-  const draftKey = 'z2a_settings_draft';
-  const updateDirty = () => {
-    settingsDirty = JSON.stringify(values()) !== fingerprint;
-    save.disabled = !settingsDirty || settingsSaving;
-    save.textContent = settingsSaving ? '正在保存…' : savedAt && !settingsDirty ? '已保存' : '保存设置';
-    save.setAttribute('aria-busy', String(settingsSaving));
-    status.textContent = settingsSaving ? '正在保存…' : settingsDirty ? '有未保存修改 · 普通参数草稿已保留' : savedAt || '所有设置已保存';
-    try { if (settingsDirty) { const draft = values(); delete draft['s-proxy-urls']; delete draft['s-proxy-subscription']; sessionStorage.setItem(draftKey, JSON.stringify(draft)); } else sessionStorage.removeItem(draftKey); }
-    catch { if (settingsDirty) status.textContent = '有未保存修改 · 浏览器暂时无法保存草稿，请及时保存'; }
-    save.title = status.textContent;
-    syncVersionFields();
-  };
-  versionSync.addEventListener('click', async () => {
-    if (versionSync.disabled) return;
-    versionSyncing = true; btnLoading(versionSync, true); syncVersionFields();
-    try {
-      const response = await api('/api/settings/zcode-version/sync', { method: 'POST', body: {} });
-      if (response.ok === false) throw new Error(response.error || '同步失败');
-      if (!form.isConnected) return;
-      s.app_version = response.app_version; s.http.client_version = response.client_version; s.zcode_version_status = response.status;
-      if (versionAuto.checked) { $('#s-ver').value = response.app_version; $('#s-http-version').value = response.client_version; }
-      const saved = JSON.parse(fingerprint);
-      saved['s-ver'] = response.app_version; saved['s-http-version'] = response.client_version;
-      fingerprint = JSON.stringify(saved);
-      toast('已同步 ZCode ' + response.app_version, 'ok');
-    } catch (error) { if (form.isConnected) toast('版本同步失败：' + error.message, 'err'); }
-    finally { versionSyncing = false; if (form.isConnected) { btnLoading(versionSync, false); updateDirty(); } }
-  });
-  try {
-    const draft = JSON.parse(sessionStorage.getItem(draftKey) || 'null');
-    if (draft && typeof draft === 'object' && !Array.isArray(draft)) {
-      if (draft['s-template-mode'] === 'subagent_custom') {
-        draft['s-template-mode'] = 'subagent';
-        for (const id of Object.values(subagentFields)) if (!Object.hasOwn(draft, id)) draft[id] = true;
-      }
-      try {
-        const oldHttp = JSON.parse(draft['s-http']);
-        if (oldHttp && Object.hasOwn(oldHttp, 'client_version') && !Object.hasOwn(draft, 's-http-version')) {
-          draft['s-http-version'] = String(oldHttp.client_version); delete oldHttp.client_version; draft['s-http'] = JSON.stringify(oldHttp, null, 2);
-        }
-        if (oldHttp?.captcha) {
-          for (const [field, id] of Object.entries(captchaFields)) {
-            if (Object.hasOwn(oldHttp.captcha, field) && !Object.hasOwn(draft, id)) draft[id] = oldHttp.captcha[field];
-          }
-          delete oldHttp.captcha; draft['s-http'] = JSON.stringify(oldHttp, null, 2);
-        }
-      } catch { }
-      apply(draft);
-    }
-  } catch { }
-  const validateJSON = () => {
-    let valid = true;
-    for (const id of ['s-aliases', 's-retry', 's-http']) {
-      const box = $('#' + id), hint = $(`.json-hint[data-for="${id}"]`);
-      try {
-        const parsed = JSON.parse(box.value);
-        if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('请输入 JSON 对象，而非数组或其他值');
-        if (id === 's-http' && Object.hasOwn(parsed, 'client_version')) throw new Error('请在上方“推理 API 版本”字段设置 client_version，并从此处移除该键');
-        if (id === 's-http' && Object.hasOwn(parsed, 'captcha')) throw new Error('请在上方“上游安全验证”设置验证码，并从此处移除 captcha');
-        box.classList.remove('invalid'); box.setAttribute('aria-invalid', 'false'); hint.textContent = ''; hint.classList.remove('error');
-      } catch (error) {
-        valid = false; box.classList.add('invalid'); box.setAttribute('aria-invalid', 'true'); hint.textContent = '配置格式错误：' + error.message; hint.classList.add('error');
-      }
-    }
-    return valid;
-  };
-  const outboundValues = (data = values()) => ({ enabled: data['s-proxy-enabled'], source: data['s-proxy-source'], urls: [...new Set(data['s-proxy-urls'].split(/\r?\n/).map(x => x.trim()).filter(Boolean))], subscription_url: data['s-proxy-subscription'].trim(), subscription_filter: '', preferred_node: data['s-proxy-node'], mihomo_path: data['s-proxy-mihomo'].trim() || 'mihomo', refresh_interval_sec: Number(data['s-proxy-refresh']) || 3600 });
-  const runtimeFields = { node: $('#s-node-status'), jsdom: $('#s-jsdom-status'), playwright: $('#s-playwright-status'), browser: $('#s-browser-status') };
-  const browserInstall = $('#s-browser-install');
-  const claimBrowserStatus = $('#s-claim-browser-status');
-  const captchaPathIDs = Object.entries(captchaFields).filter(([key]) => key.endsWith('_path')).map(([, id]) => id);
-  const captchaRuntimePaths = () => Object.fromEntries(Object.entries(captchaValues(values())).filter(([key]) => key.endsWith('_path')));
-  let captchaRuntimeRequest = 0, captchaRuntimeTimer, browserInstalling = false, lastRuntime = null;
-  const runtimePending = () => {
-    browserInstall.disabled = true; lastRuntime = null;
-    claimBrowserStatus.textContent = '正在检测浏览器依赖…'; claimBrowserStatus.classList.remove('warn-text');
-    Object.values(runtimeFields).forEach(note => { note.textContent = '检测中…'; note.classList.remove('ok-text', 'warn-text'); note.title = ''; });
-  };
-  const checkCaptchaRuntime = async () => {
-    clearTimeout(captchaRuntimeTimer);
-    if (!form.isConnected || browserInstalling) return;
-    const paths = captchaRuntimePaths(), snapshot = JSON.stringify(paths), request = ++captchaRuntimeRequest;
-    runtimePending();
-    try {
-      const info = await api('/api/settings/captcha/runtime?' + new URLSearchParams(paths));
-      if (!form.isConnected || request !== captchaRuntimeRequest || snapshot !== JSON.stringify(captchaRuntimePaths())) return;
-      if (info.ok === false) throw new Error(info.error || '检测失败');
-      for (const [key, note] of Object.entries(runtimeFields)) {
-        const state = info[key] || {};
-        note.textContent = state.available ? `${key === 'browser' ? '已找到 · ' + state.path.split(/[/\\]/).at(-1) : '可用'}${state.version ? ' · ' + (key === 'node' ? 'v' : '') + state.version : ''}` : state.message || '不可用';
-        note.title = state.path || ''; note.classList.toggle('ok-text', !!state.available); note.classList.toggle('warn-text', !state.available);
-      }
-      lastRuntime = info;
-      const missing = [['node', 'Node.js 18+'], ['playwright', 'Playwright 驱动'], ['browser', 'Chromium / Chrome / Edge']].filter(([key]) => !info[key]?.available).map(([, name]) => name);
-      claimBrowserStatus.textContent = missing.length ? '定时领卡无法运行：请配置 ' + missing.join('、') : '浏览器依赖已找到，执行时检查能否启动';
-      claimBrowserStatus.classList.toggle('warn-text', missing.length > 0);
-      browserInstall.disabled = !!info.browser_ready || !info.install_available || (!!paths.playwright_path && !info.playwright?.available) || (!!paths.browser_path && !info.browser?.installed);
-      browserInstall.textContent = info.browser_ready ? '依赖已找到' : info.browser?.installed ? '安装 Playwright' : '安装浏览器与驱动';
-    } catch (error) {
-      if (form.isConnected && request === captchaRuntimeRequest) {
-        Object.values(runtimeFields).forEach(note => { note.textContent = '检测失败'; note.title = error.message; note.classList.add('warn-text'); });
-        claimBrowserStatus.textContent = '依赖检测失败，请重新展开此面板'; claimBrowserStatus.classList.add('warn-text');
-      }
-    }
-  };
-  browserInstall.addEventListener('click', async () => {
-    if (browserInstall.disabled || !lastRuntime || browserInstalling) return;
-    const paths = captchaRuntimePaths(), snapshot = JSON.stringify(paths), installBrowser = !lastRuntime.browser?.installed;
-    const message = installBrowser
-      ? '将在服务端下载 Chromium 无头浏览器及缺失的 Playwright 驱动，占用磁盘空间；下载文件会保留，不自动安装系统依赖。是否安装？'
-      : '已找到现有浏览器，仅在服务端安装 Playwright 驱动，占用少量磁盘空间。是否安装？';
-    if (!await confirmAction('安装浏览器运行时', message, '安装', false) || !form.isConnected || snapshot !== JSON.stringify(captchaRuntimePaths())) return;
-    browserInstalling = true; captchaRuntimeRequest++; clearTimeout(captchaRuntimeTimer);
-    browserInstall.disabled = true; btnLoading(browserInstall, true); browserInstall.textContent = '安装中…';
-    runtimeFields.browser.textContent = installBrowser ? '正在安装 Chromium…' : '正在安装 Playwright 驱动…';
-    try {
-      const response = await api('/api/settings/captcha/browser/install', { method: 'POST', body: { ...paths, install_browser: installBrowser } });
-      if (response.ok === false) throw new Error(response.error || '安装失败');
-      if (form.isConnected) toast(response.browser_ready ? '浏览器运行时已安装' : '驱动已安装，仍需配置浏览器', 'ok');
-    } catch (error) { if (form.isConnected) toast(error.message, 'err'); }
-    finally { browserInstalling = false; btnLoading(browserInstall, false); if (form.isConnected) void checkCaptchaRuntime(); }
-  });
-  $('#captcha-panel').addEventListener('toggle', e => { if (form.isConnected && e.currentTarget.open) void checkCaptchaRuntime(); });
-  const mihomoField = $('#s-proxy-mihomo'), mihomoButton = $('#s-mihomo-install'), mihomoNote = $('#s-mihomo-status');
-  const mihomoPath = () => mihomoField.value.trim() || 'mihomo';
-  let mihomoRequest = 0, mihomoTimer, mihomoInstalling = false, lastMihomo = mihomo;
-  const showMihomoStatus = (info, note = '') => {
-    lastMihomo = info;
-    mihomoButton.disabled = mihomoInstalling || !!info.installed || info.supported === false;
-    mihomoButton.textContent = info.installed ? '已检测到' : '安装 Mihomo';
-    mihomoNote.textContent = note || (info.unavailable ? '暂时无法检测 Mihomo，请稍后重新展开代理面板。' : info.installed ? `已检测到可执行文件${info.path ? '：' + info.path : ''}` : info.supported === false ? '未找到 Mihomo，当前平台请手动安装。' : '未找到 Mihomo，可填写已有路径或点击安装。');
-  };
-  const checkMihomo = async () => {
-    clearTimeout(mihomoTimer);
-    if (!form.isConnected || mihomoInstalling) return;
-    const path = mihomoPath(), request = ++mihomoRequest;
-    mihomoButton.disabled = true; mihomoButton.textContent = '检测中…'; mihomoNote.textContent = '正在检测 Mihomo 是否存在…';
-    try {
-      const info = await api('/api/settings/proxy/mihomo?path=' + encodeURIComponent(path));
-      if (!form.isConnected || request !== mihomoRequest || path !== mihomoPath()) return;
-      if (info.ok === false) throw new Error(info.error || '检测失败');
-      showMihomoStatus(info);
-    } catch (error) {
-      if (form.isConnected && request === mihomoRequest && path === mihomoPath()) showMihomoStatus({ ...mihomo, installed: false, unavailable: true }, '检测失败：' + error.message);
-    }
-  };
-  showMihomoStatus(mihomo);
-  $('#proxy-panel').addEventListener('toggle', e => { if (form.isConnected && e.currentTarget.open && form.querySelector('#s-proxy-source').value === 'subscription') void checkMihomo(); });
-  let proxyNodes = [], nodeRequest = 0;
-  const nodeSource = () => { const p = outboundValues(); return JSON.stringify([p.source, p.urls, p.subscription_url]); };
-  const renderProxyNodes = () => {
-    const selected = $('#s-proxy-node').value;
-    $('#s-proxy-nodes').innerHTML = `<label class="proxy-node-option"><input type="radio" name="proxy-node" value="" ${!selected ? 'checked' : ''}><span><strong>自动选择</strong><small>从可用节点中选择，正常时保持使用</small></span></label>` + proxyNodes.map(node => `<label class="proxy-node-option ${node.unavailable || node.blocked ? 'unavailable' : ''}"><input type="radio" name="proxy-node" value="${esc(node.id)}" ${selected === node.id ? 'checked' : ''} ${node.unavailable || node.blocked ? 'disabled' : ''}><span><strong>${esc(node.name)}</strong><small>${esc(node.protocol || 'HTTP / HTTPS')}</small></span>${node.current ? '<span class="proxy-node-badge current">使用中</span>' : node.unavailable ? '<span class="proxy-node-badge">连接故障</span>' : node.blocked ? '<span class="proxy-node-badge">上游拦截</span>' : ''}</label>`).join('');
-    $('#s-proxy-node-count').textContent = proxyNodes.length ? `${proxyNodes.length} 个节点` : '暂无节点';
-  };
-  const loadProxyNodes = async () => {
-    const button = $('#s-proxy-load'), status = $('#s-proxy-node-status'), options = outboundValues(), source = nodeSource(), request = ++nodeRequest;
-    button.disabled = true; btnLoading(button, true); status.textContent = '正在加载节点…';
-    try {
-      const response = await api('/api/settings/proxy/nodes', { method: 'POST', body: { outbound_proxy: options } });
-      if (!form.isConnected || request !== nodeRequest) return;
-      if (response.ok === false) throw new Error(response.error || '加载失败');
-      if (source !== nodeSource()) { status.textContent = '配置已修改，请重新加载节点。'; return; }
-      proxyNodes = response.nodes || []; renderProxyNodes(); button.textContent = '刷新节点';
-      status.textContent = $('#s-proxy-node').value && !proxyNodes.some(node => node.id === $('#s-proxy-node').value) ? '指定节点已不在列表中，将使用其他可用节点。' : proxyNodes.length ? '保存后生效；网关拦截或连接故障时切换，账号风控拒绝不切换代理。' : '请先填写代理地址或有效的订阅地址。';
-    } catch (error) { if (request === nodeRequest && form.isConnected) status.textContent = '加载失败：' + error.message; }
-    finally { if (request === nodeRequest) { button.disabled = false; btnLoading(button, false); } }
-  };
-  renderProxyNodes();
-  $('#s-proxy-load').addEventListener('click', loadProxyNodes);
-  $('#s-proxy-nodes').addEventListener('change', e => {
-    if (e.target.name !== 'proxy-node') return;
-    $('#s-proxy-node').value = e.target.value; updateDirty();
-    $('#s-proxy-node-status').textContent = '节点选择已修改，请保存设置。';
-    $('#s-proxy-result').classList.add('hidden');
-  });
-  const captchaModeHints = {
-    off: '仅关闭模型推理验证，不关闭领卡验证。',
-    auto: '按上游要求使用 jsdom 验证，不影响领卡。',
-    always: '上游启用验证时，每次模型推理前用 jsdom 取票。',
-  };
-  const syncNetworkFields = () => {
-    $('#s-captcha-mode-hint').textContent = captchaModeHints[$('#s-captcha-mode').value] || '';
-    const subscription = $('#s-proxy-source').value === 'subscription', enabled = $('#s-proxy-enabled').checked;
-    $('#proxy-manual-fields').hidden = subscription;
-    $('#proxy-subscription-fields').hidden = !subscription;
-    $('#s-proxy-urls').required = enabled && !subscription;
-    $('#s-proxy-urls').disabled = subscription;
-    for (const id of ['s-proxy-subscription', 's-proxy-mihomo', 's-proxy-refresh']) $('#' + id).disabled = !subscription;
-    $('#s-proxy-subscription').required = enabled && subscription;
-    $('#s-proxy-refresh').required = subscription;
-    $('#s-proxy-summary').textContent = enabled ? '已启用' : '未启用';
-  };
-  const resetProxyNodeSelection = () => {
-    $('#s-proxy-node').value = ''; proxyNodes = []; renderProxyNodes();
-    $('#s-proxy-node-status').textContent = '配置已修改，请加载节点后选择。';
-  };
-  form.addEventListener('input', e => { if (ids.includes(e.target.id)) {
-    if (['s-proxy-urls', 's-proxy-subscription'].includes(e.target.id)) resetProxyNodeSelection();
-    if (e.target.id === 's-proxy-mihomo') {
-      clearTimeout(mihomoTimer); mihomoRequest++;
-      if (!mihomoInstalling) { mihomoButton.disabled = true; mihomoNote.textContent = '正在检测 Mihomo 是否存在…'; mihomoTimer = setTimeout(checkMihomo, 250); }
-    }
-    if (captchaPathIDs.includes(e.target.id)) {
-      clearTimeout(captchaRuntimeTimer); captchaRuntimeRequest++; runtimePending(); captchaRuntimeTimer = setTimeout(checkCaptchaRuntime, 250);
-    }
-    validateJSON(); syncTemplateFields(); syncNetworkFields(); updateDirty(); if (e.target.id.startsWith('s-proxy-')) $('#s-proxy-result').classList.add('hidden');
-  } });
-  form.addEventListener('change', e => { if (ids.includes(e.target.id)) {
-    if (e.target.id === 's-proxy-source') { resetProxyNodeSelection(); $('#s-proxy-result').classList.add('hidden'); if ($('#s-proxy-source').value === 'subscription') void checkMihomo(); }
-    if (e.target.id === 's-proxy-mihomo') void checkMihomo();
-    if (captchaPathIDs.includes(e.target.id) || e.target.id === captchaFields.claim_runtime) void checkCaptchaRuntime();
-    syncTemplateFields(); syncNetworkFields(); updateDirty();
-  } });
-  $('#s-mihomo-install').addEventListener('click', async () => {
-    const button = $('#s-mihomo-install'), result = $('#s-mihomo-status');
-    clearTimeout(mihomoTimer); mihomoRequest++; mihomoInstalling = true;
-    const originalPath = mihomoField.value;
-    button.disabled = true; btnLoading(button, true); result.textContent = '正在下载并校验 Mihomo，最长约 3 分钟…';
-    let installed = false, note = '';
-    try {
-      const response = await api('/api/settings/proxy/mihomo/install', { method: 'POST', body: {} });
-      if (response.ok === false || !response.path) throw new Error(response.error || '安装失败');
-      installed = true;
-      if (!form.isConnected) return;
-      if (mihomoField.value !== originalPath) return;
-      mihomoField.value = response.path;
-      $('#s-proxy-result').classList.add('hidden');
-      updateDirty();
-      lastMihomo = { ...mihomo, ...response, installed: true };
-      note = `已安装 ${response.version}，路径已填入，请保存设置。`;
-    } catch (error) { note = '安装失败：' + error.message; }
-    finally {
-      mihomoInstalling = false; btnLoading(button, false);
-      const changedPath = installed ? mihomoField.value !== lastMihomo.path : mihomoField.value !== originalPath;
-      if (changedPath) void checkMihomo();
-      else showMihomoStatus(lastMihomo, note);
-    }
-  });
-  $('#s-proxy-test').addEventListener('click', async () => {
-    const button = $('#s-proxy-test'), result = $('#s-proxy-result'), options = outboundValues(), tested = JSON.stringify(options);
-    button.disabled = true; btnLoading(button, true); result.classList.remove('hidden'); result.textContent = '正在连接并检测出口，请稍候…';
-    try {
-      const response = await api('/api/settings/proxy/test', { method: 'POST', body: { outbound_proxy: options } });
-      if (tested !== JSON.stringify(outboundValues())) { result.textContent = '配置已修改，请重新检测。'; return; }
-      const rows = response.results || [], reachable = rows.filter(row => row.reachable).length;
-      result.innerHTML = `<details class="proxy-test-details"><summary class="disclosure-heading"><strong>检测结果</strong><span>${rows.length} 个节点 · 可达 ${reachable} · 失败 ${rows.length - reachable}</span></summary><div class="proxy-test-body"><ul>${rows.map(row => `<li><strong>${esc(row.name)}</strong><span class="${row.reachable ? 'ok-text' : 'warn-text'}">${esc(row.reachable ? '出口可达' : row.message)}${row.status ? ` · HTTP ${Number(row.status)}` : ''} · ${Number(row.elapsed_ms)} ms</span></li>`).join('')}</ul></div></details>`;
-    } catch (error) { result.textContent = '检测失败：' + error.message; }
-    finally { button.disabled = false; btnLoading(button, false); }
-  });
-  validateJSON(); validateCaptchaTTL(); syncTemplateFields(); syncNetworkFields(); updateDirty();
-  void checkCaptchaRuntime();
-  if (mihomoPath() !== (proxy.mihomo_path.trim() || 'mihomo')) void checkMihomo();
-  const initialProxy = outboundValues();
-  if (initialProxy.source === 'subscription' ? initialProxy.subscription_url : initialProxy.urls.length) void loadProxyNodes();
-  form.addEventListener('submit', async e => {
-    e.preventDefault();
-    if (settingsSaving || !settingsDirty) return;
-    const error = $('#settings-error'); error.classList.add('hidden');
-    if (!validateJSON()) {
-      const invalid = $('.invalid', form), panel = invalid?.closest('details');
-      if (panel) panel.open = true;
-      invalid?.focus(); return;
-    }
-    const invalidField = form.querySelector(':invalid');
-    for (let section = invalidField?.closest('details'); section; section = section.parentElement?.closest('details')) section.open = true;
-    if (!form.reportValidity()) return;
-    const submitted = values();
-    settingsSaving = true; btnLoading(save, true); updateDirty();
-    try {
-      const response = await api('/api/settings', { method: 'PUT', body: {
-        poll_interval_sec: Number(submitted['s-poll']), poll_jitter_sec: Number(submitted['s-jitter']), poll_concurrency: Number(submitted['s-conc']),
-        default_reasoning_level: submitted['s-level'], app_version: submitted['s-ver'], zcode_version_auto_update: submitted['s-zcode-version-auto'], zcode_version_check_interval_sec: Math.round(Number(submitted['s-zcode-version-interval']) * Number(submitted['s-zcode-version-unit'])),
-        zcode_template_mode: submitted['s-template-mode'], zcode_subagent_template: submitted['s-subagent-template'],
-        ...Object.fromEntries(Object.entries(subagentFields).map(([key, id]) => [key, submitted[id]])),
-        inference_driver: 'http', http: { ...JSON.parse(submitted['s-http']), client_version: submitted['s-http-version'], captcha: captchaValues(submitted) }, outbound_proxy: outboundValues(submitted), aliases: JSON.parse(submitted['s-aliases']), retry: JSON.parse(submitted['s-retry']),
-      } });
-      if (response.ok === false) throw new Error(response.error || '保存失败');
-      s.zcode_version_auto_update = submitted['s-zcode-version-auto'];
-      s.zcode_version_check_interval_sec = Math.round(Number(submitted['s-zcode-version-interval']) * Number(submitted['s-zcode-version-unit']));
-      fingerprint = JSON.stringify(submitted);
-      savedAt = '已保存并生效 · ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
-      toast('设置已保存并生效', 'ok');
-    } catch (err) { error.textContent = '保存失败，修改已保留：' + err.message; error.classList.remove('hidden'); }
-    finally { settingsSaving = false; btnLoading(save, false); updateDirty(); }
-  });
-}
-
 async function pageLogs(main, options = {}) {
   await Z2ALogs.render(main, { api, esc, icon, pagehead, fmtTime, fmtCompactTime, fmtInt, policyLabel, rerender: () => render({ swap: true }) }, options);
 }
@@ -1876,6 +1526,7 @@ async function boot() {
     if (session !== TOKEN || error.status === 401) return;
     $('#login-view').classList.add('hidden');
     $('#app-view').classList.remove('hidden');
+    renderNav();
     const notice = h(`<section class="page-error" role="alert">${icon('zap', 20)}<div><h2>暂时无法连接服务</h2><p>${esc(error.message)}</p></div><button type="button" class="btn" data-retry-session>${icon('refresh', 14)}重试</button></section>`);
     $('#main').replaceChildren(notice);
     $('[data-retry-session]', notice).addEventListener('click', () => boot());
@@ -1886,9 +1537,7 @@ async function boot() {
   restoreRoute(UI.readRoute(location.hash));
   syncRoute();
   renderNav();
-  const ports = `web:${RUNTIME.web_port} · gateway:${RUNTIME.gateway_port}`;
-  const pl2 = $('#ports-label2');
-  if (pl2) pl2.textContent = ports;
+  $('#ports-label').textContent = `Web ${RUNTIME.web_port} · 网关 ${RUNTIME.gateway_port}`;
   render();
   startOauthWatcher();
   if (window._refreshTimer) clearInterval(window._refreshTimer);

@@ -1,6 +1,6 @@
 'use strict';
 
-const dashboardChartLayout = { width: 1120, height: 306, left: 68, right: 66, top: 38, bottom: 256 };
+const dashboardChartLayout = { width: 1120, height: 282, left: 68, right: 66, top: 34, bottom: 235 };
 const dashboardChartColors = ['#ff4b16', '#ffbd0b', '#438cff', '#9470ed', '#25a887', '#ec7ba5'];
 const chartCoord = value => Number(value).toFixed(2);
 function dashboardChartMaximum(value) {
