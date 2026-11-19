@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	accountdata "zcode2api/internal/server/account"
 	captchasdk "zcode2api/internal/server/captcha"
@@ -54,7 +55,7 @@ type requestTiming struct {
 func newTiming() *requestTiming { return &requestTiming{start: time.Now()} }
 
 func (t *requestTiming) observe(e wire.Event) {
-	if !((e.Type == "text_delta" || e.Type == "reasoning_delta") && e.Text != "") && e.Type != "tool_start" {
+	if !e.HasText() && e.Type != "tool_start" {
 		return
 	}
 	v := time.Since(t.start).Milliseconds()
@@ -123,6 +124,46 @@ func requestMetadataUserID(deviceMid, session string) string {
 
 var errStopSSE = errors.New("message_stop")
 
+func watchStreamIdle(timeout time.Duration, cancel context.CancelCauseFunc) (func(), func()) {
+	if timeout <= 0 {
+		noop := func() {}
+		return noop, noop
+	}
+	var mu sync.Mutex
+	var timer *time.Timer
+	deadline := time.Now().Add(timeout)
+	mu.Lock()
+	timer = time.AfterFunc(timeout, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if deadline.IsZero() {
+			return
+		}
+		// A timer callback can run after fresh output has moved the deadline.
+		if remaining := time.Until(deadline); remaining > 0 {
+			timer.Reset(remaining)
+			return
+		}
+		deadline = time.Time{}
+		cancel(&fault.Failure{Kind: "timeout", Code: "stream_idle_timeout", Message: "上游长时间未返回有效内容"})
+	})
+	mu.Unlock()
+	progress := func() {
+		mu.Lock()
+		if now := time.Now(); now.Before(deadline) {
+			deadline = now.Add(timeout)
+		}
+		mu.Unlock()
+	}
+	stop := func() {
+		mu.Lock()
+		deadline = time.Time{}
+		timer.Stop()
+		mu.Unlock()
+	}
+	return progress, stop
+}
+
 func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions) (result *wire.Result, failure *fault.Failure) {
 	if o.Timing == nil {
 		o.Timing = newTiming()
@@ -141,7 +182,8 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 	}
 	timer("inference_timeout", "上游推理超时", shared.Ms(params["total_timeout_ms"]))
 	firstTimer := timer("first_token_timeout", "上游首字超时", shared.Ms(params["first_token_timeout_ms"]))
-	idle := timer("stream_idle_timeout", "上游流空闲超时", shared.Ms(params["idle_timeout_ms"]))
+	refreshIdle, stopIdle := watchStreamIdle(shared.Ms(params["idle_timeout_ms"]), cancel)
+	defer stopIdle()
 	var admission *time.Timer
 	if o.Admission > 0 {
 		admission = time.AfterFunc(o.Admission, func() {
@@ -154,11 +196,6 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 			t.Stop()
 		}
 	}()
-	resetIdle := func() {
-		if idle != nil {
-			idle.Reset(shared.Ms(params["idle_timeout_ms"]))
-		}
-	}
 	admitted := false
 	admit := func() {
 		if !admitted && o.OnAdmitted != nil {
@@ -207,6 +244,8 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		}
 		if cause, ok := context.Cause(ctx).(*fault.Failure); ok {
 			failure.Kind, failure.Code, failure.Message = cause.Kind, cause.Code, cause.Message
+			failure.Retryable = true
+			failure.Detail["kind"], failure.Detail["code"], failure.Detail["message"] = cause.Kind, cause.Code, cause.Message
 		}
 	}()
 	r := &wire.Result{Calls: []any{}, Usage: shared.M{}}
@@ -281,7 +320,7 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		if e != nil {
 			return nil, routing.TransportFailure(ctx, e)
 		}
-		resetIdle()
+		refreshIdle()
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			// Accepted requests use the first-token timeout. Error responses and
 			// verification retries must still fit within the admission budget.
@@ -323,6 +362,9 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 	defer res.Body.Close()
 	if !strings.Contains(res.Header.Get("Content-Type"), "text/event-stream") {
 		body, readError := io.ReadAll(io.LimitReader(res.Body, fault.FailureBodyLimit+1))
+		if len(body) == 0 && readError == nil {
+			return nil, &fault.Failure{Status: http.StatusBadGateway, Code: "upstream_empty_response", Message: "上游结束响应，但未返回任何内容"}
+		}
 		detail := shared.M{"body": fault.FailureBody(string(body))}
 		if readError != nil {
 			detail["read_error"] = fault.BoundedFailureText(readError.Error())
@@ -337,21 +379,28 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 	nativePending := []wire.Frame{}
 	pendingBytes := 0
 	nativeStarted, stopped := false, false
+	hasOutput := false
 	emit := func(ev wire.Event) error {
 		o.Timing.observe(ev)
-		if ((ev.Type == "text_delta" || ev.Type == "reasoning_delta") && ev.Text != "") || ev.Type == "tool_start" {
+		visibleOutput := ev.HasText() || ev.Type == "tool_start"
+		if visibleOutput || ev.Type == "tool_delta" && ev.Delta != "" || ev.Type == "tool_end" {
+			refreshIdle()
+		}
+		if visibleOutput {
 			admit()
 		}
 		if o.OnEvent == nil {
 			return nil
 		}
-		if (o.Protocol == "anthropic" && ev.Type == "native_event") || (o.Protocol != "anthropic" && (ev.Type == "tool_start" || ev.Type == "tool_delta" || (ev.Type == "text_delta" || ev.Type == "reasoning_delta") && ev.Text != "")) {
+		if ev.StartsStream(o.Protocol) {
 			committed = true
 		}
 		return o.OnEvent(ev)
 	}
 	e = wire.ReadSSE(res.Body, func(f wire.Frame) error {
-		resetIdle()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if f.Data == "" {
 			return nil
 		}
@@ -484,8 +533,32 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 			maps.Copy(usage, shared.Obj(event["usage"]))
 		}
 		if typ == "message_stop" {
+			if r.Native == nil {
+				return &fault.Failure{Status: http.StatusBadGateway, Code: "truncated_stream", Message: "上游事件流缺少 message_start"}
+			}
 			if len(open) > 0 {
 				return fault.ProviderFailure(shared.M{"message": "上游事件流提前结束，内容块未关闭"}, 502, "")
+			}
+			hasOutput = text.Len() > 0 || reasoning.Len() > 0 || len(r.Calls) > 0
+			if !hasOutput && o.Protocol == "anthropic" {
+				for _, block := range content {
+					switch shared.Str(block["type"]) {
+					case "", "text", "thinking", "tool_use":
+						continue
+					}
+					if len(block) > 1 {
+						hasOutput = true
+						break
+					}
+				}
+			}
+			if !hasOutput {
+				switch reason := shared.Str(r.Native["stop_reason"]); reason {
+				case "max_tokens", "stop_sequence", "refusal", "pause_turn":
+					// An explicit stop can legitimately end a turn without content.
+				default:
+					return &fault.Failure{Status: http.StatusBadGateway, Code: "upstream_empty_response", Message: "上游结束响应，但未返回任何内容", Detail: shared.M{"stop_reason": reason}}
+				}
 			}
 			stopped = true
 			admit()
@@ -520,7 +593,7 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 		}
 		return nil, &fault.Failure{Kind: "network", Code: "upstream_stream_error", Message: e.Error(), Retryable: true}
 	}
-	if !stopped || r.Native == nil {
+	if !stopped {
 		return nil, &fault.Failure{Status: 502, Code: "truncated_stream", Kind: "server", Message: "上游事件流提前结束，缺少 message_stop", Retryable: true}
 	}
 	indices := []int{}
@@ -535,6 +608,19 @@ func (a *App) inferHTTP(parent context.Context, account shared.M, o inferOptions
 	r.Native["content"], r.Native["usage"] = blocks, usage
 	r.Text, r.Reasoning = text.String(), reasoning.String()
 	r.FinishReason = shared.Str(r.Native["stop_reason"])
-	r.Usage = wire.NormalizeUsage(shared.Merge(usage, shared.M{"input_tokens": shared.Num(usage["input_tokens"]) + shared.Num(usage["cache_read_input_tokens"]) + shared.Num(usage["cache_creation_input_tokens"])}))
+	inputUsage := shared.First(usage["inputTokens"], usage["input_tokens"], usage["prompt_tokens"])
+	outputUsage := shared.First(usage["outputTokens"], usage["output_tokens"], usage["completion_tokens"])
+	if usage["input_tokens"] != nil || inputUsage == nil {
+		usage = shared.Merge(usage, shared.M{"input_tokens": shared.Num(usage["input_tokens"]) + shared.Num(usage["cache_read_input_tokens"]) + shared.Num(usage["cache_creation_input_tokens"])})
+	}
+	r.Usage = wire.NormalizeUsage(usage)
+	if hasOutput {
+		switch {
+		case inputUsage == nil || outputUsage == nil:
+			r.UsageWarning = "upstream_usage_missing"
+		case shared.Num(r.Usage["outputTokens"]) == 0:
+			r.UsageWarning = "upstream_usage_zero"
+		}
+	}
 	return r, nil
 }

@@ -75,6 +75,7 @@ let TOKEN = localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY)
 saveToken(TOKEN);
 let RUNTIME = null;
 let currentPage = 'dashboard';
+let keySecretDialog = null;
 const UI = globalThis.Z2AUI;
 let settingsDirty = false;
 let settingsSaving = false;
@@ -91,6 +92,7 @@ window.addEventListener('storage', event => {
   if (event.storageArea !== localStorage || (event.key !== TOKEN_KEY && event.key !== null)) return;
   const token = localStorage.getItem(TOKEN_KEY) || '';
   if (token === TOKEN) return;
+  keySecretDialog?.close();
   TOKEN = token;
   if (TOKEN) void boot();
   else showLogin();
@@ -112,7 +114,7 @@ async function api(path, { token = TOKEN, body, method = 'GET', reauthenticate =
       saveToken('');
       showLogin();
     }
-    throw Object.assign(new Error(data.error || data.msg || `HTTP ${res.status}`), { status: res.status });
+    throw Object.assign(new Error(data.error || data.msg || `HTTP ${res.status}`), { status: res.status, code: data.code });
   }
   return data;
 }
@@ -128,8 +130,14 @@ function toast(msg, type = '') {
 }
 
 async function copyText(text, success = '已复制', failure = '复制失败，请手动复制') {
-  try { await navigator.clipboard.writeText(text); toast(success, 'ok'); }
-  catch { toast(failure, 'err'); }
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(success, 'ok');
+    return true;
+  } catch {
+    if (failure) toast(failure, 'err');
+    return false;
+  }
 }
 
 let composing = false;
@@ -154,9 +162,11 @@ document.addEventListener('submit', (e) => {
 }, true);
 
 function showLogin() {
+  keySecretDialog?.close();
   $('#login-view').classList.remove('hidden');
   $('#app-view').classList.add('hidden');
 }
+window.addEventListener('pagehide', () => keySecretDialog?.close());
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const card = $('.login-card');
@@ -336,7 +346,6 @@ async function renderPage(opts = {}) {
   main.setAttribute('aria-busy', 'true');
   main.classList.toggle('no-anim', !!opts.swap);
   try {
-    if (currentPage !== 'logs') Z2ALogs.closeDetails();
     if (currentPage === 'dashboard') await pageDashboard(main);
     else if (currentPage === 'accounts') await pageAccounts();
     else if (currentPage === 'claims') await pageClaims(main);
@@ -366,7 +375,7 @@ async function renderPage(opts = {}) {
 }
 
 function enhanceTables(root) {
-  root.querySelectorAll('.tablecard:not(.account-table):not(.compact-account-table):not(.log-desktop) table').forEach(table => {
+  root.querySelectorAll('.tablecard:not(.account-table):not(.compact-account-table):not(.log-desktop):not(.group-table) table').forEach(table => {
     const headers = [...table.querySelectorAll('tr:first-child th')].map(th => th.textContent.trim());
     if (headers.length < 4) return;
     table.closest('.tablecard').classList.add('responsive-table');
@@ -385,7 +394,7 @@ function syncSelect(select) { selectControls.get(select)?.sync(); }
 // Both menus and hints stay inside the visible viewport, including short
 // windows and the on-screen keyboard. Dimensions come from the shared tokens.
 function positionFloatingPanel(panel, trigger, matchWidth = false) {
-  panel.style.width = panel.style.maxHeight = panel.style.maxWidth = '';
+  panel.style.width = panel.style.minWidth = panel.style.maxHeight = panel.style.maxWidth = '';
   const styles = getComputedStyle(panel), rect = trigger.getBoundingClientRect();
   const edge = parseFloat(styles.getPropertyValue('--popover-edge'));
   const gap = parseFloat(styles.getPropertyValue('--popover-gap'));
@@ -396,7 +405,9 @@ function positionFloatingPanel(panel, trigger, matchWidth = false) {
   const availableHeight = Math.max(0, height - edge * 2);
   const naturalWidth = panel.getBoundingClientRect().width;
   panel.style.maxWidth = `${availableWidth}px`;
-  panel.style.width = `${Math.min(availableWidth, matchWidth ? Math.max(rect.width, naturalWidth) : naturalWidth)}px`;
+  const preferredWidth = matchWidth === 'exact' ? rect.width : matchWidth ? Math.max(rect.width, naturalWidth) : naturalWidth;
+  if (matchWidth === 'exact') panel.style.minWidth = '0';
+  panel.style.width = `${Math.min(availableWidth, preferredWidth)}px`;
   const preferredHeight = panel.getBoundingClientRect().height;
   const below = Math.max(0, Math.min(availableHeight, top + height - rect.bottom - gap - edge));
   const above = Math.max(0, Math.min(availableHeight, rect.top - top - gap - edge));
@@ -446,6 +457,14 @@ function enhanceSelects(root) {
     let typeahead = '', typedAt = 0;
     const isDisabled = option => option.disabled || option.parentElement.matches('optgroup:disabled');
     const enabled = () => [...select.options].map((o, i) => isDisabled(o) ? -1 : i).filter((i) => i >= 0);
+    const scrollActiveOption = () => {
+      const item = list.children[active];
+      if (!item) return;
+      if (item.offsetTop < list.scrollTop) list.scrollTop = item.offsetTop;
+      else if (item.offsetTop + item.offsetHeight > list.scrollTop + list.clientHeight) {
+        list.scrollTop = item.offsetTop + item.offsetHeight - list.clientHeight;
+      }
+    };
     const sync = () => {
       trigger.disabled = select.matches(':disabled');
       value.textContent = select.selectedOptions[0]?.textContent || '请选择';
@@ -477,9 +496,7 @@ function enhanceSelects(root) {
       });
       if (active >= 0) {
         trigger.setAttribute('aria-activedescendant', `${list.id}-option-${active}`);
-        const item = list.children[active];
-        if (item && item.offsetTop < list.scrollTop) list.scrollTop = item.offsetTop;
-        else if (item && item.offsetTop + item.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = item.offsetTop + item.offsetHeight - list.clientHeight;
+        scrollActiveOption();
       }
     };
     const close = () => {
@@ -505,8 +522,8 @@ function enhanceSelects(root) {
       trigger.setAttribute('aria-expanded', 'true');
       openSelection = { trigger, wrapper, list, close };
       paint();
-      positionFloatingPanel(list, trigger, true);
-      list.children[active]?.scrollIntoView({ block: 'nearest' });
+      positionFloatingPanel(list, trigger, select.hasAttribute('data-match-width') ? 'exact' : true);
+      scrollActiveOption();
     };
     const choose = (index) => {
       if (!enabled().includes(index) || select.matches(':disabled')) return;
@@ -814,7 +831,7 @@ async function pageDashboard(main) {
 }
 
 window._accFilter = window._accFilter || { q: '', status: 'all', sort: 'default' };
-const ACC_STATUS = { active: '可用', cooldown: '冷却中', needs_relogin: '需授权', unverified: '待验证', web_only: '仅网页', expired: '已过期' };
+const ACC_STATUS = { active: '可用', cooldown: '冷却中', needs_relogin: '需授权', unverified: '待验证', web_only: '仅网页', expired: '已过期', disabled: '已停用' };
 
 function filterAccounts(accounts, groups, filter) {
   const query = (filter.q || '').trim().toLowerCase();
@@ -1018,12 +1035,14 @@ function importAccountsModal(groups) {
   });
 }
 
-function bindCreateForm(form, dialog, create, onCreated) {
-  bindDialogForm(form, dialog, () => {
-    const name = form.elements.name.value.trim();
-    if (!name) throw new Error(`请输入${form.elements.name.labels[0].textContent.trim()}。`);
-    return create(name);
-  }, onCreated);
+function groupAcceptsAccount(group, account) {
+  return !group.family_filter || group.family_filter === account.family;
+}
+
+function saveAccountPlacement(account, groupId, fields = {}) {
+  const current = account.group_id || null;
+  const body = groupId === current ? fields : { ...fields, group_id: groupId, expected_group_id: current };
+  return api(`/api/accounts/${encodeURIComponent(account.id)}`, { method: 'PATCH', body });
 }
 
 async function onAccountAction(e) {
@@ -1064,18 +1083,25 @@ async function onAccountAction(e) {
   } else if (btn.dataset.act === 'edit') {
     const [accounts, groups] = await Promise.all([api('/api/accounts'), api('/api/groups')]);
     const a = accounts.find((x) => x.id === id);
+    if (!a) return toast('账号不存在', 'err');
     const form = h(`<div>
       <div class="kv" style="margin-bottom:12px"><b>备注</b><input id="e-label" value="${esc(a.label)}"></div>
       <div class="kv" style="margin-bottom:12px"><b>分组</b><select id="e-group">
         <option value="">待分组</option>
-        ${groups.map((g) => `<option value="${esc(g.id)}" ${a.group_id === g.id ? 'selected' : ''}>${esc(g.name)}</option>`).join('')}
+        ${a.group_id && !groups.some(g => g.id === a.group_id) ? `<option value="${esc(a.group_id)}" selected>分组已失效</option>` : ''}
+        ${groups.map(g => {
+          const selected = a.group_id === g.id, compatible = groupAcceptsAccount(g, a);
+          return `<option value="${esc(g.id)}" ${selected ? 'selected' : compatible ? '' : 'disabled'}>${esc(g.name)}${compatible ? '' : '（类型不符）'}</option>`;
+        }).join('')}
       </select></div>
       <div class="kv" style="margin-bottom:6px"><b>出站代理</b><input id="e-proxy" placeholder="http://127.0.0.1:7890（留空跟随全局设置）" value="${esc(a.proxy_url || '')}"></div>
       <p class="muted" style="margin:0 0 12px">该账号全部出站（推理+平台轮询）走此代理；保存后对下一次 HTTP 请求生效。</p>
       <div class="row"><button class="btn primary" id="e-save">保存</button></div></div>`);
     const m = modal('编辑账号', form);
     $('#e-save', form).addEventListener('click', event => buttonAction(event.currentTarget, async () => {
-      await api(`/api/accounts/${id}`, { method: 'PATCH', body: { label: $('#e-label', form).value, group_id: $('#e-group', form).value || null, proxy_url: $('#e-proxy', form).value.trim() || null } });
+      await saveAccountPlacement(a, $('#e-group', form).value || null, {
+        label: $('#e-label', form).value, proxy_url: $('#e-proxy', form).value.trim() || null,
+      });
       toast('已保存', 'ok'); m.close(); render();
     }, '保存失败：'));
   }
@@ -1402,8 +1428,194 @@ async function pageUsage(main) {
   $('#usage-refresh').addEventListener('click', () => render());
 }
 
+function showKeySecret(title, secret, notice = '请复制并妥善保存完整密钥。') {
+  keySecretDialog?.close();
+  const result = h(`<div class="secret-result">
+    <p class="dialog-intro">${esc(notice)}</p><pre class="log" tabindex="0" aria-label="完整 API 密钥"></pre>
+    <div class="modal-actions"><button type="button" class="btn primary" data-copy>复制密钥</button></div>
+  </div>`);
+  const value = $('pre', result);
+  value.textContent = secret;
+  const dialog = modal(title, result, () => {
+    value.textContent = '';
+    if (keySecretDialog === dialog) keySecretDialog = null;
+  });
+  keySecretDialog = dialog;
+  $('[data-copy]', result).addEventListener('click', () => copyText(value.textContent, '密钥已复制', '复制失败，请手动选择并复制密钥'));
+}
+
+function finishKeyChange(dialog, title, secret, token, notice) {
+  if (token === TOKEN) void render();
+  dialog.close(() => {
+    if (token === TOKEN) showKeySecret(title, secret, notice);
+  });
+}
+
+function groupChainLabel(ids, groups) {
+  const names = ids.map(id => {
+    const group = groups.get(id);
+    return group ? group.name + (Number(group.enabled) === 1 ? '' : '（已停用）') : '失效分组';
+  });
+  return names.length ? names.join(' → ') : '无分组';
+}
+
+function bindKeyGroupChain(form, initial, groups) {
+  const mode = form.elements.chain_mode, select = form.elements.chain_add;
+  const custom = $('[data-chain-custom]', form), list = $('ol', custom), add = $('[data-chain-add]', custom);
+  const groupsById = new Map(groups.map(group => [group.id, group]));
+  let chain = initial?.slice() ?? [];
+  mode.value = initial == null ? 'default' : 'custom';
+  const paint = () => {
+    custom.hidden = mode.value === 'default';
+    list.innerHTML = chain.map((id, index) => {
+      const group = groupsById.get(id);
+      const problem = !group ? '分组已失效' : chain.indexOf(id) !== index ? '重复引用' : '';
+      const name = group?.name || String(id ?? '');
+      const action = (value, label, disabled) => `<button type="button" class="btn" data-chain-action="${value}" data-index="${index}" aria-label="${esc(label + ' ' + name)}" ${disabled ? 'disabled' : ''}>${label}</button>`;
+      return `<li><span>${esc(name)}${problem ? ` <span class="warn-text">${problem}</span>` : Number(group.enabled) === 1 ? '' : '（已停用）'}</span>
+        <div class="cell-inline cell-actions">${action('up', '上移', index === 0)}${action('down', '下移', index === chain.length - 1)}${action('remove', '移除')}</div></li>`;
+    }).join('');
+    select.innerHTML = `<option value="">选择要加入的分组</option>${groups.filter(group => !chain.includes(group.id)).map(group =>
+      `<option value="${esc(group.id)}">${esc(group.name)}${Number(group.enabled) === 1 ? '' : '（已停用）'}</option>`).join('')}`;
+    select.disabled = select.options.length === 1;
+    add.disabled = true;
+    syncSelect(select);
+  };
+  mode.addEventListener('change', paint);
+  select.addEventListener('change', () => { add.disabled = !select.value; });
+  add.addEventListener('click', () => {
+    const id = select.value;
+    if (!groupsById.has(id) || chain.includes(id)) return;
+    chain.push(id);
+    paint();
+    list.lastElementChild?.querySelector('[data-chain-action="remove"]')?.focus();
+  });
+  list.addEventListener('click', event => {
+    const button = event.target.closest('[data-chain-action]');
+    if (!button || button.disabled) return;
+    const index = Number(button.dataset.index), action = button.dataset.chainAction;
+    const [id] = chain.splice(index, 1);
+    const target = action === 'up' ? index - 1 : action === 'down' ? index + 1 : index;
+    if (action !== 'remove') chain.splice(target, 0, id);
+    paint();
+    const row = list.children[Math.min(target, chain.length - 1)];
+    (row?.querySelector(`[data-chain-action="${action}"]:not(:disabled)`) ||
+      row?.querySelector('[data-chain-action="remove"]') || mode.parentElement.querySelector('.select-trigger'))?.focus();
+  });
+  paint();
+  return () => mode.value === 'default' ? null : chain.slice();
+}
+
+function keyFormValues(form, groupOrder) {
+  const fields = form.elements;
+  const list = (input) => input.value.split(/[,，]/).map(value => value.trim()).filter(Boolean);
+  return {
+    name: fields.name.value.trim(),
+    quota_limit: fields.quota_limit.value.trim() || null,
+    group_order: groupOrder,
+    default_level: fields.default_level.value || null,
+    model_whitelist: list(fields.model_whitelist),
+    ip_whitelist: list(fields.ip_whitelist),
+    sticky_minutes: fields.sticky_minutes.value === '' ? 0 : Number(fields.sticky_minutes.value),
+    enabled: fields.enabled.checked,
+  };
+}
+
+function openKeyForm(groups, key) {
+  const values = key ?? { enabled: true, sticky_minutes: 0 };
+  const form = h(`<form class="dialog-form key-form" autocomplete="off">
+    <div class="dialog-grid">
+      <label class="dialog-field">密钥名称<input name="name" value="${esc(values.name)}" maxlength="80" placeholder="例如：Claude Code" required></label>
+      <label class="dialog-field">配额（Token）<input name="quota_limit" inputmode="numeric" value="${esc(values.quota_limit)}" placeholder="留空不限"></label>
+      <div class="dialog-field key-field-wide">
+        <div class="field-label"><label for="key-chain-mode">分组链</label>${infoTip('指定分组时按列表从上到下尝试，跳过停用的分组。指定列表为空时，这把密钥无分组可用。', '分组链')}</div>
+        <select id="key-chain-mode" name="chain_mode" data-match-width><option value="default">使用默认链</option><option value="custom">指定分组与顺序</option></select>
+        <div class="key-chain-custom" data-chain-custom hidden>
+          <ol class="key-chain-list" aria-label="分组调度顺序"></ol>
+          <div class="key-chain-add"><select name="chain_add" aria-label="选择要加入的分组" data-match-width></select><button type="button" class="btn" data-chain-add>加入</button></div>
+        </div>
+      </div>
+      <label class="dialog-field">默认思考档位<select name="default_level">
+        <option value="">跟随全局设置</option>
+        <option value="low">low（最快）</option>
+        <option value="high">high（深思）</option>
+        <option value="max">max</option>
+      </select></label>
+      <label class="dialog-field">黏住分钟<input name="sticky_minutes" type="number" min="0" step="any" value="${esc(values.sticky_minutes)}" placeholder="0"></label>
+      <label class="dialog-field key-field-wide">模型白名单<input name="model_whitelist" value="${esc(values.model_whitelist?.join(','))}" placeholder="逗号分隔，留空允许全部模型" spellcheck="false"></label>
+      <label class="dialog-field key-field-wide">IP 白名单<input name="ip_whitelist" value="${esc(values.ip_whitelist?.join(','))}" placeholder="逗号分隔，支持 CIDR 和 1.2.3.*，留空不限" spellcheck="false"></label>
+    </div>
+    <label class="settings-check key-enabled"><span>启用密钥</span><input name="enabled" type="checkbox" role="switch" ${values.enabled ? 'checked' : ''}></label>
+    <p class="dialog-error error" role="alert"></p>
+    <div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn primary">${key ? '保存' : '创建密钥'}</button></div>
+  </form>`);
+  const level = form.elements.default_level;
+  level.value = values.default_level ?? '';
+  if (level.selectedIndex === -1) level.selectedIndex = 0;
+  const groupOrder = bindKeyGroupChain(form, values.group_order, groups);
+  const initial = keyFormValues(form, groupOrder());
+  const token = TOKEN;
+  const dialog = modal(key ? '编辑密钥' : '新建密钥', form);
+  bindDialogForm(form, dialog, () => {
+    const payload = keyFormValues(form, groupOrder());
+    const body = key ? Object.fromEntries(Object.entries(payload).filter(([name, value]) =>
+      JSON.stringify(value) !== JSON.stringify(initial[name]))) : payload;
+    if ('name' in body && !body.name) throw new Error('请输入密钥名称');
+    if (body.quota_limit != null && !/^\d+$/.test(body.quota_limit)) throw new Error('配额（Token）必须为非负整数');
+    if (token !== TOKEN) throw new Error('管理会话已变更，请重新打开表单');
+    return key
+      ? api(`/api/keys/${encodeURIComponent(key.id)}`, { token, method: 'PATCH', body })
+      : api('/api/keys', { token, method: 'POST', body, cache: 'no-store' });
+  }, result => {
+    if (key) {
+      dialog.close();
+      if (token === TOKEN) {
+        toast('已保存', 'ok');
+        void render();
+      }
+    } else {
+      finishKeyChange(dialog, '密钥已创建', result.secret, token);
+    }
+  });
+}
+
+function offerKeyRotation(key, message, token) {
+  const form = h(`<form class="dialog-form">
+    <p class="dialog-intro">${esc(message)}</p>
+    <p class="dialog-intro">确认轮换后，旧密钥立即失效。请将所有客户端切换到新密钥，原有配置和已用 Token 会保留。</p>
+    <p class="dialog-error error" role="alert"></p>
+    <div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn danger-solid">轮换密钥</button></div>
+  </form>`);
+  const dialog = modal('轮换历史密钥', form);
+  $('[data-cancel]', form).focus();
+  bindDialogForm(form, dialog, () => {
+    if (token !== TOKEN) throw new Error('管理会话已变更，请重新打开弹窗');
+    return api(`/api/keys/${encodeURIComponent(key.id)}/rotate`, {
+      token, method: 'POST', body: { key_tail: key.key_tail }, cache: 'no-store',
+    });
+  }, result => finishKeyChange(dialog, '密钥已轮换', result.secret, token, '请保存新密钥，并更新客户端配置。'));
+}
+
+async function copyKey(key) {
+  const token = TOKEN;
+  let result;
+  try {
+    result = await api(`/api/keys/${encodeURIComponent(key.id)}/secret`, { token, method: 'POST', cache: 'no-store' });
+  } catch (error) {
+    if (error.code !== 'key_not_recoverable') throw error;
+    if (token === TOKEN) offerKeyRotation(key, error.message, token);
+    return;
+  }
+  if (token !== TOKEN) return;
+  if (!result.secret) throw new Error('服务端未返回完整密钥');
+  if (!await copyText(result.secret, '密钥已复制', '') && token === TOKEN) {
+    showKeySecret('复制密钥', result.secret, '自动复制失败，请选择并手动复制完整密钥。');
+  }
+}
+
 async function pageKeys(main) {
-  const keys = await api('/api/keys');
+  const [keys, groups] = await Promise.all([api('/api/keys'), api('/api/groups')]);
+  const groupsById = new Map(groups.map(group => [group.id, group]));
   main.innerHTML = `
   ${pagehead('API 密钥', '',
     `<button class="btn primary" id="add-key">${icon('plus', 14)}新建密钥</button>`)}
@@ -1416,103 +1628,243 @@ async function pageKeys(main) {
       <td class="mono">…${esc(k.key_tail)}</td>
       <td class="mono align-right">${k.quota_limit === null ? '不限' : fmtInt(k.quota_limit)}</td>
       <td class="mono align-right">${fmtInt(k.used_units)}</td>
-      <td style="font-size:12px">${esc((k.group_order || []).join(' → ') || '默认链')}</td>
+      <td style="font-size:12px">${esc(k.group_order ? groupChainLabel(k.group_order, groupsById) : '默认链')}</td>
       <td>${k.default_level ? `<span class="badge">${esc(({ low: '低', high: '高', max: '最高' })[k.default_level] || k.default_level)}</span>` : '<span class="muted">跟随全局</span>'}</td>
       <td style="font-size:11px">${k.model_whitelist.length ? k.model_whitelist.map((m) => `<span class="badge sm">${esc(m)}</span>`).join(' ') : '全部模型'}${k.ip_whitelist.length ? '<br>IP: ' + esc(k.ip_whitelist.join(',')) : ''}</td>
       <td>${k.enabled ? '<span class="ok-text">● 启用</span>' : '<span class="muted">禁用</span>'}</td>
-      <td class="align-right"><div class="cell-inline cell-actions"><button class="btn" data-edit="${esc(k.id)}">编辑</button><button class="btn danger" data-del="${esc(k.id)}">删除</button></div></td></tr>`).join('')}
+      <td class="align-right"><div class="cell-inline cell-actions key-actions"><button type="button" class="btn" data-key-action="copy" data-id="${esc(k.id)}">复制密钥</button><button type="button" class="btn" data-key-action="edit" data-id="${esc(k.id)}">编辑</button><button type="button" class="btn danger" data-key-action="delete" data-id="${esc(k.id)}">删除</button></div></td></tr>`).join('')}
   </table></div>` : '<p class="muted">还没有密钥。</p>';
   $('#key-table').addEventListener('click', async (e) => {
-    const del = e.target.closest('button[data-del]');
-    const edit = e.target.closest('button[data-edit]');    if (del) {
+    const button = e.target.closest('button[data-key-action]');
+    if (!button || button.disabled) return;
+    const key = keys.find(item => item.id === button.dataset.id);
+    if (!key) return;
+    if (button.dataset.keyAction === 'edit') {
+      openKeyForm(groups, key);
+    } else if (button.dataset.keyAction === 'copy') {
+      await buttonAction(button, () => copyKey(key), '复制失败：');
+    } else {
       if (!await confirmAction('删除密钥', '确定删除该密钥？使用此密钥的客户端将无法继续访问。')) return;
-      await buttonAction(del, async () => {
-        await api(`/api/keys/${del.dataset.del}`, { method: 'DELETE' });
+      await buttonAction(button, async () => {
+        await api(`/api/keys/${encodeURIComponent(key.id)}`, { method: 'DELETE' });
         toast('已删除', 'ok');
         render();
       }, '删除失败：');
-    } else if (edit) {
-      const k = keys.find((x) => x.id === edit.dataset.edit);
-      const form = h(`<div>
-        <div class="kv"><b>名称</b><input id="k-name" value="${esc(k.name)}"></div>
-        <div class="kv"><b>配额(总token)</b><input id="k-quota" type="number" value="${k.quota_limit ?? ''}" placeholder="留空不限"></div>
-        <div class="kv"><b>分组链</b><input id="k-chain" value="${esc((k.group_order || []).join(','))}" placeholder="g_xxx,g_yyy（逗号分隔，空=默认链）"></div>
-        <div class="kv"><b>默认思考档位</b><select id="k-level">
-          <option value="" ${!k.default_level ? 'selected' : ''}>跟随全局设置</option>
-          <option value="low" ${k.default_level === 'low' ? 'selected' : ''}>low（最快）</option>
-          <option value="high" ${k.default_level === 'high' ? 'selected' : ''}>high（深思）</option>
-          <option value="max" ${k.default_level === 'max' ? 'selected' : ''}>max</option>
-        </select></div>
-        <div class="kv"><b>模型白名单</b><input id="k-models" value="${esc(k.model_whitelist.join(','))}" placeholder="逗号分隔，空=全部"></div>
-        <div class="kv"><b>IP 白名单</b><input id="k-ips" value="${esc(k.ip_whitelist.join(','))}" placeholder="逗号分隔，支持 1.2.3.*，空=不限"></div>
-        <div class="kv"><b>黏住分钟</b><input id="k-sticky" type="number" value="${k.sticky_minutes}"></div>
-        <div class="kv"><label for="k-enabled">启用</label><input id="k-enabled" type="checkbox" ${k.enabled ? 'checked' : ''}></div>
-        <div class="row" style="margin-top:12px"><button class="btn primary" id="k-save">保存</button></div></div>`);
-      const m = modal('编辑密钥', form);
-      $('#k-save', form).addEventListener('click', event => buttonAction(event.currentTarget, async () => {
-        const chain = $('#k-chain', form).value.split(',').map((s) => s.trim()).filter(Boolean);
-        await api(`/api/keys/${k.id}`, { method: 'PATCH', body: {
-          name: $('#k-name', form).value,
-          quota_limit: $('#k-quota', form).value === '' ? null : Number($('#k-quota', form).value),
-          group_order: chain.length ? chain : null,
-          default_level: $('#k-level', form).value || null,
-          model_whitelist: $('#k-models', form).value.split(',').map((s) => s.trim()).filter(Boolean),
-          ip_whitelist: $('#k-ips', form).value.split(',').map((s) => s.trim()).filter(Boolean),
-          sticky_minutes: Number($('#k-sticky', form).value) || 0,
-          enabled: $('#k-enabled', form).checked,
-        } });
-        toast('已保存', 'ok'); m.close(); render();
-      }, '保存失败：'));
     }
   });
   $('#copy-gw').addEventListener('click', () => copyText(`http://127.0.0.1:${RUNTIME?.gateway_port}/v1`, '网关地址已复制'));
-  $('#add-key').addEventListener('click', () => {
-    const form = h(`<form class="dialog-form"><p class="dialog-intro">为使用网关的客户端创建独立密钥，方便管理用量与访问权限。</p><label class="dialog-field">密钥名称<input name="name" maxlength="80" placeholder="例如：Claude Code" required></label><p class="dialog-error error" role="alert"></p><div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn primary">创建密钥</button></div></form>`);
-    const m = modal('新建密钥', form);
-    bindCreateForm(form, m, name => api('/api/keys', { method: 'POST', body: { name } }), r => {
-      render();
-      m.close(() => {
-        const result = h(`<div class="secret-result"><p class="dialog-intro">密钥只显示一次，请立即复制并妥善保存。</p><pre class="log">${esc(r.secret)}</pre><div class="modal-actions"><button type="button" class="btn primary" data-copy>复制密钥</button></div></div>`);
-        modal('密钥已创建', result);
-        $('[data-copy]', result).addEventListener('click', () => copyText(r.secret, '已复制', '复制失败，请手动选择并复制密钥'));
-      });
+  $('#add-key').addEventListener('click', () => openKeyForm(groups));
+}
+
+const GROUP_ROLE_LABELS = { primary: '主力', backup: '备用' };
+const GROUP_ROUTE_HELP = '默认链依创建顺序取首个启用的主力组，再取首个启用的备用组。前一组无法接单时尝试下一组。指定分组时以密钥内的顺序为准。整条链无法接单时，请求可能排队或失败。';
+
+function openGroupForm(group) {
+  const values = group ?? { role: 'primary', policy: 'balanced', urgent_window_min: 180, enabled: 1 };
+  const field = (name, label, help, control) => `<div class="dialog-field"><div class="field-label"><label for="group-${name}">${label}</label>${infoTip(help, label)}</div>${control}</div>`;
+  const select = (name, options) => `<select id="group-${name}" name="${name}" data-match-width>${options.map(([value, label]) => `<option value="${value}">${esc(label)}</option>`).join('')}</select>`;
+  const form = h(`<form class="dialog-form group-form" autocomplete="off">
+    <fieldset class="group-fields">
+      <legend>基础信息</legend>
+      <div class="dialog-grid">
+        <label class="dialog-field group-field-wide">分组名称<input name="name" value="${esc(values.name)}" maxlength="80" placeholder="例如：推理主力" required></label>
+        ${field('role', '角色', GROUP_ROUTE_HELP, select('role', Object.entries(GROUP_ROLE_LABELS)))}
+        ${field('family_filter', '账号类型', '类型限制适用于账号加入和请求调度。国内账号包含 Z.ai 国内及旧 BigModel。', select('family_filter', [['', '全部类型'], ...Object.entries(ACCOUNT_FAMILY_LABELS)]))}
+      </div>
+    </fieldset>
+    <fieldset class="group-fields">
+      <legend>调度配置</legend>
+      <div class="dialog-grid">
+        ${field('policy', '调度策略', '组内先考虑黏住账号。均衡优先低并发和较久未使用的账号，剩余额度优先选择额度更多的账号，临期优先使用窗口内最早到期的账号。', select('policy', ['balanced', 'expiring_first', 'remaining_desc'].map(value => [value, policyLabel(value)])))}
+        ${field('urgent_window_min', '临期窗口（分钟）', '仅在临期优先策略下使用。填写 0 或留空时按 180 分钟计算。', `<input id="group-urgent_window_min" name="urgent_window_min" inputmode="numeric" value="${esc(values.urgent_window_min)}" placeholder="180">`)}
+      </div>
+    </fieldset>
+    <label class="settings-check group-enabled"><span>启用分组</span><input name="enabled" type="checkbox" role="switch" ${Number(values.enabled) === 1 ? 'checked' : ''}></label>
+    <p class="dialog-error error" role="alert"></p>
+    <div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn primary">${group ? '保存' : '创建分组'}</button></div>
+  </form>`);
+  const fields = form.elements;
+  for (const name of ['role', 'family_filter', 'policy']) {
+    const value = values[name] ?? '';
+    const field = fields[name];
+    field.value = value;
+    if (field.selectedIndex < 0) field.add(new Option(`历史值：${value}`, value, true, true));
+  }
+  const read = () => ({
+    name: fields.name.value.trim(),
+    role: fields.role.value,
+    family_filter: fields.family_filter.value || null,
+    policy: fields.policy.value,
+    urgent_window_min: fields.urgent_window_min.value.trim(),
+    enabled: fields.enabled.checked,
+  });
+  const initial = read();
+  const dialog = modal(group ? '编辑分组' : '新建分组', form);
+  bindDialogForm(form, dialog, () => {
+    const values = read();
+    const body = group ? Object.fromEntries(Object.entries(values).filter(([name, value]) => value !== initial[name])) : values;
+    if ('name' in body && !body.name) throw new Error('请输入分组名称');
+    if ('urgent_window_min' in body) {
+      const minutes = body.urgent_window_min;
+      if (minutes && !/^\d+$/.test(minutes)) throw new Error('临期窗口必须为非负整数分钟');
+      body.urgent_window_min = minutes ? Number(minutes) : null;
+    }
+    return group
+      ? api(`/api/groups/${encodeURIComponent(group.id)}`, { method: 'PATCH', body })
+      : api('/api/groups', { method: 'POST', body });
+  }, () => {
+    dialog.close();
+    toast(group ? '分组已保存' : '分组已创建', 'ok');
+    void render();
+  });
+}
+
+async function openGroupAccounts(id) {
+  const load = () => Promise.all([api('/api/accounts?view=groups'), api('/api/groups')]);
+  let [accounts, groups] = await load();
+  const group = () => groups.find(item => item.id === id);
+  if (!group()) throw new Error('分组不存在');
+  const form = h(`<div class="group-members">
+    <div class="management-toolbar">
+      <div class="searchbox">${icon('search', 14)}<input data-search aria-label="搜索账号" placeholder="搜索账号或 ID"></div>
+      <select aria-label="关联状态" data-membership data-match-width><option value="all">全部账号</option><option value="member">已在本组</option><option value="eligible">可加入</option><option value="incompatible">类型不符</option></select>
+    </div>
+    <div data-accounts></div>
+    <div class="modal-actions"><button type="button" class="btn" data-close>完成</button></div>
+  </div>`);
+  const list = $('[data-accounts]', form), search = $('[data-search]', form), membership = $('[data-membership]', form);
+  const paging = { page: 1, size: 10 };
+  const paint = () => {
+    const target = group();
+    if (!target) {
+      list.innerHTML = '<p class="muted">分组已删除。</p>';
+      return;
+    }
+    const query = search.value.trim().toLowerCase();
+    const names = new Map(groups.map(item => [item.id, item.name]));
+    const filtered = accounts.filter(account => {
+      const member = account.group_id === id, compatible = groupAcceptsAccount(target, account);
+      if (membership.value === 'member' && !member || membership.value === 'eligible' && (member || !compatible) ||
+          membership.value === 'incompatible' && compatible) return false;
+      return !query || `${account.label || ''} ${account.customer_id || ''} ${account.id}`.toLowerCase().includes(query);
     });
+    filtered.sort((x, y) => Number(y.group_id === id) - Number(x.group_id === id));
+    const page = UI.paginate(filtered, paging.page, paging.size);
+    paging.page = page.page;
+    if (!page.total) {
+      list.innerHTML = `<p class="muted">${accounts.length ? '暂无符合条件的账号。' : '暂无账号。'}</p>`;
+      return;
+    }
+    list.innerHTML = `<ul class="group-member-list">${page.items.map(account => {
+      const member = account.group_id === id, compatible = groupAcceptsAccount(target, account);
+      const name = account.label || account.customer_id || account.id;
+      const current = member ? '已在本组' : account.group_id ? names.get(account.group_id) || '分组已失效' : '待分组';
+      const identity = account.customer_id || account.id;
+      return `<li><div class="group-member-name"><strong>${esc(name)}</strong><span class="muted">${esc(ACCOUNT_FAMILY_LABELS[account.family] || account.family)} · ${esc(account.status === 'active' ? '活跃' : ACC_STATUS[account.status] || account.status)}</span>${name !== identity ? `<span class="mono">${esc(identity)}</span>` : ''}</div>
+        <div class="group-member-status"><span>${esc(current)}</span>${compatible ? '' : '<span class="warn-text">类型不符</span>'}</div>
+        <div class="cell-inline cell-actions"><button type="button" class="btn" data-member="${esc(account.id)}" aria-label="${esc((member ? '移出 ' : '加入 ') + name)}" ${member || compatible ? '' : 'disabled'}>${member ? '移出' : account.group_id ? '移入' : '加入'}</button></div></li>`;
+    }).join('')}</ul>${filtered.length > 10 ? accountPagerMarkup(page, [10, 25, 50]) : ''}`;
+    enhanceSelects(list);
+  };
+  paint();
+  const dialog = modal(`管理账号 · ${group().name}`, form, null, { externalFocus: true });
+  $('[data-close]', form).addEventListener('click', () => dialog.close());
+  const reset = () => { paging.page = 1; paint(); };
+  search.addEventListener('input', reset);
+  membership.addEventListener('change', reset);
+  bindAccountPager(list, paging, paint);
+  let saving = false;
+  list.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-member]');
+    if (saving || !button || button.disabled) return;
+    const account = accounts.find(item => item.id === button.dataset.member);
+    const target = group();
+    if (!account || !target) return;
+    const member = account.group_id === id;
+    if (!member && !groupAcceptsAccount(target, account)) return;
+    saving = true;
+    try {
+      if (member && !await confirmAction('移出账号', '移出后，账号转为待分组，直到重新分配后才会参与分组调度。', '移出')) return;
+      if (!member && account.group_id) {
+        const source = groups.find(item => item.id === account.group_id)?.name || '原分组';
+        if (!await confirmAction('移动账号', `确认将账号从「${source}」移入「${target.name}」？账号只归属一个分组。`, '移入', false)) return;
+      }
+      await buttonAction(button, async () => {
+        const destination = member ? null : id;
+        try {
+          await saveAccountPlacement(account, destination);
+        } catch (error) {
+          if ([400, 404, 409].includes(error.status)) {
+            try { [accounts, groups] = await load(); if (form.isConnected) paint(); } catch { /* Keep the request error. */ }
+            if (currentPage === 'groups') void render();
+          }
+          throw error;
+        }
+        account.group_id = destination;
+        if (form.isConnected) {
+          paint();
+          const next = list.querySelector(`[data-member="${CSS.escape(account.id)}"]:not(:disabled)`);
+          (next || search).focus({ preventScroll: true });
+        }
+        toast(member ? '账号已移出' : '账号已加入', 'ok');
+        if (currentPage === 'groups') void render();
+      });
+    } finally {
+      saving = false;
+    }
   });
 }
 
 async function pageGroups(main) {
-  const groups = await api('/api/groups');
+  const { groups, default_chain: defaultChain } = await api('/api/groups?details=1');
+  const byId = new Map(groups.map(group => [group.id, group]));
   main.innerHTML = `
-  ${pagehead('分组调度链', '按分组顺序选择账号池，再根据各组策略选择账号。',
-    `<button class="btn primary" id="add-group">${icon('plus', 14)}新建分组</button>`)}
+  ${pagehead('分组调度链', '',
+    `<button type="button" class="btn" id="refresh-groups">${icon('refresh', 14)}刷新</button><button type="button" class="btn primary" id="add-group">${icon('plus', 14)}新建分组</button>`)}
+  <div class="group-default-chain"><span class="muted">默认链</span><strong>${esc(groupChainLabel(defaultChain, byId))}</strong>${infoTip(GROUP_ROUTE_HELP, '默认链')}</div>
   <section id="group-list" style="animation-delay:50ms">
-  ${groups.length ? `<div class="tablecard fade-up"><table><tr><th>名称</th><th>角色</th><th>账号类型</th><th>调度策略</th><th class="align-right">临期窗口</th><th class="align-right">操作</th></tr>
+  ${groups.length ? `<div class="tablecard group-table fade-up" tabindex="0" role="region" aria-label="分组列表"><table>
+    <thead><tr><th scope="col">名称</th><th scope="col">角色</th><th scope="col">账号类型</th><th scope="col">组内策略</th><th scope="col" class="align-right">活跃 / 关联 ${infoTip('活跃仅统计状态为活跃且符合分组类型的账号。实际能否接单还取决于模型、登录、额度、冷却和并发。', '账号数量')}</th><th scope="col" class="align-right">操作</th></tr></thead>
+    <tbody>
     ${groups.map((g) => `<tr><td><div class="cell-name">${avatarMarkup(g.name, g.id)}<span class="nm"><b>${esc(g.name)}</b></span></div></td>
-      <td><span class="badge ${g.role === 'primary' ? 'active' : ''}">${esc(({ primary: '主力', backup: '备用' })[g.role] || g.role)}</span></td><td>${esc(ACCOUNT_FAMILY_LABELS[g.family_filter] || g.family_filter || '全部类型')}</td>
-      <td>${esc(policyLabel(g.policy))}</td><td class="align-right">${g.urgent_window_min} 分钟</td>
-      <td class="align-right"><div class="cell-inline cell-actions"><button class="btn danger" data-del="${esc(g.id)}">删除</button></div></td></tr>`).join('')}</table></div>`
+      <td><span class="badge ${Number(g.enabled) === 1 && g.role === 'primary' ? 'active' : ''}">${esc(GROUP_ROLE_LABELS[g.role] || g.role)}</span>${Number(g.enabled) === 1 ? '' : '<span class="group-row-meta muted">已停用</span>'}</td>
+      <td>${esc(ACCOUNT_FAMILY_LABELS[g.family_filter] || g.family_filter || '全部类型')}</td>
+      <td>${esc(policyLabel(g.policy))}${g.policy === 'expiring_first' ? `<span class="group-row-meta muted">${fmtInt(g.urgent_window_min || 180)} 分钟</span>` : ''}</td>
+      <td class="mono align-right">${fmtInt(g.active_account_count)} / ${fmtInt(g.account_count)}</td>
+      <td class="align-right"><div class="cell-inline cell-actions"><button type="button" class="btn" data-group-action="accounts" data-id="${esc(g.id)}">管理账号</button><button type="button" class="btn" data-group-action="edit" data-id="${esc(g.id)}">编辑</button><button type="button" class="btn danger" data-group-action="delete" data-id="${esc(g.id)}">删除</button></div></td></tr>`).join('')}
+    </tbody></table></div>`
     : '<p class="muted">暂无分组。</p>'}</section>`;
-  $('#add-group').addEventListener('click', () => {
-    const form = h(`<form class="dialog-form"><p class="dialog-intro">设置账号池的角色与调度顺序，创建后可将账号加入分组。</p><label class="dialog-field">分组名称<input name="name" maxlength="80" placeholder="例如：默认池" required></label><div class="dialog-grid"><label class="dialog-field"><span class="field-label">角色</span><select name="role"><option value="primary">主力</option><option value="backup">备用</option></select></label><div class="dialog-field"><div class="field-label"><label for="group-family">账号类型</label>${infoTip('国内账号包含 Z.ai 国内及旧 BigModel；国际账号对应 Z.ai 国际。', '账号类型')}</div><select id="group-family" name="family"><option value="">全部类型</option>${Object.entries(ACCOUNT_FAMILY_LABELS).map(([value, label]) => `<option value="${value}">${label}</option>`).join('')}</select></div></div><label class="dialog-field">调度策略<select name="policy"><option value="balanced">均衡调度</option><option value="expiring_first">临期优先</option><option value="remaining_desc">剩余额度优先</option></select></label><p class="dialog-error error" role="alert"></p><div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="submit" class="btn primary">创建分组</button></div></form>`);
-    const m = modal('新建分组', form);
-    bindCreateForm(form, m, name => api('/api/groups', { method: 'POST', body: {
-      name, role: form.elements.role.value, policy: form.elements.policy.value, family_filter: form.elements.family.value || null,
-    } }), () => { m.close(); toast('分组已创建', 'ok'); render(); });
-  });
+  $('#add-group').addEventListener('click', () => openGroupForm());
+  $('#refresh-groups').addEventListener('click', event => buttonAction(event.currentTarget, () => render({ swap: true })));
   $('#group-list').addEventListener('click', async (e) => {
-    const del = e.target.closest('button[data-del]');
-    if (!del) return;
-    if (!await confirmAction('删除分组', '确定删除该分组？分组内仍有账号时无法删除。')) return;
-    await buttonAction(del, async () => {
-      const r = await api(`/api/groups/${del.dataset.del}`, { method: 'DELETE' });
-      toast(r.ok ? '已删除' : r.error, r.ok ? 'ok' : 'err');
-      render();
+    const button = e.target.closest('[data-group-action]');
+    const group = byId.get(button?.dataset.id);
+    if (!group || button.disabled) return;
+    if (button.dataset.groupAction === 'edit') return openGroupForm(group);
+    if (button.dataset.groupAction === 'accounts') return buttonAction(button, () => openGroupAccounts(group.id), '加载账号失败：');
+    const blockers = [];
+    if (group.account_count > 0) blockers.push(`先移出 ${group.account_count} 个关联账号`);
+    if (group.key_count > 0) blockers.push(`先调整引用该组的 ${group.key_count} 个 API 密钥`);
+    if (blockers.length) return toast(`暂无法删除，请${blockers.join('，并')}`, 'err');
+    const effect = groups.length === 1
+      ? '删除后将没有任何分组。若重启时仍为空，服务会创建默认池。'
+      : group.default_chain_after_delete ? `删除后默认链将变为「${groupChainLabel(group.default_chain_after_delete, byId)}」。`
+      : '删除后，该分组将从可选分组中移除。';
+    if (!await confirmAction('删除分组', `确定删除「${group.name}」？${effect}`)) return;
+    await buttonAction(button, async () => {
+      try {
+        const result = await api(`/api/groups/${encodeURIComponent(group.id)}`, { method: 'DELETE' });
+        if (!result.ok) throw new Error(result.error || '操作失败');
+        toast('分组已删除', 'ok');
+      } finally {
+        if (currentPage === 'groups') void render();
+      }
     }, '删除失败：');
   });
 }
 
 async function pageLogs(main, options = {}) {
-  await Z2ALogs.render(main, { api, esc, icon, pagehead, fmtTime, fmtCompactTime, fmtInt, policyLabel, rerender: () => render({ swap: true }) }, options);
+  await Z2ALogs.render(main, { api, esc, icon, pagehead, fmtTime, fmtCompactTime, fmtInt, rerender: () => render({ swap: true }) }, options);
 }
 async function boot() {
   if (!TOKEN) return showLogin();
@@ -1541,7 +1893,7 @@ async function boot() {
   startOauthWatcher();
   if (window._refreshTimer) clearInterval(window._refreshTimer);
   window._refreshTimer = setInterval(() => {
-    if (!TOKEN || document.hidden || $('#app-view').classList.contains('hidden')) return;
+    if (session !== TOKEN || document.hidden || $('#app-view').classList.contains('hidden')) return;
     const period = currentPage === 'logs' ? 1000 : ['dashboard', 'accounts'].includes(currentPage) ? 5000 : 0;
     if (!period || Date.now() - lastRefreshAt < period) return;
     const main = $('#main');

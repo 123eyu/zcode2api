@@ -27,6 +27,14 @@ func bearer(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
 
+func adminBearer(r *http.Request) string {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(token)
+}
+
 func adminSessionToken(r *http.Request) string {
 	token := bearer(r)
 	if token == "" {
@@ -54,13 +62,12 @@ func (a *App) newAdminSession(ctx context.Context) (string, int64, error) {
 	return token, expiry, nil
 }
 
-func (a *App) adminAuth(r *http.Request) (bool, error) {
-	token := adminSessionToken(r)
+func (a *App) adminAuth(ctx context.Context, token string) (bool, error) {
 	if token == "" {
 		return false, nil
 	}
 	var expiry int64
-	err := a.db.QueryRowContext(r.Context(), "SELECT expires_at FROM admin_sessions WHERE token_hash=? AND credential_hash=?", shared.Hash(token), a.adminCredentialHash()).Scan(&expiry)
+	err := a.db.QueryRowContext(ctx, "SELECT expires_at FROM admin_sessions WHERE token_hash=? AND credential_hash=?", shared.Hash(token), a.adminCredentialHash()).Scan(&expiry)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
@@ -100,7 +107,7 @@ func (a *App) authenticate(r *http.Request) (shared.M, *fault.Failure) {
 	if secret == "" {
 		return nil, &fault.Failure{Status: 401, Code: "invalid_api_key", Message: "缺少 API 密钥"}
 	}
-	k := a.row("SELECT * FROM keys WHERE key_hash=?", shared.Hash(secret))
+	k := a.row("SELECT "+apiKeyColumns+" FROM keys WHERE key_hash=?", shared.Hash(secret))
 	if k == nil {
 		return nil, &fault.Failure{Status: 401, Code: "invalid_api_key", Message: "无效密钥"}
 	}
@@ -119,29 +126,6 @@ func (a *App) authenticate(r *http.Request) (shared.M, *fault.Failure) {
 	}
 	_ = a.exec("UPDATE keys SET last_used_at=? WHERE id=?", shared.NowMS(), k["id"])
 	return k, nil
-}
-
-func (a *App) createKey(b shared.M) (shared.M, error) {
-	id, secret := "key_"+shared.Random(4), "zk2-"+shared.Random(20)
-	level := shared.First(b["defaultLevel"], b["default_level"])
-	if !settings.ValidLevel(shared.Str(level)) {
-		level = nil
-	}
-	groups := shared.First(b["groupOrder"], b["group_order"])
-	if groups != nil {
-		groups = shared.JSON(groups)
-	}
-	e := a.exec("INSERT INTO keys(id,name,key_hash,key_tail,quota_limit,expires_at,ip_whitelist,model_whitelist,group_order,sticky_minutes,default_level,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", id, shared.Fallback(b["name"], "default"), shared.Hash(secret), secret[len(secret)-6:], shared.First(b["quotaLimit"], b["quota_limit"]), shared.First(b["expiresAt"], b["expires_at"]), shared.JSON(shared.First(b["ipWhitelist"], b["ip_whitelist"], []any{})), shared.JSON(shared.First(b["modelWhitelist"], b["model_whitelist"], []any{})), groups, shared.First(b["stickyMinutes"], b["sticky_minutes"], 0), level, shared.NowMS())
-	return shared.M{"ok": e == nil, "id": id, "secret": secret}, e
-}
-
-func (a *App) keyChain(k shared.M) []any {
-	if s := k["group_order"]; s != nil {
-		if v, ok := shared.Parse(s, nil).([]any); ok {
-			return v
-		}
-	}
-	return a.defaultChain()
 }
 
 func (a *App) modelAllowed(k shared.M, model string) bool {

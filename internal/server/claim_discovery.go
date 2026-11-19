@@ -11,8 +11,6 @@ import (
 	"zcode2api/internal/server/storage"
 )
 
-const claimDiscoveryConcurrency = 3
-
 const claimDiscoveryAccountTimeout = 10 * time.Second
 
 const dailyClaimCandidateRecoveryVersion = 2

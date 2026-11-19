@@ -72,17 +72,6 @@ CREATE INDEX IF NOT EXISTS idx_usage_status_ts ON usage_log(status, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_error_ts ON usage_log(error_code, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_account_ts ON usage_log(account_id, ts);
 CREATE INDEX IF NOT EXISTS idx_usage_model_ts ON usage_log(model, ts);
-CREATE TABLE IF NOT EXISTS schedule_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  request_id TEXT,
-  chain TEXT, -- JSON 分组 ID 列表
-  candidates TEXT, -- JSON 调度候选
-  policy TEXT,
-  picked TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_schedule_ts ON schedule_log(ts);
-CREATE INDEX IF NOT EXISTS idx_schedule_picked_ts ON schedule_log(picked, ts);
 CREATE TABLE IF NOT EXISTS claim_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   account_id TEXT NOT NULL,
@@ -100,6 +89,7 @@ CREATE TABLE IF NOT EXISTS keys (
   name TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE,
   key_tail TEXT NOT NULL,
+  secret_enc TEXT,
   quota_limit INTEGER, -- Token 上限，NULL 不限
   used_units INTEGER NOT NULL DEFAULT 0,
   expires_at INTEGER,
@@ -130,13 +120,6 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   credential_hash TEXT NOT NULL,
   expires_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS audit_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts INTEGER NOT NULL,
-  actor TEXT, action TEXT, detail TEXT, ip TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
-CREATE INDEX IF NOT EXISTS idx_audit_action_ts ON audit_log(action, ts);
 CREATE TABLE IF NOT EXISTS oauth_flows (
   flow_id TEXT PRIMARY KEY,
   account_rowid TEXT,

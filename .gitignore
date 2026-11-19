@@ -3,8 +3,8 @@ bin/
 dist/
 coverage.out
 data/
+/.zcode2api-docker*
 .zcode/
 config.json
 probe-*.json
-AGENTS.md
 /test/

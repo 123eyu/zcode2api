@@ -2,6 +2,7 @@ package update
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -47,16 +48,20 @@ type UpdateReleaseCache struct {
 	Release   githubRelease `json:"release"`
 	CheckedAt int64         `json:"checked_at"`
 	ETag      string        `json:"etag"`
+	Mirror    string        `json:"mirror,omitempty"`
 }
 
 type UpdateState struct {
-	Phase      string `json:"phase"`
-	Version    string `json:"version,omitempty"`
-	Message    string `json:"message,omitempty"`
-	Downloaded int64  `json:"downloaded,omitempty"`
-	Total      int64  `json:"total,omitempty"`
-	StartedAt  int64  `json:"started_at,omitempty"`
-	FinishedAt int64  `json:"finished_at,omitempty"`
+	Phase           string `json:"phase"`
+	Version         string `json:"version,omitempty"`
+	Message         string `json:"message,omitempty"`
+	Downloaded      int64  `json:"downloaded,omitempty"`
+	Total           int64  `json:"total,omitempty"`
+	StartedAt       int64  `json:"started_at,omitempty"`
+	FinishedAt      int64  `json:"finished_at,omitempty"`
+	Deployment      string `json:"deployment,omitempty"`
+	PreviousVersion string `json:"previous_version,omitempty"`
+	BackupJob       string `json:"backup_job,omitempty"`
 }
 
 func ReadUpdateJSON(filename string, target any) error {
@@ -77,17 +82,51 @@ func WriteUpdateJSON(filename string, value any) error {
 		return err
 	}
 	defer os.Remove(file.Name())
-	if err = json.NewEncoder(file).Encode(value); err == nil {
+	if err := writeUpdateFile(file, value); err != nil {
+		return err
+	}
+	return replaceUpdateState(func() error { return os.Rename(file.Name(), filename) })
+}
+
+func writeUpdateFile(file *os.File, value any) error {
+	err := json.NewEncoder(file).Encode(value)
+	if err == nil {
 		err = file.Sync()
 	}
 	closeErr := file.Close()
 	if err != nil {
 		return err
 	}
-	if closeErr != nil {
-		return closeErr
+	return closeErr
+}
+
+func readRootUpdateJSON(root *os.Root, name string, target any) error {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return err
 	}
-	return os.Rename(file.Name(), filename)
+	if !info.Mode().IsRegular() || info.Size() > 2<<20 {
+		return fmt.Errorf("更新状态文件无效")
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return json.NewDecoder(io.LimitReader(file, 2<<20)).Decode(target)
+}
+
+func writeRootUpdateJSON(root *os.Root, name string, value any) error {
+	temporary := ".state-" + shared.Random(8)
+	file, err := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	defer root.Remove(temporary)
+	if err := writeUpdateFile(file, value); err != nil {
+		return err
+	}
+	return replaceUpdateState(func() error { return root.Rename(temporary, name) })
 }
 
 // Compare release numbers so a local hotfix never gets replaced by the same
@@ -123,7 +162,11 @@ func NewerUpdate(current, latest string) bool {
 }
 
 func UpdateAssets(release githubRelease) (releaseAsset, releaseAsset, error) {
-	name := fmt.Sprintf("zcode2api_%s_%s_%s.tar.gz", release.Tag, runtime.GOOS, runtime.GOARCH)
+	extension := ".tar.gz"
+	if runtime.GOOS == "windows" {
+		extension = ".zip"
+	}
+	name := fmt.Sprintf("zcode2api_%s_%s_%s%s", release.Tag, runtime.GOOS, runtime.GOARCH, extension)
 	var binary, checksums releaseAsset
 	for _, asset := range release.Assets {
 		switch asset.Name {
@@ -152,51 +195,78 @@ func UpdateAssets(release githubRelease) (releaseAsset, releaseAsset, error) {
 }
 
 func UpdateBusy(phase string) bool {
-	return phase == "downloading" || phase == "preparing" || phase == "applying" || phase == "restarting"
+	return phase == "queued" || phase == "downloading" || phase == "preparing" || phase == "applying" || phase == "restarting"
 }
 
-func UpdateRedirect(request *http.Request, via []*http.Request) error {
-	host := request.URL.Hostname()
-	if len(via) > 5 || request.URL.Scheme != "https" || request.URL.User != nil || request.URL.Port() != "" ||
-		(host != "api.github.com" && host != "github.com" && host != "release-assets.githubusercontent.com" && host != "objects.githubusercontent.com") {
+func updateRedirect(request *http.Request, via []*http.Request, mirrorHost string) error {
+	host := strings.ToLower(request.URL.Host)
+	if len(via) > 5 || request.URL.Scheme != "https" || request.URL.User != nil || request.URL.Opaque != "" {
 		return fmt.Errorf("更新下载重定向地址无效")
 	}
-	return nil
+	switch host {
+	case "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com":
+		return nil
+	}
+	if mirrorHost != "" && strings.EqualFold(host, mirrorHost) {
+		return nil
+	}
+	// GH-Proxy serves both published preset domains.
+	if (mirrorHost == "gh-proxy.org" || mirrorHost == "gh-proxy.com") && (host == "gh-proxy.org" || host == "gh-proxy.com") {
+		return nil
+	}
+	return fmt.Errorf("更新下载重定向地址无效")
 }
 
-func UpdateGET(ctx context.Context, client *http.Client, address, etag string) (*http.Response, error) {
+func UpdateGET(ctx context.Context, client *http.Client, address, etag, mirror string) (*http.Response, error) {
 	u, err := url.Parse(address)
-	if err != nil || u.Scheme != "https" || (u.Host != "api.github.com" && u.Host != "github.com") {
+	if err != nil || u.Scheme != "https" || u.User != nil || (u.Host != "api.github.com" && u.Host != "github.com") {
 		return nil, fmt.Errorf("更新地址无效")
+	}
+	source := "GitHub"
+	if mirror != "" {
+		address = mirror + "/" + address
+		source = "GitHub 镜像"
 	}
 	request, err := http.NewRequestWithContext(ctx, "GET", address, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s 请求地址无效", source)
 	}
 	request.Header.Set("User-Agent", "zcode2api-updater")
 	if etag != "" {
 		request.Header.Set("If-None-Match", etag)
 	}
-	response, err := client.Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("无法连接 GitHub，请检查服务器网络或出站代理")
+	mirrorHost := ""
+	if mirror != "" {
+		mirrorHost = strings.ToLower(request.URL.Host)
 	}
-	if response.StatusCode != 200 && response.StatusCode != 304 {
+	routed := *client
+	routed.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		return updateRedirect(request, via, mirrorHost)
+	}
+	response, err := routed.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("无法连接%s，请检查服务器网络或出站代理", source)
+	}
+	if response.StatusCode != 200 && (response.StatusCode != 304 || etag == "") {
 		response.Body.Close()
 		switch response.StatusCode {
 		case 403, 429:
-			return nil, fmt.Errorf("GitHub 请求频率受限，请稍后重试")
+			return nil, fmt.Errorf("%s请求受限，请稍后重试", source)
 		case 404:
-			return nil, fmt.Errorf("仓库尚未发布正式版本或发行文件不存在")
+			return nil, fmt.Errorf("%s未找到正式版本或发行文件", source)
 		default:
-			return nil, fmt.Errorf("GitHub 返回 HTTP %d", response.StatusCode)
+			return nil, fmt.Errorf("%s返回 HTTP %d", source, response.StatusCode)
 		}
 	}
 	return response, nil
 }
 
-func FetchUpdateRelease(ctx context.Context, client *http.Client, cache UpdateReleaseCache) (UpdateReleaseCache, error) {
-	response, err := UpdateGET(ctx, client, "https://api.github.com/repos/"+UpdateRepository+"/releases/latest", cache.ETag)
+func FetchUpdateRelease(ctx context.Context, client *http.Client, cache UpdateReleaseCache, mirror string) (UpdateReleaseCache, error) {
+	etag := ""
+	if cache.Mirror == mirror {
+		etag = cache.ETag
+	}
+	response, err := UpdateGET(ctx, client, "https://api.github.com/repos/"+UpdateRepository+"/releases/latest", etag, mirror)
 	if err != nil {
 		return cache, err
 	}
@@ -216,7 +286,7 @@ func FetchUpdateRelease(ctx context.Context, client *http.Client, cache UpdateRe
 		release.URL != "https://github.com/"+UpdateRepository+"/releases/tag/"+release.Tag {
 		return cache, fmt.Errorf("GitHub 未返回有效的正式版本")
 	}
-	return UpdateReleaseCache{Release: release, CheckedAt: shared.NowMS(), ETag: response.Header.Get("ETag")}, nil
+	return UpdateReleaseCache{Release: release, CheckedAt: shared.NowMS(), ETag: response.Header.Get("ETag"), Mirror: mirror}, nil
 }
 
 type UpdateProgress struct {
@@ -231,6 +301,9 @@ func (progress *UpdateProgress) Write(data []byte) (int, error) {
 }
 
 func ExtractUpdateBinary(archiveName, assetName, output string) error {
+	if strings.HasSuffix(assetName, ".zip") {
+		return extractWindowsUpdateBinary(archiveName, strings.TrimSuffix(assetName, ".zip")+"/zcode2api.exe", output)
+	}
 	archive, err := os.Open(archiveName)
 	if err != nil {
 		return err
@@ -259,21 +332,58 @@ func ExtractUpdateBinary(archiveName, assetName, output string) error {
 			return fmt.Errorf("发行包内的可执行文件无效或重复")
 		}
 		found = true
-		file, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
-		if err != nil {
+		if err := writeUpdateBinary(output, reader, header.Size); err != nil {
 			return err
-		}
-		n, err := io.Copy(file, reader)
-		if err == nil {
-			err = file.Sync()
-		}
-		closeErr := file.Close()
-		if err != nil || closeErr != nil || n != header.Size {
-			return fmt.Errorf("发行包内程序解压不完整")
 		}
 	}
 	if !found {
 		return fmt.Errorf("发行包中未找到当前平台程序")
+	}
+	return nil
+}
+
+func extractWindowsUpdateBinary(archiveName, expected, output string) error {
+	archive, err := zip.OpenReader(archiveName)
+	if err != nil {
+		if archive != nil {
+			archive.Close()
+		}
+		return fmt.Errorf("Windows 发行包格式无效")
+	}
+	defer archive.Close()
+	var candidate *zip.File
+	for _, entry := range archive.File {
+		if strings.ReplaceAll(entry.Name, "\\", "/") != expected {
+			continue
+		}
+		if candidate != nil || !entry.Mode().IsRegular() || entry.UncompressedSize64 == 0 || entry.UncompressedSize64 > updateBinaryLimit {
+			return fmt.Errorf("发行包内的可执行文件无效或重复")
+		}
+		candidate = entry
+	}
+	if candidate == nil {
+		return fmt.Errorf("发行包中未找到 Windows 程序")
+	}
+	reader, err := candidate.Open()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	return writeUpdateBinary(output, reader, int64(candidate.UncompressedSize64))
+}
+
+func writeUpdateBinary(output string, reader io.Reader, size int64) error {
+	file, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+	if err != nil {
+		return err
+	}
+	written, err := io.Copy(file, io.LimitReader(reader, size+1))
+	if err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil || closeErr != nil || written != size {
+		return fmt.Errorf("发行包内程序解压不完整")
 	}
 	return nil
 }

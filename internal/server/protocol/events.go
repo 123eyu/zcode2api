@@ -57,9 +57,20 @@ type Event struct {
 	Frame                       Frame
 }
 
+func (e Event) HasText() bool {
+	return (e.Type == "text_delta" || e.Type == "reasoning_delta") && e.Text != ""
+}
+
+func (e Event) StartsStream(protocol string) bool {
+	if protocol == "anthropic" {
+		return e.Type == "native_event"
+	}
+	return e.HasText() || e.Type == "tool_start"
+}
+
 type Result struct {
 	Text, Reasoning, FinishReason string
-	TraceID                       string
+	TraceID, UsageWarning         string
 	Native, Usage                 shared.M
 	Calls                         []any
 	Attempts                      int

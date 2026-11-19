@@ -192,7 +192,7 @@ async function worker() {
     if (stopping) return;
     stopping = true;
     sessions.clear();
-    await native?.close();
+    await native?.shutdown();
     await browser?.close().catch(() => {});
   };
   process.once('SIGINT', shutdown);
@@ -206,7 +206,7 @@ async function worker() {
       try {
         const config = JSON.parse(line);
         const proxy = config.proxy_url ? new URL(config.proxy_url) : null;
-        if (process.platform === 'win32' && !proxy?.username && !proxy?.password) {
+        if (!config.headless_only && process.platform === 'win32' && !proxy?.username && !proxy?.password) {
           if (!native) {
             const file = browserPath(config, playwright(config));
             if (!file) result = { ok: false, code: 'captcha_browser_missing' };

@@ -140,6 +140,8 @@ docker compose up -d
 
 调用记录中的 `error_message` 是中文分类摘要，`error_code` 是具体错误码。排查时保留 HTTP 状态、错误码、`request_id` 和 `trace_id`。日志入口与筛选方式见[日志保存与筛选](configuration.md#日志保存与筛选)。
 
+遇到 0 Token 时，结合错误码和请求详情中的「上游结束原因」判断。Token 用量显示 `—` 表示输入和输出用量均无记录。
+
 遇到 403 或 405 时，结合具体错误码判断原因。代理故障、WAF、`3012` 和 `F001` 的分类见[出口故障与切换](#出口故障与切换)。
 
 | 错误码 / 提示 | 含义与处理方式 |
@@ -155,6 +157,8 @@ docker compose up -d
 | `F008` / `F018` / `captcha_duplicate_result` | 验证票据重复提交，不能复用已提交的结果 |
 | `captcha_jsdom_missing` / `captcha_runtime_error` / `captcha_timeout` | SDK 依赖缺失、运行异常或验证超时；检查 Node.js、jsdom、网络和验证配置 |
 | `first_token_timeout` / `stream_idle_timeout` / `inference_timeout` | 分别为首个有效输出、流式输出空闲、整轮推理超时 |
+| `upstream_content_refusal` | 上游拒绝生成内容。收到 `stop_reason=refusal` 时，调用记录标为失败并保留记录的 Token 用量，请求详情显示 `refusal`。客户端仍可能收到 HTTP 200 |
+| `upstream_usage_missing` / `upstream_usage_zero` | 已收到内容，但上游提供的 Token 用量不完整，或报告的输出 Token 为 0。调用记录保留成功状态并显示对应说明 |
 | `proxy_subscription_auth_failed` | 订阅令牌可能错误或已失效，重新复制有效订阅链接 |
 
 SDK 不可用时先查看设置页的环境检测结果和依赖路径；需要人工验证时使用官方组件，或在 ZCode 客户端完成领取后刷新余额。

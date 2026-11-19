@@ -17,6 +17,7 @@ import (
 	wire "zcode2api/internal/server/protocol"
 	routing "zcode2api/internal/server/proxy"
 	"zcode2api/internal/server/shared"
+	"zcode2api/internal/server/storage"
 )
 
 func (a *App) AdminHandler() http.Handler {
@@ -29,8 +30,28 @@ func (a *App) AdminHandler() http.Handler {
 			files.ServeHTTP(w, r)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/api/auth/") {
+		keyAPI := r.URL.Path == "/api/keys" || strings.HasPrefix(r.URL.Path, "/api/keys/")
+		if keyAPI || strings.HasPrefix(r.URL.Path, "/api/auth/") {
 			w.Header().Set("Cache-Control", "no-store")
+		}
+		login := r.URL.Path == "/api/auth/login" && r.Method == "POST"
+		if !login {
+			var token string
+			if r.Method == "POST" && (keyAPI || r.URL.Path == "/api/settings/update/install") {
+				token = adminBearer(r)
+			} else {
+				token = adminSessionToken(r)
+			}
+			authorized, err := a.adminAuth(r.Context(), token)
+			if err != nil {
+				a.log.Printf("check admin session: %v", err)
+				writeJSON(w, http.StatusServiceUnavailable, shared.M{"ok": false, "error": "暂时无法验证登录状态，请重试"})
+				return
+			}
+			if !authorized {
+				writeJSON(w, 401, shared.M{"ok": false, "error": "未登录或会话过期"})
+				return
+			}
 		}
 		b := shared.M{}
 		if r.Method == "POST" || r.Method == "PUT" || r.Method == "PATCH" {
@@ -42,9 +63,8 @@ func (a *App) AdminHandler() http.Handler {
 				return
 			}
 		}
-		if r.URL.Path == "/api/auth/login" && r.Method == "POST" {
+		if login {
 			if !a.password(b["password"]) {
-				a.audit("anon", "login.fail", "", a.ip(r))
 				writeJSON(w, 401, shared.M{"ok": false, "error": "密码错误"})
 				return
 			}
@@ -54,18 +74,7 @@ func (a *App) AdminHandler() http.Handler {
 				writeJSON(w, http.StatusServiceUnavailable, shared.M{"ok": false, "error": "暂时无法保存登录状态，请重试"})
 				return
 			}
-			a.audit("admin", "login.ok", "", a.ip(r))
 			writeJSON(w, 200, shared.M{"ok": true, "token": token, "expires_at": expiresAt})
-			return
-		}
-		authorized, err := a.adminAuth(r)
-		if err != nil {
-			a.log.Printf("check admin session: %v", err)
-			writeJSON(w, http.StatusServiceUnavailable, shared.M{"ok": false, "error": "暂时无法验证登录状态，请重试"})
-			return
-		}
-		if !authorized {
-			writeJSON(w, 401, shared.M{"ok": false, "error": "未登录或会话过期"})
 			return
 		}
 		if r.URL.Path == "/api/claims/discover" || r.URL.Path == "/api/claims/verification" || r.URL.Path == "/api/accounts/export" || r.URL.Path == "/api/accounts/import" || strings.HasPrefix(r.URL.Path, "/api/settings/update") {
@@ -90,9 +99,6 @@ func (a *App) AdminHandler() http.Handler {
 			writeJSON(w, status, body)
 			return
 		}
-		if r.Method != "GET" && status < 400 {
-			a.audit("admin", r.Method+" "+r.URL.Path, shared.M{"ok": true}, a.ip(r))
-		}
 		writeJSON(w, status, result)
 	}))
 }
@@ -109,6 +115,14 @@ func adminError(status int, message string) (any, int, error) {
 	return shared.M{"ok": false, "error": message}, status, nil
 }
 
+func adminWriteResult(value any, err error) (any, int, error) {
+	var failure *fault.Failure
+	if errors.As(err, &failure) {
+		return adminError(failure.Status, failure.Message)
+	}
+	return value, http.StatusOK, err
+}
+
 func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 	p, method := r.URL.Path, r.Method
 	ctx := r.Context()
@@ -120,8 +134,11 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 		return wrap(ok, err)
 	case "GET /api/runtime-info":
 		cfg := a.config("host", "app_version", "poll_interval_sec")
-		return shared.M{"web_port": a.webPort, "gateway_port": a.gatewayPort, "host": cfg["host"], "app_version": cfg["app_version"], "version": a.version, "inference_driver": "http", "backend": "go", "poll_interval_sec": cfg["poll_interval_sec"]}, 200, nil
+		return shared.M{"web_port": a.webPort, "gateway_port": a.gatewayPort, "host": cfg["host"], "app_version": cfg["app_version"], "version": a.version, "inference_driver": "http", "backend": "go", "poll_interval_sec": cfg["poll_interval_sec"], "account_operation_concurrency": shared.AccountOperationConcurrency}, 200, nil
 	case "GET /api/accounts":
+		if r.URL.Query().Get("view") == "groups" {
+			return wrap(storage.Query(a.db, "SELECT id,label,customer_id,family,group_id,status FROM accounts ORDER BY created_at,id"))
+		}
 		return shared.Arr(a.summary(ctx)["accounts"]), 200, nil
 	case "POST /api/accounts/import-local":
 		return wrap(a.importLocal(ctx, b))
@@ -201,11 +218,13 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 			period = a.row("SELECT "+usageColumns+" FROM usage_log WHERE ts>=? AND ts<=?", until-hours*3600000, until)
 		}
 		summary := a.summary(ctx)
-		return shared.M{"summary": summary, "groups": a.groups(), "busy_24h": busy, "cache_24h": cache, "cache_trend_24h": shared.M{"hours": 24, "time_unit": "hour", "range_start": until - 86400000, "range_end": until, "utc_offset_minutes": offset / 60, "byHour": cacheTrend}, "daily_usage": shared.M{"hours": days * 24, "time_unit": "day", "range_start": startDay.UnixMilli(), "range_end": until, "utc_offset_minutes": offset / 60, "byHour": daily, "byModel": dailyModels}, "usage_total": usage, "usage_period": shared.Merge(period, shared.M{"hours": hours}), "default_chain": a.defaultChain()}, 200, nil
+		groups := a.groups()
+		return shared.M{"summary": summary, "groups": groups, "busy_24h": busy, "cache_24h": cache, "cache_trend_24h": shared.M{"hours": 24, "time_unit": "hour", "range_start": until - 86400000, "range_end": until, "utc_offset_minutes": offset / 60, "byHour": cacheTrend}, "daily_usage": shared.M{"hours": days * 24, "time_unit": "day", "range_start": startDay.UnixMilli(), "range_end": until, "utc_offset_minutes": offset / 60, "byHour": daily, "byModel": dailyModels}, "usage_total": usage, "usage_period": shared.Merge(period, shared.M{"hours": hours}), "default_chain": defaultGroupChain(groups)}, 200, nil
 	case "GET /api/claims/discover":
 		return wrap(a.discover(ctx, r.URL.Query().Get("account_id"), r.URL.Query().Get("scope") == "daily"))
 	case "GET /api/claims/verification":
-		return wrap(a.claimVerification(ctx, r.URL.Query().Get("account_id"), r.URL.Query().Get("plan_id")))
+		query := r.URL.Query()
+		return wrap(a.claimVerification(ctx, query.Get("account_id"), query.Get("plan_id"), query.Get("config_only") == "1"))
 	case "POST /api/claims/verification/cancel":
 		a.cancelClaimVerification(shared.Str(b["verification_session"]))
 		return ok, 200, nil
@@ -219,8 +238,7 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 			return adminError(400, e.Error())
 		}
 		v, e := a.claim(ctx, shared.Str(b["account_id"]), shared.Str(b["plan_id"]), "manual", b)
-		// Preserve actionable verification and cooldown details on transport or
-		// admission failures instead of reducing them to a generic HTTP error.
+		// Preserve the claim result and its verification details on failure.
 		if v != nil {
 			return v, 200, nil
 		}
@@ -233,49 +251,31 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 		return a.usageStats(r), 200, nil
 	case "GET /api/usage/logs":
 		if r.URL.Query().Has("page") {
-			return a.pagedLogs(r, "logs")
+			return a.pagedUsageLogs(r)
 		}
 		rows := a.rows("SELECT u.*,k.name key_name,a.label account_label FROM usage_log u LEFT JOIN keys k ON k.id=u.key_id LEFT JOIN accounts a ON a.id=u.account_id ORDER BY u.ts DESC LIMIT ?", limitQuery(r, 100, 500))
 		return publicUsageLogs(rows), 200, nil
 	case "GET /api/performance":
 		return a.performance(limitQuery(r, 100, 1000)), 200, nil
-	case "GET /api/schedule-logs":
-		if r.URL.Query().Has("page") {
-			return a.pagedLogs(r, "sched")
-		}
-		return a.rows("SELECT * FROM schedule_log ORDER BY ts DESC LIMIT ?", limitQuery(r, 50, 200)), 200, nil
 	case "GET /api/keys":
-		rows := a.rows("SELECT * FROM keys ORDER BY created_at")
-		for _, v := range rows {
-			m := shared.Obj(v)
-			delete(m, "key_hash")
-			for _, k := range []string{"ip_whitelist", "model_whitelist", "group_order"} {
-				var d any
-				if k != "group_order" {
-					d = []any{}
-				}
-				m[k] = shared.Parse(m[k], d)
-			}
-		}
-		return rows, 200, nil
+		return wrap(a.listKeys())
 	case "POST /api/keys":
-		if !shared.Truth(b["name"]) {
-			return adminError(400, "缺少 name")
+		fields, err := apiKeyConfig(b, true)
+		if err != nil {
+			return adminError(http.StatusBadRequest, err.Error())
 		}
-		return wrap(a.createKey(b))
+		return adminWriteResult(a.createKey(ctx, fields))
 	case "GET /api/groups":
+		if r.URL.Query().Get("details") == "1" {
+			return wrap(a.groupDetails(ctx))
+		}
 		return a.groups(), 200, nil
 	case "POST /api/groups":
-		if !shared.Truth(b["name"]) {
-			return adminError(400, "缺少 name")
+		fields, err := groupConfig(b, true)
+		if err != nil {
+			return adminError(http.StatusBadRequest, err.Error())
 		}
-		id := "g_" + shared.Random(4)
-		enabled := 1
-		if b["enabled"] == false {
-			enabled = 0
-		}
-		e := a.exec("INSERT INTO groups(id,name,role,family_filter,policy,urgent_window_min,enabled,created_at) VALUES(?,?,?,?,?,?,?,?)", id, b["name"], shared.Fallback(b["role"], "primary"), shared.Nullable(b["family_filter"]), shared.Fallback(b["policy"], "balanced"), shared.Fallback(b["urgent_window_min"], 180), enabled, shared.NowMS())
-		return shared.M{"ok": e == nil, "id": id}, 200, e
+		return wrap(a.createGroup(fields))
 	case "GET /api/settings/update":
 		return a.updateStatus(), 200, nil
 	case "POST /api/settings/update/check":
@@ -405,42 +405,42 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 		claimScheduleChanged := shared.JSON(next["daily_claim_time"]) != shared.JSON(a.cfg["daily_claim_time"]) || shared.JSON(next["daily_claim_enabled"]) != shared.JSON(a.cfg["daily_claim_enabled"])
 		versionSyncEnabled := autoVersion && (proxyChanged || !shared.Truth(a.cfg["zcode_version_auto_update"]))
 		versionScheduleChanged := shared.JSON(next["zcode_version_auto_update"]) != shared.JSON(a.cfg["zcode_version_auto_update"]) || shared.JSON(next["zcode_version_check_interval_sec"]) != shared.JSON(a.cfg["zcode_version_check_interval_sec"])
-		e := a.setSetting("config_overrides", over)
-		if e == nil {
-			a.cfg = next
+		logRetentionChanged := shared.Integer(next["usage_log_retention_days"]) != shared.Integer(a.cfg["usage_log_retention_days"])
+		if e := a.setSetting("config_overrides", over); e != nil {
+			a.configMu.Unlock()
+			return ok, 200, e
 		}
+		a.cfg = next
 		a.configMu.Unlock()
-		if e == nil && b["poll_concurrency"] != nil {
+		if b["poll_concurrency"] != nil {
 			shared.Wake(a.pollWake)
 		}
-		if captchaChanged && e == nil {
+		if captchaChanged {
 			a.resetCaptchaCache()
 		}
-		if proxyChanged && e == nil {
+		if proxyChanged {
 			a.resetOutboundProxies()
 		}
-		if (claimScheduleChanged || captchaChanged) && e == nil {
+		if claimScheduleChanged || captchaChanged {
 			a.rescheduleClaims()
 		}
-		if versionScheduleChanged && e == nil {
+		if versionScheduleChanged {
 			a.rescheduleZCodeVersionChecks()
 		}
-		if versionSyncEnabled && e == nil {
+		if logRetentionChanged {
+			shared.Wake(a.usageLogCleanupWake)
+		}
+		if versionSyncEnabled {
 			a.background(func() {
 				if err := a.syncZCodeVersion(a.ctx); err != nil && a.ctx.Err() == nil {
 					a.log.Printf("ZCode 版本同步失败，沿用当前版本：%v", err)
 				}
 			})
 		}
-		if e == nil && (b["daily_claim_enabled"] != nil || b["daily_claim_time"] != nil) {
+		if b["daily_claim_enabled"] != nil || b["daily_claim_time"] != nil {
 			return shared.M{"ok": true, "claim_schedule": a.dailyClaimSchedule()}, 200, nil
 		}
-		return ok, 200, e
-	case "GET /api/audit":
-		if r.URL.Query().Has("page") {
-			return a.pagedLogs(r, "audit")
-		}
-		return a.rows("SELECT * FROM audit_log ORDER BY ts DESC LIMIT ?", limitQuery(r, 100, 300)), 200, nil
+		return ok, 200, nil
 	}
 	if strings.HasPrefix(p, "/api/accounts/oauth/status/") && method == "GET" {
 		row := a.row("SELECT * FROM oauth_flows WHERE flow_id=?", strings.TrimPrefix(p, "/api/accounts/oauth/status/"))
@@ -504,11 +504,13 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 					fields["proxy_url"] = shared.Nullable(p)
 					proxyChanged = p != shared.Str(account["proxy_url"])
 				}
-				if shared.Truth(fields["group_id"]) && a.row("SELECT id FROM groups WHERE id=?", fields["group_id"]) == nil {
-					return adminError(400, "分组不存在")
+				var err error
+				if _, moves := fields["group_id"]; moves {
+					err = a.updateAccountPlacement(ctx, id, fields, b)
+				} else {
+					err = a.updateAccount(id, fields)
 				}
-				e := a.updateAccount(id, fields)
-				return shared.M{"ok": e == nil, "proxy_updated": proxyChanged}, 200, e
+				return adminWriteResult(shared.M{"ok": err == nil, "proxy_updated": proxyChanged}, err)
 			}
 		}
 		if len(parts) == 2 && method == "POST" {
@@ -521,29 +523,43 @@ func (a *App) adminRoute(r *http.Request, b shared.M) (any, int, error) {
 		}
 	}
 	if strings.HasPrefix(p, "/api/keys/") {
-		id := strings.TrimPrefix(p, "/api/keys/")
+		id, action, hasAction := strings.Cut(strings.TrimPrefix(p, "/api/keys/"), "/")
+		if id == "" {
+			return adminError(http.StatusNotFound, "密钥不存在")
+		}
+		if hasAction {
+			if method == "POST" {
+				switch action {
+				case "secret":
+					return a.revealKey(ctx, id)
+				case "rotate":
+					return a.rotateKey(ctx, id, shared.Str(b["key_tail"]))
+				}
+			}
+			return adminError(http.StatusNotFound, "接口不存在")
+		}
 		switch method {
 		case "DELETE":
 			return ok, 200, a.exec("DELETE FROM keys WHERE id=?", id)
 		case "PATCH":
-			fields := shared.Clone(b)
-			if v, exists := fields["default_level"]; exists && !settings.ValidLevel(shared.Str(v)) {
-				fields["default_level"] = nil
+			fields, err := apiKeyConfig(b, false)
+			if err != nil {
+				return adminError(http.StatusBadRequest, err.Error())
 			}
-			return ok, 200, a.update("keys", "id", id, fields, "name quota_limit expires_at ip_whitelist model_whitelist group_order sticky_minutes default_level enabled")
+			return adminWriteResult(ok, a.patchKey(ctx, id, fields))
 		}
 	}
 	if strings.HasPrefix(p, "/api/groups/") {
 		id := strings.TrimPrefix(p, "/api/groups/")
 		switch method {
 		case "DELETE":
-			n := shared.Integer(a.row("SELECT COUNT(*) n FROM accounts WHERE group_id=?", id)["n"])
-			if n > 0 {
-				return adminError(200, fmt.Sprintf("分组下还有 %d 个账号，先移出再删除", n))
-			}
-			return ok, 200, a.exec("DELETE FROM groups WHERE id=?", id)
+			return a.deleteGroup(ctx, id)
 		case "PATCH":
-			return ok, 200, a.update("groups", "id", id, b, "name role family_filter policy urgent_window_min enabled")
+			fields, err := groupConfig(b, false)
+			if err != nil {
+				return adminError(http.StatusBadRequest, err.Error())
+			}
+			return a.updateGroup(ctx, id, fields)
 		}
 	}
 	return adminError(404, "接口不存在")

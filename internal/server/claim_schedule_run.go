@@ -18,7 +18,7 @@ const dailyClaimRecoveryWindow = 10 * time.Minute
 
 const dailyClaimRecoveryDelay = time.Minute
 
-const dailyClaimConcurrency = 5
+const dailyClaimConcurrency = shared.AccountOperationConcurrency
 
 type scheduledClaimContextKey struct{}
 

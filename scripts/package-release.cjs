@@ -27,21 +27,19 @@ if (goos === 'windows') {
   assert.equal(bytes.readUInt32LE(0), 0xfeedfacf);
   assert.equal(bytes.readUInt32LE(4), goarch === 'amd64' ? 0x01000007 : 0x0100000c);
 }
-const sharedFiles = [
+const files = [
   'LICENSE', 'README.md', 'README.EN.md', 'README.JP.md', 'CHANGELOG.md', 'SECURITY.md', 'config.example.json',
+  'compose.yaml', 'compose.update.yaml',
   'docs/configuration.md', 'docs/network.md',
   'docs/protocol-compatibility.md', 'grammar_python/requirements.txt',
   'captcha_node/package.json', 'captcha_node/package-lock.json',
   ...fs.readdirSync(path.join(root, 'docs')).filter(file => file.endsWith('.png')).map(file => `docs/${file}`),
 ];
-for (const file of sharedFiles) {
+if (goos === 'windows') files.push('scripts/start.ps1', 'scripts/stop.ps1');
+for (const file of files) {
   const destination = path.join(directory, file);
   fs.mkdirSync(path.dirname(destination), { recursive: true });
   fs.copyFileSync(path.join(root, file), destination);
-}
-if (goos === 'windows') {
-  fs.mkdirSync(path.join(directory, 'scripts'));
-  for (const file of ['start.ps1', 'stop.ps1']) fs.copyFileSync(path.join(root, 'scripts', file), path.join(directory, 'scripts', file));
 }
 const archive = path.join(output, name + (goos === 'windows' ? '.zip' : '.tar.gz'));
 if (goos === 'windows' && process.platform === 'win32') {
@@ -56,7 +54,7 @@ try {
   if (goos === 'windows' && process.platform !== 'win32') execFileSync('unzip', ['-q', archive, '-d', checkDirectory]);
   else execFileSync('tar', ['-xf', archive, '-C', checkDirectory]);
   const entries = fs.readdirSync(checkDirectory, { recursive: true }).map(entry => entry.replaceAll('\\', '/'));
-  for (const file of [binary, ...sharedFiles, ...(goos === 'windows' ? ['scripts/start.ps1', 'scripts/stop.ps1'] : [])]) assert.ok(entries.includes(`${name}/${file}`), `Archive missing ${file}`);
+  for (const file of [binary, ...files]) assert.ok(entries.includes(`${name}/${file}`), `Archive missing ${file}`);
   assert.ok(entries.every(entry => (entry === name || entry.startsWith(name + '/')) && !/(^|\/)(data|node_modules|\.git)(\/|$)/.test(entry) && !entry.endsWith('/config.json')), 'Archive contains runtime data or an unexpected path');
 } finally {
   fs.rmSync(checkDirectory, { recursive: true, force: true });

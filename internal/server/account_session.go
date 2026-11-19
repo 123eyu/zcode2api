@@ -273,7 +273,7 @@ func (a *App) platformName(ctx context.Context, r shared.M) any {
 }
 
 func (a *App) addPlatformNames(ctx context.Context, accounts []any) {
-	shared.ParallelFor(len(accounts), 4, func(i int) {
+	shared.ParallelFor(len(accounts), shared.AccountOperationConcurrency, func(i int) {
 		if ctx.Err() == nil {
 			r := shared.Obj(accounts[i])
 			r["platform_name"] = a.platformName(ctx, r)

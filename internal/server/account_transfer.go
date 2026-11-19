@@ -247,7 +247,7 @@ func (a *App) importAccounts(ctx context.Context, b shared.M) (any, int, error) 
 		if targetGroup == "" {
 			var loaded bool
 			if targetGroup, loaded = defaultGroups[entry.Family]; !loaded {
-				err := tx.QueryRowContext(ctx, "SELECT id FROM groups WHERE enabled=1 AND role='primary' AND (family_filter IS NULL OR family_filter='' OR family_filter=?) ORDER BY created_at LIMIT 1", entry.Family).Scan(&targetGroup)
+				err := tx.QueryRowContext(ctx, automaticAccountGroup, entry.Family).Scan(&targetGroup)
 				if err != nil && err != sql.ErrNoRows {
 					return nil, 500, err
 				}

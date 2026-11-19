@@ -20,7 +20,7 @@ globalThis.Z2ACacheDetails = (() => {
     const { esc, fmtInt } = helpers, u = usage(row);
     const fields = [['总输入 Token', fmtInt(row.tokens_in)], ['普通输入', fmtInt(u.ordinary)], ['缓存读取', fmtInt(row.cache_read)], ['缓存写入', fmtInt(row.cache_write)], ['输出 Token', fmtInt(row.tokens_out)], ['命中率', percent(u.rate)], ['首 Token 时间', row.ttft_ms == null ? '—' : fmtInt(row.ttft_ms) + ' ms'], ['尝试次数', fmtInt(row.attempt_count)], ['密钥', row.key_name || row.key_id || '—'], ['账号', row.account_label || row.account_id || '—'], ['请求 ID', row.request_id], ['追踪 ID', row.trace_id || '—']];
     const detail = row.error_detail || {};
-    for (const [label, value] of [['错误码', row.error_code], ['上游 HTTP 状态', detail.http_status], ['上游请求 ID', detail.request_id], ['ZCode 查询 ID', detail.query_id], ['ZCode 会话 ID', detail.session_id]]) {
+    for (const [label, value] of [['错误码', row.error_code], ['上游结束原因', detail.stop_reason], ['上游 HTTP 状态', detail.http_status], ['上游请求 ID', detail.request_id], ['ZCode 查询 ID', detail.query_id], ['ZCode 会话 ID', detail.session_id]]) {
       if (value != null && value !== '') fields.push([label, value]);
     }
     return fields.map(([label, value]) => `<div${label.endsWith(' ID') ? ' class="cache-detail-wide"' : ''}><dt>${label}</dt><dd>${esc(value)}</dd></div>`).join('');

@@ -18,6 +18,12 @@ import (
 )
 
 func (a *App) preview(ctx context.Context, r shared.M, dailyOnly bool) (shared.M, error) {
+	select {
+	case a.claimPreviewSlots <- struct{}{}:
+		defer func() { <-a.claimPreviewSlots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if dailyOnly {
 		preview, err := a.marketingPreview(ctx, r)
 		if err == nil {
@@ -152,6 +158,7 @@ func (a *App) incentives(ctx context.Context, r shared.M) (shared.M, error) {
 }
 
 func (a *App) discover(ctx context.Context, id string, dailyOnly bool) (shared.M, error) {
+	ctx = context.WithValue(ctx, manualClaimContextKey{}, true)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	statement := "SELECT * FROM accounts"
@@ -172,7 +179,7 @@ func (a *App) discover(ctx context.Context, id string, dailyOnly bool) (shared.M
 		}
 	}
 	previews := make([]any, len(accounts))
-	shared.ParallelFor(len(accounts), claimDiscoveryConcurrency, func(index int) {
+	shared.ParallelFor(len(accounts), shared.AccountOperationConcurrency, func(index int) {
 		// Keep account order and explicit errors for canceled or timed-out rows.
 		previews[index] = a.discoverClaimAccount(ctx, accounts[index], dailyOnly)
 	})
@@ -204,6 +211,11 @@ func dailyFreePlans(plans []any) []any {
 }
 
 func (a *App) claim(ctx context.Context, id, plan, trigger string, verification shared.M) (result shared.M, err error) {
+	manual := trigger == "manual"
+	batch := manual && shared.Truth(verification["auto_verify"])
+	if manual {
+		ctx = context.WithValue(ctx, manualClaimContextKey{}, true)
+	}
 	// Serialize all cards for one account, including manual and batch requests.
 	a.mu.Lock()
 	if a.claimLocks[id] {
@@ -231,13 +243,13 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 			return recorded, e
 		}
 	}
+	worker, releaseWorker, workerErr := a.acquireClaimWorker(ctx)
+	if workerErr != nil {
+		return nil, workerErr
+	}
+	defer releaseWorker()
 	if trigger != "scheduled" {
-		workerCtx, releaseWorker, workerErr := a.acquireManualClaimWorker(ctx)
-		if workerErr != nil {
-			return nil, workerErr
-		}
-		defer releaseWorker()
-		ctx = workerCtx
+		ctx = context.WithValue(ctx, manualClaimWorkerKey{}, worker)
 	}
 	diagnostic := shared.M{"stage": "route", "sdk_attempted": false, "sdk_executed": false, "sdk_initialized": false, "ticket_attached": false, "browser_ticket": shared.Str(verification["captcha_verify_param"]) != "", "claim_request_started": false, "http_status": 0, "initial_http_status": 0}
 	ctx = context.WithValue(ctx, claimCaptchaDiagnosticKey{}, diagnostic)
@@ -265,9 +277,11 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 		if !shared.Truth(result["ok"]) {
 			diagnostic["failure_stage"] = diagnostic["stage"]
 			if result != nil && failure != nil {
-				result["requires_verification"] = shared.Truth(result["requires_verification"]) || captchasdk.ClaimBrowserFallback(failure)
+				if !manual {
+					result["requires_verification"] = shared.Truth(result["requires_verification"]) || captchasdk.ClaimBrowserFallback(failure)
+				}
 				result["retry_after_ms"] = failure.RetryAfter.Milliseconds()
-				if shared.Truth(result["requires_verification"]) {
+				if !manual && shared.Truth(result["requires_verification"]) {
 					result["verification_retry_at"] = shared.NowMS() + max(int64(0), failure.RetryAfter.Milliseconds())
 					result["manual_verification_failed"] = shared.Truth(diagnostic["browser_ticket"])
 				}
@@ -275,7 +289,6 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 		}
 		diagnostic["retry_after_ms"] = result["retry_after_ms"]
 		diagnostic["requires_verification"] = shared.Truth(result["requires_verification"])
-		a.audit("system", "claim", shared.M{"account": id, "plan_id": plan, "ok": shared.Truth(result["ok"]), "code": result["code"], "verification": diagnostic}, "")
 	}()
 	ctx, release, e := a.claimVerificationContext(ctx, r, plan, token, verification)
 	if e != nil {
@@ -307,16 +320,20 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 		headers["X-Aliyun-Captcha-Verify-Region"] = verification["captcha_region"]
 	}
 	var verificationFailure *fault.Failure
-	// Every claim without a browser ticket resolves verification first. The
-	// trigger and legacy auto_verify flag must not permit unverified probes.
+	// In an enabled scene, a single manual claim uses the page's ticket.
+	// A manual batch can use the SDK in a headless browser.
 	if shared.Str(verification["captcha_verify_param"]) == "" {
 		diagnostic["stage"] = "scene"
 		var scene shared.M
 		scene, verificationFailure = a.captchaScene(ctx, r)
-		if verificationFailure == nil && shared.Truth(scene["enabled"]) {
+		if manual && !batch && verificationFailure == nil && shared.Truth(scene["enabled"]) {
+			verificationFailure = &fault.Failure{Kind: "risk", Code: "coding_plan_security_verification_required", Message: "请重新点击领取并完成安全验证"}
+		} else if verificationFailure == nil && shared.Truth(scene["enabled"]) {
 			diagnostic["sdk_attempted"], diagnostic["stage"] = true, "sdk"
 			purpose := captchasdk.CaptchaPurposeClaim
-			if trigger == "scheduled" {
+			if batch {
+				purpose = captchasdk.CaptchaPurposeBatchClaim
+			} else if trigger == "scheduled" {
 				purpose = captchasdk.CaptchaPurposeScheduledClaim
 			}
 			sdkVerification, verificationFailure = a.captchaHeaders(ctx, r, purpose, true)
@@ -363,8 +380,10 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 	if raw := shared.First(shared.Obj(res.JSON["error"])["code"], res.JSON["code"]); raw != nil {
 		code = shared.Str(raw)
 	}
+	alreadyClaimed := manual && !ok && code == "1003" && (res.Status == 200 || res.Status == 400 || res.Status == 409)
+	completed := ok || alreadyClaimed
 	message := shared.First(data["message"], res.JSON["msg"], "")
-	if !ok {
+	if !completed {
 		failure = fault.ApiResponseFailure(res)
 		if res.Status > 0 {
 			// Keep the redacted upstream response before the shared classifier's
@@ -375,14 +394,24 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 			failure = &fault.Failure{Kind: "server", Code: "claim_invalid_response", Message: "领取响应缺少卡片信息，请刷新领取状态"}
 		}
 	}
-	requiresVerification := !ok && captchasdk.ClaimResponseRequiresVerification(res)
-	if verificationFailure != nil {
+	requiresVerification := !completed && captchasdk.ClaimResponseRequiresVerification(res)
+	if alreadyClaimed {
+		message = "该账号已领取过"
+	} else if verificationFailure != nil {
 		failure = verificationFailure
 		code = verificationFailure.Code
 		message = fault.ConciseFailureMessage(verificationFailure)
-		requiresVerification = captchasdk.ClaimBrowserFallback(verificationFailure)
-		if requiresVerification {
-			message = shared.Str(message) + "，请完成浏览器验证后领取"
+		if manual {
+			requiresVerification = verificationFailure.Code == "coding_plan_security_verification_required"
+			if batch && verificationFailure.Kind != "account_risk" && captchasdk.ClaimBrowserFallback(verificationFailure) {
+				requiresVerification = true
+				message = "需要人工验证后领取"
+			}
+		} else {
+			requiresVerification = captchasdk.ClaimBrowserFallback(verificationFailure)
+			if requiresVerification {
+				message = shared.Str(message) + "，请完成浏览器验证后领取"
+			}
 		}
 	} else if requiresVerification {
 		failure.Kind, failure.Retryable = "risk", false
@@ -405,13 +434,15 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 		}
 	}
 	end := accountdata.SecondsMS(p["ends_at"])
-	_ = a.exec("INSERT INTO claim_log(account_id,ts,plan_id,ok,code,message,user_plan_id,ends_at,trigger) VALUES(?,?,?,?,?,?,?,?,?)", id, shared.NowMS(), plan, shared.Integer(ok), code, message, p["user_plan_id"], end, trigger)
+	_ = a.exec("INSERT INTO claim_log(account_id,ts,plan_id,ok,code,message,user_plan_id,ends_at,trigger) VALUES(?,?,?,?,?,?,?,?,?)", id, shared.NowMS(), plan, shared.Integer(completed), code, message, p["user_plan_id"], end, trigger)
 	diagnostic["initial_http_status"], diagnostic["http_status"], diagnostic["requires_verification"] = res.Status, res.Status, requiresVerification
 	if verificationFailure != nil {
 		diagnostic["sdk_error"] = verificationFailure.Code
 	}
 	if ok {
 		a.acceptCaptchaVerification(ctx, &sdkVerification)
+	}
+	if completed {
 		a.invalidateBalance(id)
 		a.scheduleNext(id, 0)
 	}
@@ -419,7 +450,10 @@ func (a *App) claim(ctx context.Context, id, plan, trigger string, verification 
 	if len(p) > 0 {
 		resultPlan = p
 	}
-	result = shared.M{"ok": ok, "httpStatus": res.Status, "code": code, "message": message, "plan": resultPlan, "endsAt": end, "requires_verification": requiresVerification, "verification": diagnostic}
+	result = shared.M{"ok": completed, "httpStatus": res.Status, "code": code, "message": message, "plan": resultPlan, "endsAt": end, "requires_verification": requiresVerification, "verification": diagnostic}
+	if alreadyClaimed {
+		result["already_claimed"] = true
+	}
 	if failure != nil {
 		result["failure_kind"], result["retryable"] = failure.Kind, failure.Retryable
 		if failure.RetryAfter > 0 {

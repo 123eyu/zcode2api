@@ -1,7 +1,7 @@
 'use strict';
 
 const dashboardChartLayout = { width: 1120, height: 282, left: 68, right: 66, top: 34, bottom: 235 };
-const dashboardChartColors = ['orange', 'amber', 'blue', 'violet', 'teal', 'pink'].map(color => `var(--chart-${color})`);
+const dailyTokenChartColors = ['orange', 'amber', 'blue', 'violet', 'teal', 'pink'].map(color => `var(--token-bar-${color})`);
 const chartCoord = value => Number(value).toFixed(2);
 function dashboardChartMaximum(value) {
   const raw = Math.max(4, value), power = 10 ** Math.floor(Math.log10(raw));
@@ -118,7 +118,7 @@ function renderDailyTokenChart(root, stats) {
     names.add('全部模型');
     rows.forEach(row => values.set(row.bucket, new Map([['全部模型', row.tokens]])));
   }
-  const models = [...names].sort().map((name, index) => ({ name, color: dashboardChartColors[index % dashboardChartColors.length] }));
+  const models = [...names].sort().map((name, index) => ({ name, color: dailyTokenChartColors[index % dailyTokenChartColors.length] }));
   const { width, height, left, right, top, bottom } = dashboardChartLayout;
   const step = (width - left - right) / rows.length, barWidth = Math.min(38, step * .55);
   const maximum = dashboardChartMaximum(Math.max(0, ...rows.map(row => row.tokens)));

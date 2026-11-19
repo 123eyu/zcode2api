@@ -20,12 +20,14 @@
   --ok: #047857;
   --warn: #b45309;
   --info: #2563eb;
-  --chart-orange: #c4512c;
   --chart-amber: #a66a06;
   --chart-blue: #356fd1;
-  --chart-violet: #7956c4;
-  --chart-teal: #187c6c;
-  --chart-pink: #b54578;
+  --token-bar-orange: #ff886b;
+  --token-bar-amber: #ffca45;
+  --token-bar-blue: #66b1ff;
+  --token-bar-violet: #b598ff;
+  --token-bar-teal: #3dd4ae;
+  --token-bar-pink: #ff83c1;
   --trend-cache: #1680ff;
   --trend-tokens: #ec6817;
   --shadow-pop: 0 16px 48px oklch(0 0 0 / 18%);
@@ -82,12 +84,14 @@ html.dark {
   --ok: #34d399;
   --warn: #fbbf24;
   --info: #60a5fa;
-  --chart-orange: #f28364;
   --chart-amber: #edbb63;
   --chart-blue: #78a9ff;
-  --chart-violet: #b59aef;
-  --chart-teal: #55c5ae;
-  --chart-pink: #e993bc;
+  --token-bar-orange: #ff9a80;
+  --token-bar-amber: #ffd568;
+  --token-bar-blue: #80c2ff;
+  --token-bar-violet: #c6aaff;
+  --token-bar-teal: #5ce5c1;
+  --token-bar-pink: #ff9cd1;
   --trend-cache: var(--chart-blue);
   --trend-tokens: var(--chart-amber);
   --dock-bg: #212227;
@@ -445,6 +449,17 @@ td {
 tr:last-child td { border-bottom: 0; }
 tbody tr:hover > td, section > table tr:hover > td { background: var(--control-background); }
 .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11.5px; color: var(--muted-fg); }
+.key-actions { flex-wrap: wrap; justify-content: flex-end; }
+.key-actions .btn { flex: none; }
+.group-default-chain { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13px; }
+.group-default-chain strong { font-weight: 600; overflow-wrap: anywhere; }
+.group-table { --table-cell-padding: 12px; overflow-x: auto; }
+.group-table table { min-width: 590px; }
+.group-table td { padding-block: 8px; }
+.group-table .cell-name { min-width: 100px; }
+.group-table .cell-name .nm { max-width: 32ch; }
+.group-table td:last-child { width: 1%; }
+.group-row-meta { display: block; margin-top: 2px; font-size: 11px; white-space: nowrap; }
 @media (min-width: 641px) {
   #key-table > .tablecard { --table-cell-padding: 14px; overflow-x: auto; }
   #key-table th { height: 38px; padding-block: 8px; }
@@ -578,6 +593,25 @@ textarea.invalid, textarea.invalid:focus { border-color: var(--destructive); }
 .dialog-field input, .dialog-field select { width: 100%; font-weight: 400; }
 .field-inline { flex-direction: row; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; }
 .dialog-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.modal:has(.key-form, .group-form, .group-members) { width: min(100%, 600px); }
+.key-field-wide, .group-field-wide { grid-column: 1 / -1; }
+:is(.key-form, .group-form) .select-trigger { min-height: 32px; }
+:is(.key-form .key-enabled, .group-form .group-enabled) { justify-content: flex-start; min-height: 32px; align-self: flex-start; font-weight: 600; }
+.group-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.group-fields legend { margin: 0 0 8px; padding: 0; color: var(--muted-fg); font-size: 12px; font-weight: 600; }
+.key-chain-custom:not([hidden]) { display: grid; gap: 8px; }
+.key-chain-add { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
+.key-chain-list, .group-member-list { margin: 0; padding: 0; list-style: none; }
+.key-chain-list:empty { display: none; }
+.key-chain-list li, .group-member-list li { display: grid; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--divider); font-size: 13px; }
+.key-chain-list li { grid-template-columns: minmax(0, 1fr) auto; }
+.key-chain-list li > span { overflow-wrap: anywhere; }
+.key-chain-list .cell-actions { flex-wrap: wrap; justify-content: flex-end; }
+.group-member-list li { grid-template-columns: minmax(0, 1fr) minmax(4rem, 25%) auto; gap: 12px; }
+.group-member-list li:last-child { border-bottom: 0; }
+.group-member-name, .group-member-status { display: grid; gap: 2px; overflow-wrap: anywhere; }
+.group-member-name strong { font-weight: 600; }
+.group-member-name .muted, .group-member-status { font-size: 12px; }
 .dialog-error { margin: 0; font-size: 13px; }
 .dialog-error:empty { display: none; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
@@ -600,6 +634,8 @@ textarea.invalid, textarea.invalid:focus { border-color: var(--destructive); }
   .modal-body { padding: 20px; }
   .modal-body .kv { grid-template-columns: minmax(0, 1fr); gap: 5px; }
   .dialog-grid { grid-template-columns: minmax(0, 1fr); }
+  .group-table { --table-cell-padding: 10px; }
+  .group-member-list li { gap: 8px; }
 }
 pre.log {
   margin: 0; padding: 10px 12px; border-radius: 10px;
@@ -721,12 +757,10 @@ details[open] > .disclosure-heading::before { transform: translateY(-.125rem) ro
 .usage-pager .pinfo { margin: 0 6px; }
 #log-panel { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 #log-panel > .pager { margin-top: 0; }
-.log-tabs { padding: 3px; }
 .log-live { color: var(--muted-fg); }
 .log-live::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .55; }
 .log-live[aria-pressed="true"]::before { background: var(--ok); opacity: 1; }
 .log-live.is-reconnecting::before { background: var(--warn); }
-.log-tabs .tab { min-height: 28px; padding: 3px 9px; }
 .log-filter-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px 12px; margin: 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; background: var(--card); }
 .log-filter-grid { display: grid; gap: 8px; }
 .log-primary-filters { grid-column: 1 / -1; grid-template-columns: minmax(220px, 1.6fr) minmax(105px, .65fr) minmax(105px, .65fr) minmax(180px, 1.1fr); }
@@ -770,29 +804,7 @@ details[open] > .disclosure-heading::before { transform: translateY(-.125rem) ro
 .log-cache-inline .cache-open:disabled { opacity: .45; cursor: default; color: var(--muted-fg); background: transparent; }
 /* Keep long errors out of intrinsic sizing; fill the final column after layout. */
 .log-calls .log-error-message { width: 0; min-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log-detail-trigger { flex: none; padding: 3px 7px; border: 0; border-radius: 6px; background: transparent; color: var(--muted-fg); font: inherit; font-size: 11px; cursor: pointer; }
-.log-detail-trigger:hover, .log-detail-trigger[aria-expanded="true"] { background: var(--accent); color: var(--foreground); }
-.log-detail-card { position: fixed; inset: auto; z-index: 100; margin: 0; padding: 12px; width: var(--popover-max-width); max-width: calc(100vw - 2 * var(--popover-edge)); max-height: var(--popover-max-height); overflow: auto; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: var(--popover-radius); background: var(--card); color: var(--foreground); box-shadow: var(--shadow-pop); font-size: 12px; }
-.log-detail-card[hidden] { display: none; }
-.log-detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
-.log-detail-heading strong { font-size: 12px; font-weight: 600; }
-.log-detail-close { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--muted-fg); font-size: 18px; line-height: 1; cursor: pointer; }
-.log-detail-close:hover { background: var(--accent); color: var(--foreground); }
-.log-detail-card dl { display: grid; gap: 7px; margin: 0; }
-.log-detail-card dl > div { display: grid; grid-template-columns: 58px minmax(0, 1fr); align-items: baseline; gap: 10px; }
-.log-detail-card dt { color: var(--muted-fg); font-size: 11px; }
-.log-detail-card dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 11.5px; line-height: 1.5; }
-.log-candidate-trigger { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); white-space: nowrap; }
-.log-candidate-trigger > span { font-variant-numeric: tabular-nums; }
-.log-candidate-list { display: grid; gap: 7px; }
-.log-candidate-item { padding: 8px 9px; border-radius: 8px; background: var(--muted); }
-.log-candidate-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.log-candidate-head strong { min-width: 0; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
-.log-candidate-head .badge { flex: none; max-width: 60%; white-space: normal; overflow-wrap: anywhere; }
-.log-candidate-id { margin-top: 3px; color: var(--muted-fg); font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 10.5px; overflow-wrap: anywhere; }
-.log-candidate-empty { margin: 0; font-size: 12px; color: var(--muted-fg); line-height: 1.6; }
 .mobile-log-error { display: block; margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--destructive); font-size: 12px; line-height: 1.5; }
-.log-audit-detail { max-width: 480px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .cache-open { padding: 4px 7px; border: 0; border-radius: 6px; background: transparent; color: var(--muted-fg); cursor: pointer; font: inherit; font-size: 12px; transition: color var(--fast), background var(--fast); }
 .cache-open:hover { color: var(--foreground); background: var(--accent); }
 .cache-detail-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 18px; background: var(--card); color: var(--foreground); box-shadow: var(--shadow-pop); }
@@ -875,6 +887,7 @@ details[open] > .disclosure-heading::before { transform: translateY(-.125rem) ro
 .daily-claim-title h2 { margin: 0 0 3px; font-size: 17px; font-weight: 600; letter-spacing: -.02em; }
 .daily-claim-title div > span { font-size: 12px; color: var(--muted-fg); }
 .daily-claim-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 16px; }
+.daily-claim-actions > [hidden], .daily-claim-action > [hidden] { display: none; }
 .daily-claim-schedule { display: flex; align-items: center; gap: 6px; }
 .daily-claim-schedule label { display: inline-flex; align-items: center; gap: 10px; min-height: 36px; font-size: 12px; color: var(--muted-fg); cursor: pointer; white-space: nowrap; }
 .daily-claim-schedule input[type="checkbox"] { appearance: none; display: inline-block; flex: none; width: 34px; height: 20px; margin: 0; padding: 3px; border: 0; border-radius: 999px; background: var(--border); cursor: pointer; transition: background var(--fast) var(--ease-out), opacity var(--fast) var(--ease-out); }
@@ -893,14 +906,22 @@ details[open] > .disclosure-heading::before { transform: translateY(-.125rem) ro
 .daily-claim-schedule input[type="checkbox"]:checked { background: var(--primary); }
 .daily-claim-schedule input[type="checkbox"]:checked::before { transform: translateX(14px); background: var(--primary-fg); }
 .daily-claim-schedule input:disabled { opacity: .5; cursor: default; }
-.daily-claim-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 20px; min-height: 48px; padding: 7px 24px; border-top: 1px solid var(--border); transition: background var(--fast) var(--ease-out); }
+.daily-claim-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; column-gap: 20px; min-height: 48px; padding: 7px 24px; border-top: 1px solid var(--border); transition: background var(--fast) var(--ease-out); }
 .daily-claim-row:hover { background: var(--accent); }
-.daily-claim-row .account-name-button { width: fit-content; min-width: 0; max-width: 100%; }
-.daily-claim-row .account-identity { flex-direction: row; align-items: center; gap: 14px; min-width: 0; }
-.daily-claim-row .account-row-family { margin-left: 4px; }
-.daily-claim-row .account-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.daily-claim-row .account-name-button {
+  display: grid;
+  grid-template-columns: 25px clamp(4.5rem, 9vw, 6rem) minmax(0, 8rem) minmax(0, 1fr);
+  justify-self: start;
+  width: min(100%, 24rem);
+}
+.daily-claim-row .account-identity { display: contents; }
+.daily-claim-row .account-name-button .account-row-name { white-space: nowrap; }
+.daily-claim-row .account-row-family { min-width: 0; margin-left: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .daily-claim-action { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 .daily-claim-action > .btn { min-width: 64px; min-height: 30px; height: 30px; padding: 0 12px; font-size: 12px; }
+.daily-claim-feedback { grid-column: 1 / -1; margin: 2px 0 3px; color: var(--muted-fg); font-size: 12px; overflow-wrap: anywhere; }
+.daily-claim-feedback:empty, #claims-summary:empty { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.daily-claim-feedback.error { color: var(--destructive); }
 .daily-claim-row.needs-verification { box-shadow: inset 2px 0 var(--primary); }
 .daily-claim-row.query-stale { box-shadow: inset 2px 0 var(--warn); }
 .daily-claim-grants { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 20px; text-align: right; }
@@ -1286,6 +1307,7 @@ details[open] > .disclosure-heading::before { transform: translateY(-.125rem) ro
   .responsive-table.log-table td { height: auto; }
   .responsive-table td::before { content: attr(data-label); display: block; color: var(--muted-fg); font: 12px/1.5 'Segoe UI Variable Text', 'Microsoft YaHei UI', sans-serif; margin-bottom: 4px; }
   .responsive-table td:first-child, .responsive-table td:last-child { grid-column: 1 / -1; }
+  .key-actions { justify-content: flex-start; }
 }
 
 @media (max-width: 640px) and (any-hover: none) and (pointer: coarse) {
@@ -1315,8 +1337,10 @@ details[open] > .disclosure-heading::before { transform: translateY(-.125rem) ro
   .daily-claim-icon { width: 38px; height: 38px; border-radius: 11px; }
   .daily-claim-title h2 { font-size: 15px; }
   .daily-claim-actions { width: 100%; justify-content: space-between; gap: 8px; }
-  .daily-claim-row { gap: 10px; padding: 7px 16px; }
-  .daily-claim-row .account-identity { flex-direction: column; align-items: flex-start; gap: 0; }
+  .daily-claim-row { column-gap: 10px; padding: 7px 16px; }
+  .daily-claim-action { flex-wrap: wrap; max-width: 135px; gap: 4px; }
+  .daily-claim-row .account-name-button { display: flex; width: fit-content; max-width: 100%; }
+  .daily-claim-row .account-identity { display: flex; align-items: flex-start; gap: 0; }
   .daily-claim-row .account-row-family { display: none; }
   .daily-claim-action > .btn { min-width: 52px; padding-inline: 10px; }
   .daily-claim-grants { max-width: 115px; }

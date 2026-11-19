@@ -16,8 +16,9 @@ class NativeClaimBrowser {
 
   async open(config) {
     const proxy = config.proxy_url || '';
-    if (this.child && this.child.exitCode === null && (config.action === 'warm' || this.proxy === proxy)) return;
+    if (this.child && this.child.exitCode === null && this.child.signalCode === null && (config.action === 'warm' || this.proxy === proxy)) return;
     await this.close();
+    if (this.stopping) return;
     this.proxy = proxy;
     this.nonce = crypto.randomBytes(24).toString('hex');
     this.server = http.createServer((request, response) => this.handle(request, response));
@@ -25,17 +26,21 @@ class NativeClaimBrowser {
       this.server.once('error', reject);
       this.server.listen(0, '127.0.0.1', resolve);
     });
+    if (this.stopping) return;
     this.origin = `http://127.0.0.1:${this.server.address().port}`;
-    const profile = path.join(config.browser_profiles, crypto.createHash('sha256').update(proxy).digest('hex'));
-    fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(config.browser_profiles, { recursive: true, mode: 0o700 });
+    const profile = this.profile = fs.mkdtempSync(path.join(config.browser_profiles, 'browser-'));
     const args = ['--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check', '--start-minimized'];
     args.push(proxy ? '--proxy-server=' + new URL(proxy).origin : '--no-proxy-server');
     args.push('--app=' + this.origin + '/' + this.nonce);
     const child = this.child = spawn(this.executable, args, { windowsHide: true, stdio: 'ignore' });
-    child.once('error', () => this.finish({ ok: false, code: 'captcha_browser_launch_failed' }));
-    child.once('exit', () => {
-      if (this.child === child) this.finish({ ok: false, code: 'captcha_browser_launch_failed' });
-    });
+    const onBrowserExit = () => {
+      if (this.child !== child) return;
+      this.finish({ ok: false, code: 'captcha_browser_launch_failed' });
+      void this.close();
+    };
+    child.once('error', onBrowserExit);
+    child.once('exit', onBrowserExit);
     // Chrome app windows can ignore STARTUPINFO's hidden state. Hide only the
     // process we just created; never touch the user's browser or profile.
     const command = `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ClaimWindow { [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow); }'; for($i=0;$i -lt 30;$i++){ $p=Get-Process -Id ${Number(child.pid)} -ErrorAction SilentlyContinue; if(!$p){break}; if($p.MainWindowHandle -ne 0){ [ClaimWindow]::ShowWindowAsync($p.MainWindowHandle,0) | Out-Null; break }; Start-Sleep -Milliseconds 100 }`;
@@ -131,7 +136,13 @@ class NativeClaimBrowser {
   async run(config) {
     // Native claims need a fresh SDK instance; only the browser process is warmed.
     if (config.action === 'prepare') return { ok: true, preparation_skipped: true, runtime: 'native_browser' };
-    await this.open(config);
+    this.opening = this.open(config);
+    try {
+      await this.opening;
+    } finally {
+      this.opening = null;
+    }
+    if (this.stopping) return { ok: false, code: 'captcha_canceled' };
     if (this.job) return { ok: false, code: 'captcha_capacity_exceeded' };
     const timeout = config.action === 'warm' ? 20000 : Math.max(5000, Math.min(120000, Number(config.timeout_ms) || 30000));
     return new Promise(resolve => {
@@ -152,15 +163,34 @@ class NativeClaimBrowser {
     });
   }
 
-  async close() {
+  async shutdown() {
+    this.stopping = true;
+    await this.opening?.catch(() => {});
+    await this.close();
+  }
+
+  close() {
+    this.closing ||= this.closeBrowser().finally(() => { this.closing = null; });
+    return this.closing;
+  }
+
+  async closeBrowser() {
     this.finish({ ok: false, code: 'captcha_canceled' });
     clearTimeout(this.pollTimer);
     this.poll?.end(); this.poll = null;
     this.server?.closeAllConnections(); this.server?.close(); this.server = null;
     this.hider?.kill(); this.hider = null;
     const child = this.child; this.child = null;
-    if (child && child.exitCode === null && child.pid) {
-      await new Promise(resolve => execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 5000 }, () => resolve()));
+    const profile = this.profile; this.profile = null;
+    if (child && child.exitCode === null && child.signalCode === null && child.pid) {
+      const exited = new Promise(resolve => child.once('exit', resolve));
+      const killed = await new Promise(resolve => execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 5000 }, error => resolve(!error)));
+      if (killed) await exited;
+      else if (child.exitCode === null && child.signalCode === null) return;
+    }
+    if (profile) {
+      // Windows can keep profile files locked briefly after the browser exits.
+      await fs.promises.rm(profile, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 }).catch(() => {});
     }
   }
 }

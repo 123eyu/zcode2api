@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 	captchasdk "zcode2api/internal/server/captcha"
@@ -23,12 +24,13 @@ const claimBrowserWarmup = 3 * time.Minute
 const claimBrowserIdle = 30 * time.Second
 
 type claimBrowserProcess struct {
-	key     string
-	input   io.WriteCloser
-	replies chan shared.M
-	done    chan struct{}
-	cancel  context.CancelFunc
-	active  bool
+	key        string
+	profileDir string
+	input      io.WriteCloser
+	replies    chan shared.M
+	done       chan struct{}
+	cancel     context.CancelFunc
+	active     bool
 }
 
 type claimBrowserManager struct {
@@ -80,7 +82,7 @@ func (a *App) acquireClaimCaptchaSlot(ctx context.Context, background bool) (fun
 }
 
 func (a *App) browserParameters(options shared.M) shared.M {
-	return shared.M{"root": a.root, "module_path": a.captchaModulePath(shared.Str(options["jsdom_path"])), "playwright_path": shared.Str(options["playwright_path"]), "driver_path": filepath.Join(a.data, "tools", "playwright"), "browser_cache": filepath.Join(a.data, "tools", "chromium"), "browser_path": shared.Str(options["browser_path"]), "browser_profiles": filepath.Join(a.data, "browser-profiles")}
+	return shared.M{"root": a.root, "module_path": a.captchaModulePath(shared.Str(options["jsdom_path"])), "playwright_path": shared.Str(options["playwright_path"]), "driver_path": filepath.Join(a.data, "tools", "playwright"), "browser_cache": filepath.Join(a.data, "tools", "chromium"), "browser_path": shared.Str(options["browser_path"])}
 }
 
 func (a *App) writeCaptchaRuntime(name string, source []byte) (string, error) {
@@ -151,11 +153,7 @@ func (a *App) runBrowserCaptcha(ctx context.Context, options, parameters shared.
 		}
 	}()
 	parameters = shared.Merge(a.browserParameters(options), parameters)
-	if worker, ok := ctx.Value(scheduledClaimWorkerKey{}).(int); ok && manager != &a.claimBrowser {
-		parameters["browser_profiles"] = filepath.Join(a.data, "browser-profiles", fmt.Sprintf("scheduled-%d", worker+1))
-	} else if worker, ok := ctx.Value(manualClaimWorkerKey{}).(int); ok && manager != &a.claimBrowser {
-		parameters["browser_profiles"] = filepath.Join(a.data, "browser-profiles", fmt.Sprintf("manual-%d", worker+1))
-	}
+	parameters["browser_profiles"] = process.profileDir
 	if _, err = io.WriteString(process.input, shared.JSON(parameters)+"\n"); err != nil {
 		return nil, err
 	}
@@ -201,11 +199,24 @@ func (a *App) startClaimBrowser(options shared.M, key string) (*claimBrowserProc
 		return nil, err
 	}
 	process := &claimBrowserProcess{key: key, input: input, replies: make(chan shared.M, 1), done: make(chan struct{}), cancel: cancel}
+	if runtime.GOOS == "windows" {
+		profiles := filepath.Join(a.data, "browser-profiles")
+		if err = os.MkdirAll(profiles, 0700); err == nil {
+			process.profileDir, err = os.MkdirTemp(profiles, "worker-")
+		}
+		if err != nil {
+			cancel()
+			input.Close()
+			output.Close()
+			return nil, err
+		}
+	}
+	exited := make(chan struct{})
 	command.Cancel = func() error {
-		_ = input.Close() // EOF lets Playwright close Chromium and its children.
+		_ = input.Close() // EOF lets the worker close the browser and clean up its profile.
 		time.AfterFunc(3*time.Second, func() {
 			select {
-			case <-process.done:
+			case <-exited:
 			default:
 				childproc.KillBrowserProcess(command)
 			}
@@ -217,6 +228,9 @@ func (a *App) startClaimBrowser(options shared.M, key string) (*claimBrowserProc
 		cancel()
 		input.Close()
 		output.Close()
+		if process.profileDir != "" {
+			_ = os.Remove(process.profileDir)
+		}
 		return nil, err
 	}
 	a.background(func() {
@@ -237,6 +251,21 @@ func (a *App) startClaimBrowser(options shared.M, key string) (*claimBrowserProc
 		}
 		cancel()
 		_ = command.Wait()
+		close(exited)
+		// Reap the worker's private directory even if it was stopped forcibly.
+		if process.profileDir != "" {
+			for attempt := range 3 {
+				err := os.RemoveAll(process.profileDir)
+				if err == nil {
+					break
+				}
+				if attempt == 2 {
+					a.log.Printf("清理浏览器配置目录失败: %v", err)
+					break
+				}
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
 	})
 	return process, nil
 }

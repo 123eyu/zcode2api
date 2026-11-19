@@ -28,6 +28,7 @@ func main() {
 	health := flag.String("healthcheck", "", "检查指定健康地址后退出")
 	showVersion := flag.Bool("version", false, "显示程序版本后退出")
 	applyUpdate := flag.String("apply-update", "", "应用已下载的网关更新")
+	dockerUpdater := flag.Bool("docker-updater", false, "在宿主机执行 WebUI 提交的 Compose 更新")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println("zcode2api " + version)
@@ -35,6 +36,15 @@ func main() {
 	}
 	if *applyUpdate != "" {
 		if err := update.Apply(*applyUpdate); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *dockerUpdater {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := update.RunDockerUpdater(ctx, *root); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

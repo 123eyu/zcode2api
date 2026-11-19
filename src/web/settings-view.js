@@ -3,14 +3,50 @@
 const SETTINGS_GROUPS = [
   ['服务', [['gateway', '网关与模型'], ['template', '请求模板'], ['poll', '额度轮询']]],
   ['连接', [['proxy', '出站代理'], ['captcha', '上游安全验证']]],
-  ['维护', [['update', '版本更新']]],
+  ['维护', [['log-retention', '日志保留'], ['update', '版本更新']]],
 ];
 const SETTINGS_SECTIONS = SETTINGS_GROUPS.flatMap(([, sections]) => sections);
 const DEFAULT_SETTINGS_SECTION = SETTINGS_SECTIONS[0][0];
+const SETTINGS_JSON_COMMENTS = {
+  aliases: {
+    'glm-5.3': 'GLM-5.3 的默认别名',
+    'glm-5.3-flash': 'GLM-5.3-Flash 的默认别名',
+    'glm-flash': 'GLM-5.3-Flash 的默认短别名',
+  },
+  retry: {
+    backoff_factor: '重试等待时间的增长倍数',
+    base_delay_ms: '首次退避等待时间（毫秒）',
+    busy_wait_sec: '等待可用账号的时限（秒）',
+    jitter: '随机调整等待时间，分散重试',
+    max_attempts: '常规失败的尝试次数上限',
+    max_delay_ms: '加入抖动前的退避上限（毫秒）',
+    min_request_window_sec: '账号卡最短剩余有效期（秒）',
+    rate_limit_retry_interval_ms: '上游未指定时的限流重试间隔（毫秒）',
+    total_budget_ms: '排队与故障重试的总预算（毫秒）',
+  },
+  http: {
+    first_token_timeout_ms: '等待首次模型输出的时限',
+    idle_timeout_ms: '上游无有效响应的最长等待时间',
+    total_timeout_ms: '单次推理的总时限，0 表示不限',
+  },
+};
 const compactSettings = matchMedia('(max-width: 759px)');
 let settingsSection = '';
 let showSettingsSection = null;
 compactSettings.addEventListener('change', () => showSettingsSection?.());
+
+function formatSettingsJSON(value, comments) {
+  const json = JSON.stringify(value, null, 2) ?? '';
+  return json.replace(/^  "([\w.-]+)":[^\n]*/gm, (line, key) =>
+    Object.hasOwn(comments, key) ? `${line}  ## ${comments[key]}` : line);
+}
+
+function parseSettingsJSON(text) {
+  // Match quoted strings first to preserve ## inside JSON keys and values.
+  const json = text.replace(/"(?:[^"\\\r\n]|\\[^\r\n])*"|##[^\r\n]*/g, token =>
+    token.startsWith('##') ? '' : token);
+  return JSON.parse(json);
+}
 
 function readSettingsSection(section) {
   return SETTINGS_SECTIONS.some(([id]) => id === section) ? section : '';
@@ -98,7 +134,7 @@ async function pageSettings(main) {
   const httpParams = { ...s.http };
   const versionIntervalSeconds = Number(s.zcode_version_check_interval_sec) || 432000;
   const versionIntervalUnit = versionIntervalSeconds % 86400 === 0 ? 86400 : versionIntervalSeconds % 3600 === 0 ? 3600 : 60;
-  const captcha = { mode: 'off', claim_runtime: 'jsdom', playwright_path: '', browser_path: '', node_path: 'node', jsdom_path: '', simulate_canvas_webgl: true, timeout_ms: 30000, ticket_ttl_ms: 75000, ...s.http.captcha };
+  const captcha = { mode: 'off', playwright_path: '', browser_path: '', node_path: 'node', jsdom_path: '', simulate_canvas_webgl: true, timeout_ms: 30000, ticket_ttl_ms: 75000, ...s.http.captcha };
   const proxy = { enabled: false, source: 'manual', urls: [], subscription_url: '', preferred_node: '', mihomo_path: 'mihomo', refresh_interval_sec: 3600, ...s.outbound_proxy };
   const subagentFields = { zcode_subagent_insert_enabled: 's-subagent-insert', zcode_subagent_harness_enabled: 's-subagent-harness', zcode_subagent_files_enabled: 's-subagent-files', zcode_subagent_comments_enabled: 's-subagent-comments' };
   delete httpParams.client_version;
@@ -116,7 +152,14 @@ async function pageSettings(main) {
     <div class="settings-layout">
       ${settingsNavMarkup()}
       <form id="settings-form" class="settings-form control-comfortable" novalidate>
-      ${settingsPanel('update', settingsUpdateMarkup())}
+      ${settingsPanel('update', settingsUpdateMarkup(s.github_update_mirror))}
+      ${settingsPanel('log-retention', `<div class="settings-fields">
+        <div class="field-group f">
+          <label for="s-log-retention">调用记录保留天数</label>
+          <input id="s-log-retention" type="number" min="1" step="1" required value="${esc(s.usage_log_retention_days)}" aria-describedby="s-log-retention-hint">
+          <small id="s-log-retention-hint">超过保留期的记录会自动删除，删除后无法恢复。</small>
+        </div>
+      </div>`)}
       ${settingsPanel('template', `
         <div class="settings-fields"><label class="f" for="s-template-mode"><span>模板类型 ${infoTip('main 固定使用原始三段式模板。subagent 可独立勾选正文内容；保存后同时切换模板与请求头。', '请求模板')}</span><select id="s-template-mode" required><option value="main">main（默认原始三段式）</option><option value="subagent">subagent</option></select></label></div>
         <div class="settings-stack template-custom-fields" id="s-subagent-options" hidden>
@@ -133,24 +176,23 @@ async function pageSettings(main) {
       ${settingsPanel('poll', `<div class="settings-fields">
         <label class="f">轮询间隔（秒）<input id="s-poll" type="number" min="1" step="1" required value="${s.poll_interval_sec}"></label>
         <label class="f" for="s-jitter"><span>随机抖动（秒） ${infoTip('分散多个账号的余额检查时间。', '随机抖动')}</span><input id="s-jitter" type="number" min="0" step="1" required value="${s.poll_jitter_sec}"></label>
-        <label class="f" for="s-conc"><span>轮询并发 ${infoTip('同时检查余额的账号数量。', '轮询并发')}</span><input id="s-conc" type="number" min="1" step="1" required value="${s.poll_concurrency}"></label>
+        <label class="f" for="s-conc"><span>轮询并发 ${infoTip('同时检查余额的账号数量。', '轮询并发')}</span><input id="s-conc" type="number" min="1" max="${RUNTIME?.account_operation_concurrency ?? 3}" step="1" required value="${s.poll_concurrency}"></label>
       </div>`)}
       ${settingsPanel('captcha', `
         <div class="settings-subsection"><h3>模型推理</h3><div class="settings-fields">
           <label class="f">模型推理验证策略<select id="s-captcha-mode" aria-describedby="s-captcha-mode-hint"><option value="off">关闭模型推理验证</option><option value="auto">按上游要求验证</option><option value="always">每次推理前验证</option></select><small id="s-captcha-mode-hint" aria-live="polite"></small></label>
-          <label class="f" for="s-captcha-jsdom"><span>jsdom 依赖目录 ${infoTip('用于模型推理验证，以及选择 jsdom 的手动领卡。定时领卡不使用 jsdom。', 'jsdom 适用范围')}</span><input id="s-captcha-jsdom" value="${esc(captcha.jsdom_path)}" placeholder="留空使用 captcha_node"><small id="s-jsdom-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
+          <label class="f" for="s-captcha-jsdom"><span>jsdom 依赖目录</span><input id="s-captcha-jsdom" value="${esc(captcha.jsdom_path)}" placeholder="留空使用 captcha_node"><small id="s-jsdom-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
           <label class="settings-check" for="s-captcha-canvas"><input id="s-captcha-canvas" type="checkbox" role="switch" ${captcha.simulate_canvas_webgl ? 'checked' : ''}><span>jsdom 渲染接口模拟 ${infoTip('仅为 jsdom 验证补充 Canvas、WebGL 等兼容接口，不影响真实浏览器，也不保证通过上游验证。', '渲染接口模拟')}</span></label>
         </div></div>
         <div class="settings-subsection"><h3>领卡验证</h3><div class="settings-fields">
           <div class="field-group f"><span>定时领卡验证方式</span><strong>服务端真实浏览器（固定）</strong><small id="s-claim-browser-status" class="runtime-status" role="status" aria-live="polite">正在检测浏览器依赖…</small></div>
-          <label class="f"><span>手动领卡验证方式 ${infoTip('仅影响点击“领取”或“全部领取”时的服务端验证。需要人工操作时，仍可在当前网页完成验证；不改变定时领卡或模型推理的方式。', '手动领卡验证')}</span><select id="s-claim-runtime"><option value="jsdom">Node.js + jsdom</option><option value="browser">服务端真实浏览器</option></select></label>
-          <div class="mihomo-field" id="claim-browser-fields"><div class="mihomo-field-heading"><label for="s-browser-path">服务端浏览器路径</label><span>${infoTip('需要 Node.js、Playwright 及 Chromium 内核浏览器，支持 Chromium / Chrome / Edge。定时领取前 3 分钟预热，最晚保留至计划时间后 10 分钟，完成后提前退出。手动领取选择浏览器时按需启动，空闲 30 秒退出。不使用个人浏览器配置。', '领卡浏览器')} <button type="button" class="btn proxy-small-button" id="s-browser-install" disabled>检测中…</button></span></div><input id="s-browser-path" value="${esc(captcha.browser_path)}" placeholder="自动检测 Chromium / Chrome / Edge"><small id="s-browser-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></div>
-          <label class="f" for="s-playwright-path"><span>Playwright 驱动目录 ${infoTip('定时领卡必需；手动领卡选择真实浏览器时也使用此驱动。可填写 playwright-core、playwright 包目录，或包含它的 node_modules / 项目目录。留空自动检测，指定后只使用该目录。', 'Playwright 搜索路径')}</span><input id="s-playwright-path" value="${esc(captcha.playwright_path)}" placeholder="自动检测，或填写已有 Playwright 目录"><small id="s-playwright-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
+          <div class="mihomo-field" id="claim-browser-fields"><div class="mihomo-field-heading"><label for="s-browser-path">服务端浏览器路径</label><span>${infoTip('需要 Node.js、Playwright 及 Chromium 内核浏览器，支持 Chromium / Chrome / Edge。定时领取前 3 分钟预热，最晚保留至计划时间后 10 分钟，完成后提前退出。', '领卡浏览器')} <button type="button" class="btn proxy-small-button" id="s-browser-install" disabled>检测中…</button></span></div><input id="s-browser-path" value="${esc(captcha.browser_path)}" placeholder="自动检测 Chromium / Chrome / Edge"><small id="s-browser-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></div>
+          <label class="f" for="s-playwright-path"><span>Playwright 驱动目录 ${infoTip('可填写 playwright-core、playwright 包目录，或包含它的 node_modules / 项目目录。留空自动检测。', 'Playwright 搜索路径')}</span><input id="s-playwright-path" value="${esc(captcha.playwright_path)}" placeholder="自动检测，或填写已有 Playwright 目录"><small id="s-playwright-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
         </div></div>
         <div class="settings-subsection"><h3>运行环境</h3><div class="settings-fields">
-          <label class="f" for="s-captcha-node"><span>Node.js 可执行文件 ${infoTip('模型推理验证、定时领卡和手动领卡的服务端验证均需要 Node.js 18 或以上版本。', 'Node.js 依赖')}</span><input id="s-captcha-node" value="${esc(captcha.node_path)}" placeholder="node"><small id="s-node-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
+          <label class="f" for="s-captcha-node"><span>Node.js 可执行文件 ${infoTip('模型推理验证和定时领卡需要 Node.js 18 或以上版本。', 'Node.js 依赖')}</span><input id="s-captcha-node" value="${esc(captcha.node_path)}" placeholder="node"><small id="s-node-status" class="runtime-status" role="status" aria-live="polite">检测中…</small></label>
           <label class="f">验证超时（毫秒）<input id="s-captcha-timeout" type="number" min="5000" max="120000" step="1" required value="${captcha.timeout_ms}"></label>
-          <label class="f" for="s-captcha-ttl"><span>jsdom 票据预取有效期（毫秒） ${infoTip('仅用于模型推理和手动领卡的 jsdom 验证；连续验证成功后按需预取。真实浏览器按需取票，不使用预取。设为 0 关闭预取。', '票据预取')}</span><input id="s-captcha-ttl" type="number" min="0" max="90000" step="1" required value="${captcha.ticket_ttl_ms}"></label>
+          <label class="f" for="s-captcha-ttl"><span>jsdom 票据预取有效期（毫秒） ${infoTip('连续验证成功后按需预取。设为 0 关闭预取。', '票据预取')}</span><input id="s-captcha-ttl" type="number" min="0" max="90000" step="1" required value="${captcha.ticket_ttl_ms}"></label>
         </div></div>
       `)}
       ${settingsPanel('proxy', `
@@ -184,15 +226,29 @@ async function pageSettings(main) {
         </div>
         <div class="settings-subsection"><h3>高级参数</h3>
           <div class="settings-fields">
-            <div class="code-field"><label class="f" for="s-aliases">模型别名（JSON 对象）</label><textarea id="s-aliases" class="code-input" spellcheck="false" rows="6" aria-describedby="s-aliases-hint">${esc(JSON.stringify(s.aliases, null, 2))}</textarea><p id="s-aliases-hint" class="json-hint" data-for="s-aliases" aria-live="polite"></p></div>
-            <div class="code-field"><label class="f" for="s-retry">重试参数（JSON 对象）</label><textarea id="s-retry" class="code-input" spellcheck="false" rows="6" aria-describedby="s-retry-hint">${esc(JSON.stringify(s.retry, null, 2))}</textarea><p id="s-retry-hint" class="json-hint" data-for="s-retry" aria-live="polite"></p></div>
-            <div class="code-field"><label class="f" for="s-http"><span>HTTP 超时（JSON 对象，毫秒） ${infoTip('total_timeout_ms 为 0 表示不限制整轮时长。client_version 使用“推理 API 版本”设置。', 'HTTP 超时')}</span></label><textarea id="s-http" class="code-input" spellcheck="false" rows="5" aria-describedby="s-http-hint">${esc(JSON.stringify(httpParams, null, 2))}</textarea><p id="s-http-hint" class="json-hint" data-for="s-http" aria-live="polite"></p></div>
+            <div class="code-field">
+              <label class="f" for="s-aliases">模型别名（JSON 对象）</label>
+              <textarea id="s-aliases" class="code-input" spellcheck="false" rows="6" aria-describedby="s-aliases-hint">${esc(formatSettingsJSON(s.aliases, SETTINGS_JSON_COMMENTS.aliases))}</textarea>
+              <p id="s-aliases-hint" class="json-hint" data-for="s-aliases" aria-live="polite"></p>
+            </div>
+            <div class="code-field">
+              <label class="f" for="s-retry">重试参数（JSON 对象）</label>
+              <textarea id="s-retry" class="code-input" spellcheck="false" rows="6" aria-describedby="s-retry-hint">${esc(formatSettingsJSON(s.retry, SETTINGS_JSON_COMMENTS.retry))}</textarea>
+              <p id="s-retry-hint" class="json-hint" data-for="s-retry" aria-live="polite"></p>
+            </div>
+            <div class="code-field">
+              <label class="f" for="s-http">HTTP 超时（JSON 对象，毫秒）</label>
+              <textarea id="s-http" class="code-input" spellcheck="false" rows="5" aria-describedby="s-http-hint">${esc(formatSettingsJSON(httpParams, SETTINGS_JSON_COMMENTS.http))}</textarea>
+              <p id="s-http-hint" class="json-hint" data-for="s-http" aria-live="polite"></p>
+            </div>
           </div>
         </div>`)}
       </form>
     </div>`;
   const form = $('#settings-form'), save = $('#s-save'), status = $('#settings-state'), dirtyIndicator = $('#settings-dirty');
-  void mountSettingsUpdate(main);
+  const updateMirrorMode = $('#s-update-mirror', form), updateMirrorCustom = $('#s-update-mirror-custom', form);
+  const updateMirrorValue = () => selectedUpdateMirror(updateMirrorMode.value, updateMirrorCustom.value);
+  void mountSettingsUpdate(main, () => updateMirrorValue() !== selectedUpdateMirror(String(s.github_update_mirror ?? ''), ''));
   const captchaTTLField = $('#s-captcha-ttl');
   const validateCaptchaTTL = () => {
     const value = Number(captchaTTLField.value);
@@ -211,7 +267,6 @@ async function pageSettings(main) {
     editor.setCustomValidity(insert && new TextEncoder().encode(editor.value).length > 262144 ? '自定义插入内容不能超过 256 KiB' : '');
   };
   $('#s-captcha-mode').value = captcha.mode;
-  $('#s-claim-runtime').value = captcha.claim_runtime;
   $('#s-proxy-source').value = proxy.source;
   const versionAuto = $('#s-zcode-version-auto'), versionSync = $('#s-zcode-version-sync');
   const versionInterval = $('#s-zcode-version-interval'), versionUnit = $('#s-zcode-version-unit');
@@ -227,8 +282,8 @@ async function pageSettings(main) {
     const checked = s.zcode_version_status?.checked_at;
     versionSync.title = s.zcode_version_status?.error || (checked ? '最近检查：' + new Date(checked).toLocaleString() + '\n下次检查：' + new Date(Number(checked) + (Number(s.zcode_version_check_interval_sec) || 432000) * 1000).toLocaleString() : '查询 ZCode 官方稳定版清单');
   };
-  const captchaFields = { mode: 's-captcha-mode', claim_runtime: 's-claim-runtime', playwright_path: 's-playwright-path', browser_path: 's-browser-path', timeout_ms: 's-captcha-timeout', simulate_canvas_webgl: 's-captcha-canvas', node_path: 's-captcha-node', jsdom_path: 's-captcha-jsdom', ticket_ttl_ms: 's-captcha-ttl' };
-  const ids = ['s-poll', 's-jitter', 's-conc', 's-level', 's-template-mode', 's-subagent-template', ...Object.values(subagentFields), 's-ver', 's-http-version', 's-zcode-version-auto', 's-zcode-version-interval', 's-zcode-version-unit', 's-aliases', 's-retry', 's-http', ...Object.values(captchaFields), 's-proxy-enabled', 's-proxy-source', 's-proxy-urls', 's-proxy-subscription', 's-proxy-node', 's-proxy-mihomo', 's-proxy-refresh'];
+  const captchaFields = { mode: 's-captcha-mode', playwright_path: 's-playwright-path', browser_path: 's-browser-path', timeout_ms: 's-captcha-timeout', simulate_canvas_webgl: 's-captcha-canvas', node_path: 's-captcha-node', jsdom_path: 's-captcha-jsdom', ticket_ttl_ms: 's-captcha-ttl' };
+  const ids = ['s-poll', 's-jitter', 's-conc', 's-log-retention', 's-level', 's-template-mode', 's-subagent-template', ...Object.values(subagentFields), 's-ver', 's-http-version', 's-zcode-version-auto', 's-zcode-version-interval', 's-zcode-version-unit', 's-aliases', 's-retry', 's-http', ...Object.values(captchaFields), 's-proxy-enabled', 's-proxy-source', 's-proxy-urls', 's-proxy-subscription', 's-proxy-node', 's-proxy-mihomo', 's-proxy-refresh', 's-update-mirror', 's-update-mirror-custom'];
   const fields = ids.map(id => $('#' + id));
   const values = () => Object.fromEntries(fields.map(input => [input.id, input.type === 'checkbox' ? input.checked : input.value]));
   const apply = data => fields.forEach(input => { if (Object.hasOwn(data, input.id)) { if (input.type === 'checkbox') input.checked = !!data[input.id]; else input.value = data[input.id]; syncSelect(input); } });
@@ -241,6 +296,9 @@ async function pageSettings(main) {
   let fingerprint = JSON.stringify(values()), savedAt = '';
   const draftKey = 'z2a_settings_draft';
   const updateDirty = () => {
+    const customMirror = updateMirrorMode.value === 'custom';
+    $('#update-mirror-custom', form).hidden = !customMirror;
+    updateMirrorCustom.disabled = !customMirror;
     settingsDirty = JSON.stringify(values()) !== fingerprint;
     dirtyIndicator.hidden = !settingsDirty || settingsSaving;
     save.disabled = !settingsDirty || settingsSaving;
@@ -276,15 +334,15 @@ async function pageSettings(main) {
         for (const id of Object.values(subagentFields)) if (!Object.hasOwn(draft, id)) draft[id] = true;
       }
       try {
-        const oldHttp = JSON.parse(draft['s-http']);
+        const oldHttp = parseSettingsJSON(draft['s-http']);
         if (oldHttp && Object.hasOwn(oldHttp, 'client_version') && !Object.hasOwn(draft, 's-http-version')) {
-          draft['s-http-version'] = String(oldHttp.client_version); delete oldHttp.client_version; draft['s-http'] = JSON.stringify(oldHttp, null, 2);
+          draft['s-http-version'] = String(oldHttp.client_version); delete oldHttp.client_version; draft['s-http'] = formatSettingsJSON(oldHttp, SETTINGS_JSON_COMMENTS.http);
         }
         if (oldHttp?.captcha) {
           for (const [field, id] of Object.entries(captchaFields)) {
             if (Object.hasOwn(oldHttp.captcha, field) && !Object.hasOwn(draft, id)) draft[id] = oldHttp.captcha[field];
           }
-          delete oldHttp.captcha; draft['s-http'] = JSON.stringify(oldHttp, null, 2);
+          delete oldHttp.captcha; draft['s-http'] = formatSettingsJSON(oldHttp, SETTINGS_JSON_COMMENTS.http);
         }
       } catch { }
       apply(draft);
@@ -295,7 +353,7 @@ async function pageSettings(main) {
     for (const id of ['s-aliases', 's-retry', 's-http']) {
       const box = $('#' + id), hint = $(`.json-hint[data-for="${id}"]`);
       try {
-        const parsed = JSON.parse(box.value);
+        const parsed = parseSettingsJSON(box.value);
         if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('请输入 JSON 对象，而非数组或其他值');
         if (id === 's-http' && Object.hasOwn(parsed, 'client_version')) throw new Error('请在上方“推理 API 版本”字段设置 client_version，并从此处移除该键');
         if (id === 's-http' && Object.hasOwn(parsed, 'captcha')) throw new Error('请在“上游安全验证”设置验证码，并从此处移除 captcha');
@@ -448,7 +506,7 @@ async function pageSettings(main) {
   form.addEventListener('change', e => { if (ids.includes(e.target.id)) {
     if (e.target.id === 's-proxy-source') { resetProxyNodeSelection(); $('#s-proxy-result').classList.add('hidden'); if ($('#s-proxy-source').value === 'subscription') void checkMihomo(); }
     if (e.target.id === 's-proxy-mihomo') void checkMihomo();
-    if (captchaPathIDs.includes(e.target.id) || e.target.id === captchaFields.claim_runtime) void checkCaptchaRuntime();
+    if (captchaPathIDs.includes(e.target.id)) void checkCaptchaRuntime();
     syncTemplateFields(); syncNetworkFields(); updateDirty();
   } });
   $('#s-mihomo-install').addEventListener('click', async () => {
@@ -516,16 +574,21 @@ async function pageSettings(main) {
       return;
     }
     const submitted = values();
+    const submittedMirror = updateMirrorValue();
     settingsSaving = true; btnLoading(save, true); updateDirty();
     try {
       const response = await api('/api/settings', { method: 'PUT', body: {
         poll_interval_sec: Number(submitted['s-poll']), poll_jitter_sec: Number(submitted['s-jitter']), poll_concurrency: Number(submitted['s-conc']),
+        usage_log_retention_days: Number(submitted['s-log-retention']),
+        github_update_mirror: submittedMirror,
         default_reasoning_level: submitted['s-level'], app_version: submitted['s-ver'], zcode_version_auto_update: submitted['s-zcode-version-auto'], zcode_version_check_interval_sec: Math.round(Number(submitted['s-zcode-version-interval']) * Number(submitted['s-zcode-version-unit'])),
         zcode_template_mode: submitted['s-template-mode'], zcode_subagent_template: submitted['s-subagent-template'],
         ...Object.fromEntries(Object.entries(subagentFields).map(([key, id]) => [key, submitted[id]])),
-        http: { ...JSON.parse(submitted['s-http']), client_version: submitted['s-http-version'], captcha: captchaValues(submitted) }, outbound_proxy: outboundValues(submitted), aliases: JSON.parse(submitted['s-aliases']), retry: JSON.parse(submitted['s-retry']),
+        http: { ...parseSettingsJSON(submitted['s-http']), client_version: submitted['s-http-version'], captcha: captchaValues(submitted) },
+        outbound_proxy: outboundValues(submitted), aliases: parseSettingsJSON(submitted['s-aliases']), retry: parseSettingsJSON(submitted['s-retry']),
       } });
       if (response.ok === false) throw new Error(response.error || '保存失败');
+      s.github_update_mirror = submittedMirror;
       s.zcode_version_auto_update = submitted['s-zcode-version-auto'];
       s.zcode_version_check_interval_sec = Math.round(Number(submitted['s-zcode-version-interval']) * Number(submitted['s-zcode-version-unit']));
       fingerprint = JSON.stringify(submitted);

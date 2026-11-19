@@ -77,7 +77,8 @@ type App struct {
 	claimLocks             map[string]bool
 	claimBatchMu           sync.Mutex
 	claimCandidatesMu      sync.Mutex
-	manualClaimSlots       chan int
+	claimWorkerSlots       chan int
+	claimPreviewSlots      chan struct{}
 	claimReschedule        chan struct{}
 	claimScheduleCancel    context.CancelFunc
 	flowLocks              map[string]bool
@@ -88,12 +89,15 @@ type App struct {
 	pollDue                map[string]int64
 	polling                map[string]bool
 	pollWake               chan struct{}
+	usageLogCleanupWake    chan struct{}
 	balances               balanceManager
 	profiles               map[string]*profileEntry
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
 	webPort, gatewayPort   int
+	webUpdateHost          string
+	gatewayUpdateHost      string
 	origin                 string
 	captcha                captchaManager
 	claimBrowser           claimBrowserManager
@@ -134,10 +138,19 @@ func New(root, data string, web fs.FS, buildVersion string) (*App, error) {
 	a.zcodeVersionReschedule = make(chan struct{}, 1)
 	a.proxyHealthReschedule = make(chan struct{}, 1)
 	a.pollWake = make(chan struct{}, 1)
+	a.usageLogCleanupWake = make(chan struct{}, 1)
+	a.claimPreviewSlots = make(chan struct{}, shared.AccountOperationConcurrency)
+	a.balances.slots = make(chan struct{}, shared.AccountOperationConcurrency)
 	saved := shared.Obj(a.setting("config_overrides", shared.M{}))
 	migrateHTTPVersion := !shared.Truth(a.setting("http_client_version_3_17_2_migrated", false))
 	migrateBalancePoll := !shared.Truth(a.setting("balance_poll_30s_migrated", false))
 	clean := settings.KnownConfig(cfg, saved)
+	if !settings.ValidUsageLogRetentionDays(cfg["usage_log_retention_days"]) {
+		cfg["usage_log_retention_days"] = settings.DefaultUsageLogRetentionDays
+	}
+	if v, present := clean["usage_log_retention_days"]; present && !settings.ValidUsageLogRetentionDays(v) {
+		delete(clean, "usage_log_retention_days")
+	}
 	settings.MigrateTemplateSettings(clean)
 	for k, v := range clean {
 		if k == "http" || k == "retry" || k == "outbound_proxy" {
@@ -162,6 +175,12 @@ func New(root, data string, web fs.FS, buildVersion string) (*App, error) {
 		a.cfg["poll_interval_sec"] = settings.DefaultBalancePollInterval
 		clean["poll_interval_sec"] = settings.DefaultBalancePollInterval
 	}
+	if shared.Num(a.cfg["poll_concurrency"]) > shared.AccountOperationConcurrency {
+		a.cfg["poll_concurrency"] = shared.AccountOperationConcurrency
+		if _, present := clean["poll_concurrency"]; present {
+			clean["poll_concurrency"] = shared.AccountOperationConcurrency
+		}
+	}
 	if shared.JSON(clean) != shared.JSON(saved) {
 		if e = a.setSetting("config_overrides", clean); e != nil {
 			a.Close()
@@ -180,7 +199,10 @@ func New(root, data string, web fs.FS, buildVersion string) (*App, error) {
 			return nil, e
 		}
 	}
-	a.ensureGroups()
+	if e = a.ensureGroups(); e != nil {
+		a.Close()
+		return nil, e
+	}
 	a.restoreProxyState()
 	a.restoreUpstreamCooldowns()
 	a.background(a.runAccountQueue)
@@ -228,20 +250,6 @@ func (a *App) Close() {
 
 func (a *App) background(f func()) { a.wg.Go(f) }
 
-func (a *App) ensureGroups() {
-	if a.row("SELECT id FROM groups WHERE id='g_main'") == nil {
-		legacy := a.rows("SELECT id FROM groups WHERE id IN ('g_domestic','g_intl','g_backup')")
-		if len(legacy) > 0 {
-			_ = a.exec("INSERT INTO groups(id,name,created_at) VALUES('g_main','默认池',?)", shared.NowMS())
-			_ = a.exec("UPDATE accounts SET group_id='g_main' WHERE group_id IN ('g_domestic','g_intl','g_backup')")
-			_ = a.exec("DELETE FROM groups WHERE id IN ('g_domestic','g_intl','g_backup')")
-		}
-	}
-	if len(a.rows("SELECT id FROM groups")) == 0 {
-		_ = a.exec("INSERT INTO groups(id,name,created_at) VALUES('g_main','默认池',?)", shared.NowMS())
-	}
-}
-
 func (a *App) Run(ctx context.Context) error {
 	cfg := a.config()
 	host := shared.Str(cfg["host"])
@@ -261,8 +269,9 @@ func (a *App) Run(ctx context.Context) error {
 		wl.Close()
 		return e
 	}
-	a.webPort = wl.Addr().(*net.TCPAddr).Port
-	a.gatewayPort = gl.Addr().(*net.TCPAddr).Port
+	webAddress, gatewayAddress := wl.Addr().(*net.TCPAddr), gl.Addr().(*net.TCPAddr)
+	a.webPort, a.gatewayPort = webAddress.Port, gatewayAddress.Port
+	a.webUpdateHost, a.gatewayUpdateHost = updateHealthHost(webAddress), updateHealthHost(gatewayAddress)
 	w := &http.Server{Handler: a.AdminHandler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 1 << 20}
 	g := &http.Server{Handler: a.GatewayHandler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: 1 << 20}
 	info := shared.M{"web_port": a.webPort, "gateway_port": a.gatewayPort, "pid": os.Getpid(), "backend": "go", "updated_at": time.Now().UTC().Format(time.RFC3339)}
@@ -272,13 +281,13 @@ func (a *App) Run(ctx context.Context) error {
 		return e
 	}
 	a.log.Printf("Go HTTP 服务已启动 Web: http://%s:%d 网关: http://%s:%d/v1 管理密码文件: %s", host, a.webPort, host, a.gatewayPort, filepath.Join(a.data, "admin-password.txt"))
-	a.audit("system", "startup", info, "")
 	a.startWorkers()
 	errs := make(chan error, 2)
 	go func() { errs <- w.Serve(wl) }()
 	go func() { errs <- g.Serve(gl) }()
 	select {
 	case <-ctx.Done():
+	case <-a.ctx.Done():
 	case e = <-errs:
 		if e == http.ErrServerClosed {
 			e = nil
@@ -292,6 +301,19 @@ func (a *App) Run(ctx context.Context) error {
 	_ = w.Close()
 	_ = g.Close()
 	return e
+}
+
+func updateHealthHost(address *net.TCPAddr) string {
+	if address.IP.IsUnspecified() {
+		if address.IP.To4() != nil {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	if address.Zone != "" {
+		return address.IP.String() + "%" + address.Zone
+	}
+	return address.IP.String()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -386,20 +408,3 @@ func (a *App) operationContext(parent context.Context, timeout time.Duration) (c
 }
 
 func (a *App) account(id string) shared.M { return a.row("SELECT * FROM accounts WHERE id=?", id) }
-
-func (a *App) groups() []any { return a.rows("SELECT * FROM groups ORDER BY created_at") }
-
-func (a *App) defaultChain() []any {
-	out := []any{}
-	groups := a.groups()
-	for _, role := range []string{"primary", "backup"} {
-		for _, v := range groups {
-			g := shared.Obj(v)
-			if shared.Truth(g["enabled"]) && shared.Str(g["role"]) == role {
-				out = append(out, g["id"])
-				break
-			}
-		}
-	}
-	return out
-}

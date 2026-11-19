@@ -40,6 +40,7 @@ type balanceSnapshotState struct {
 }
 
 type balanceManager struct {
+	slots       chan struct{}
 	mu          sync.Mutex
 	flights     map[string]*balanceFlight
 	cache       map[string]balanceCacheEntry

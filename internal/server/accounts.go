@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -13,8 +16,13 @@ import (
 )
 
 const accountFields = "label family customer_id group_id status enc_tokens device_mid app_version card_started_at card_expires_at web_cookie_expires_at business_token_expires_at zcode_jwt_last_ok_at fail_streak cooldown_until capabilities last_balance last_error proxy_url last_ok_at last_used_at"
+const automaticAccountGroup = "SELECT id FROM groups WHERE enabled=1 AND role='primary' AND (family_filter IS NULL OR family_filter='' OR family_filter=?) ORDER BY created_at LIMIT 1"
 
 func (a *App) updateAccount(id string, m shared.M) error {
+	return a.writeAccountUpdate(id, m, func() error { return a.update("accounts", "id", id, m, accountFields) })
+}
+
+func (a *App) writeAccountUpdate(id string, m shared.M, write func() error) error {
 	invalidate := m["status"] == "disabled" || m["status"] == "needs_relogin" || m["status"] == "web_only"
 	for _, key := range []string{"enc_tokens", "device_mid", "proxy_url"} {
 		if _, changed := m[key]; changed {
@@ -25,11 +33,64 @@ func (a *App) updateAccount(id string, m shared.M) error {
 		a.balances.applyMu.Lock()
 		defer a.balances.applyMu.Unlock()
 	}
-	err := a.update("accounts", "id", id, m, accountFields)
+	err := write()
 	if err == nil && invalidate {
 		a.invalidateBalanceLocked(id)
 	}
 	return err
+}
+
+func (a *App) updateAccountPlacement(ctx context.Context, id string, fields, body shared.M) error {
+	group, valid := fields["group_id"].(string)
+	if fields["group_id"] != nil && !valid {
+		return fault.Invalid("目标分组无效")
+	}
+	expectedValue, compare := body["expected_group_id"]
+	expected, valid := expectedValue.(string)
+	if compare && expectedValue != nil && !valid {
+		return fault.Invalid("原分组无效")
+	}
+	return a.writeAccountUpdate(id, fields, func() error {
+		tx, err := a.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		var current sql.NullString
+		var family string
+		err = tx.QueryRowContext(ctx, "SELECT group_id,family FROM accounts WHERE id=?", id).Scan(&current, &family)
+		if errors.Is(err, sql.ErrNoRows) {
+			return &fault.Failure{Status: http.StatusNotFound, Message: "账号不存在"}
+		}
+		if err != nil {
+			return err
+		}
+		if compare && current.String != expected {
+			return &fault.Failure{Status: http.StatusConflict, Message: "账号归属已变更，请刷新后重试"}
+		}
+		if group != "" && group != current.String {
+			var filter sql.NullString
+			err := tx.QueryRowContext(ctx, "SELECT family_filter FROM groups WHERE id=?", group).Scan(&filter)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fault.Invalid("目标分组不存在")
+			}
+			if err != nil {
+				return err
+			}
+			if filter.String != "" && filter.String != family {
+				return fault.Invalid("账号类型与目标分组不匹配")
+			}
+		}
+		fields["group_id"] = shared.Nullable(group)
+		if _, err := updateFields(tx, "accounts", "id", id, fields, accountFields); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		a.notifyAvailable()
+		return nil
+	})
 }
 
 func (a *App) tokens(id string) map[string]string { return a.accountTokens(a.account(id)) }
@@ -52,8 +113,17 @@ func (a *App) insertAccount(fields, tokens shared.M) (shared.M, error) {
 			plain[k] = shared.Str(v)
 		}
 	}
-	id, err := a.insertAccountRow(a.db, fields, plain, shared.Str(a.configValue("app_version")))
+	appVersion := shared.Str(a.configValue("app_version"))
+	tx, err := a.db.Begin()
 	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	id, err := a.insertAccountRow(tx, fields, plain, appVersion)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return a.account(id), nil
@@ -70,7 +140,7 @@ func (a *App) insertAccountRow(db storage.Executor, fields shared.M, tokens map[
 	}
 	group := fields["group_id"]
 	if _, ok := fields["group_id"]; !ok {
-		groups, err := storage.Query(db, "SELECT id FROM groups WHERE enabled=1 AND role='primary' AND (family_filter IS NULL OR family_filter='' OR family_filter=?) ORDER BY created_at LIMIT 1", shared.Fallback(fields["family"], "bigmodel"))
+		groups, err := storage.Query(db, automaticAccountGroup, shared.Fallback(fields["family"], "bigmodel"))
 		if err != nil {
 			return "", err
 		}
@@ -106,6 +176,12 @@ func (a *App) publicAccount(r shared.M) shared.M {
 }
 
 func (a *App) fetchBalanceUpstream(ctx context.Context, r shared.M) (shared.M, error) {
+	select {
+	case a.balances.slots <- struct{}{}:
+		defer func() { <-a.balances.slots }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	t := a.accountTokens(r)
 	if accountdata.LoginJWTExpired(t) {
 		return shared.M{"ok": false, "authFailed": true, "httpStatus": 401, "failure_kind": "auth", "error_code": "login_expired", "reason": "ZCode 登录已过期，请重新授权"}, nil

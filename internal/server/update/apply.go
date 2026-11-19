@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -38,6 +41,16 @@ func DetectUpdateSupport(version string) UpdateSupport {
 		}
 	}
 	if runtime.GOOS != "linux" {
+		if runtime.GOOS == "windows" {
+			if _, valid := updateVersionNumbers(version); valid {
+				if !windowsUpdateAvailable() {
+					support.Reason = "Windows 在线更新适用于直接启动的发行版；由服务管理器托管时请通过该管理器更新"
+					return support
+				}
+				return detectUpdateBinary(support, "windows")
+			}
+			support.Reason = "Windows 在线更新适用于发行版，请通过源码更新当前开发构建"
+		}
 		return support
 	}
 	if _, ok := updateVersionNumbers(version); !ok {
@@ -87,6 +100,10 @@ func DetectUpdateSupport(version string) UpdateSupport {
 		support.Reason = "当前程序不是 systemd 主进程，请使用发行包手动更新"
 		return support
 	}
+	return detectUpdateBinary(support, "systemd")
+}
+
+func detectUpdateBinary(support UpdateSupport, mode string) UpdateSupport {
 	binary, err := os.Executable()
 	if err != nil {
 		return support
@@ -102,25 +119,36 @@ func DetectUpdateSupport(version string) UpdateSupport {
 	}
 	file.Close()
 	os.Remove(file.Name())
-	support.Supported, support.Mode, support.Reason = true, "systemd", ""
+	support.Supported, support.Mode, support.Reason = true, mode, ""
 	return support
 }
 
 type UpdatePlan struct {
-	Service         string `json:"service"`
-	Binary          string `json:"binary"`
-	Candidate       string `json:"candidate"`
-	Backup          string `json:"backup"`
-	Data            string `json:"data"`
-	StateFile       string `json:"state_file"`
-	Version         string `json:"version"`
-	PreviousVersion string `json:"previous_version"`
-	OldSHA256       string `json:"old_sha256"`
-	NewSHA256       string `json:"new_sha256"`
-	CreatedAt       int64  `json:"created_at"`
-	PID             int    `json:"pid"`
-	WebPort         int    `json:"web_port"`
-	GatewayPort     int    `json:"gateway_port"`
+	Service         string   `json:"service"`
+	Binary          string   `json:"binary"`
+	Candidate       string   `json:"candidate"`
+	Backup          string   `json:"backup"`
+	Data            string   `json:"data"`
+	StateFile       string   `json:"state_file"`
+	Version         string   `json:"version"`
+	PreviousVersion string   `json:"previous_version"`
+	OldSHA256       string   `json:"old_sha256"`
+	NewSHA256       string   `json:"new_sha256"`
+	CreatedAt       int64    `json:"created_at"`
+	PID             int      `json:"pid"`
+	WebPort         int      `json:"web_port"`
+	GatewayPort     int      `json:"gateway_port"`
+	WebHost         string   `json:"web_host,omitempty"`
+	GatewayHost     string   `json:"gateway_host,omitempty"`
+	Directory       string   `json:"directory,omitempty"`
+	Args            []string `json:"args,omitempty"`
+}
+
+func UpdateBinaryFilename(base string) string {
+	if runtime.GOOS == "windows" {
+		return base + ".exe"
+	}
+	return base
 }
 
 func CopyUpdateFile(source, target string, mode os.FileMode) error {
@@ -211,8 +239,19 @@ func waitUpdateHealthy(ctx context.Context, plan UpdatePlan, version string) err
 	client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
 	for ctx.Err() == nil {
 		healthy := true
-		for _, port := range []int{plan.WebPort, plan.GatewayPort} {
-			request, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("http://127.0.0.1:%d/healthz", port), nil)
+		for _, endpoint := range []struct {
+			host string
+			port int
+		}{{plan.WebHost, plan.WebPort}, {plan.GatewayHost, plan.GatewayPort}} {
+			host := endpoint.host
+			if host == "" {
+				host = "127.0.0.1"
+			}
+			address := url.URL{Scheme: "http", Host: net.JoinHostPort(host, strconv.Itoa(endpoint.port)), Path: "/healthz"}
+			request, err := http.NewRequestWithContext(ctx, "GET", address.String(), nil)
+			if err != nil {
+				return err
+			}
 			response, err := client.Do(request)
 			if err != nil {
 				healthy = false
@@ -224,7 +263,8 @@ func waitUpdateHealthy(ctx context.Context, plan UpdatePlan, version string) err
 			}
 			err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&health)
 			response.Body.Close()
-			if err != nil || response.StatusCode != 200 || !health.OK || (health.Version != "" && health.Version != version) {
+			if err != nil || response.StatusCode != 200 || !health.OK ||
+				health.Version != version && (health.Version != "" || runtime.GOOS == "windows") {
 				healthy = false
 				break
 			}
@@ -241,14 +281,25 @@ func waitUpdateHealthy(ctx context.Context, plan UpdatePlan, version string) err
 
 func validateUpdatePlanPaths(filename string, plan UpdatePlan) error {
 	job := filepath.Dir(filename)
-	if runtime.GOOS != "linux" || os.Geteuid() != 0 || !updateServicePattern.MatchString(plan.Service) ||
+	validPlatform := runtime.GOOS == "linux" && os.Geteuid() == 0 && updateServicePattern.MatchString(plan.Service)
+	if runtime.GOOS == "windows" {
+		validPlatform = plan.Service == "" && filepath.IsAbs(plan.Directory) && strings.EqualFold(filepath.Ext(plan.Binary), ".exe")
+	}
+	if !validPlatform ||
 		!filepath.IsAbs(plan.Binary) || !filepath.IsAbs(plan.Data) ||
 		filepath.Dir(job) != filepath.Join(plan.Data, "updates") || !strings.HasPrefix(filepath.Base(job), "job-") ||
 		plan.StateFile != filepath.Join(plan.Data, "updates", "state.json") ||
-		plan.Candidate != filepath.Join(job, "new-binary") || plan.Backup != filepath.Join(job, "previous-binary") ||
+		plan.Candidate != filepath.Join(job, UpdateBinaryFilename("new-binary")) || plan.Backup != filepath.Join(job, UpdateBinaryFilename("previous-binary")) ||
 		plan.CreatedAt < shared.NowMS()-int64((30*time.Minute)/time.Millisecond) || plan.CreatedAt > shared.NowMS()+60000 ||
 		!NewerUpdate(plan.PreviousVersion, plan.Version) || plan.PID < 1 || plan.WebPort < 1 || plan.WebPort > 65535 || plan.GatewayPort < 1 || plan.GatewayPort > 65535 {
 		return fmt.Errorf("更新计划无效或已过期")
+	}
+	for _, host := range []string{plan.WebHost, plan.GatewayHost} {
+		if host != "" {
+			if _, err := netip.ParseAddr(host); err != nil {
+				return fmt.Errorf("更新健康检查地址无效")
+			}
+		}
 	}
 	return nil
 }
@@ -274,7 +325,7 @@ func Apply(filename string) (resultErr error) {
 		return err
 	}
 	info, err := os.Lstat(filename)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
+	if err != nil || !info.Mode().IsRegular() || runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
 		return fmt.Errorf("更新计划文件不存在或权限无效")
 	}
 	var plan UpdatePlan
@@ -297,6 +348,9 @@ func Apply(filename string) (resultErr error) {
 	defer stop()
 	ctx, cancel := context.WithTimeout(signalCtx, 5*time.Minute)
 	defer cancel()
+	if runtime.GOOS == "windows" {
+		return applyWindowsUpdate(ctx, filename, plan, state)
+	}
 	stopped, replaced := false, false
 	defer func() {
 		if recovered := recover(); recovered != nil {

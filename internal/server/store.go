@@ -1,6 +1,7 @@
 package server
 
 import (
+	"database/sql"
 	"strings"
 	"zcode2api/internal/server/shared"
 	"zcode2api/internal/server/storage"
@@ -42,11 +43,17 @@ func (a *App) setSetting(k string, v any) error {
 	return a.exec("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v WHERE settings.v IS NOT excluded.v", k, shared.JSON(v))
 }
 
-func (a *App) audit(actor, action string, detail any, ip string) {
-	_ = a.exec("INSERT INTO audit_log(ts,actor,action,detail,ip) VALUES(?,?,?,?,?)", shared.NowMS(), actor, action, shared.JSON(detail), ip)
+func (a *App) update(table, idcol, id string, fields shared.M, allowed string) error {
+	result, err := updateFields(a.db, table, idcol, id, fields, allowed)
+	if err != nil {
+		a.log.Printf("database write: %v", err)
+	} else if result != nil && (table == "accounts" || table == "groups") {
+		a.notifyAvailable()
+	}
+	return err
 }
 
-func (a *App) update(table, idcol, id string, fields shared.M, allowed string) error {
+func updateFields(db storage.Executor, table, idcol, id string, fields shared.M, allowed string) (sql.Result, error) {
 	sets := []string{}
 	args := []any{}
 	for k, v := range fields {
@@ -67,12 +74,8 @@ func (a *App) update(table, idcol, id string, fields shared.M, allowed string) e
 		args = append(args, v)
 	}
 	if len(sets) == 0 {
-		return nil
+		return nil, nil
 	}
 	args = append(args, id)
-	e := a.exec("UPDATE "+table+" SET "+strings.Join(sets, ",")+" WHERE "+idcol+"=?", args...)
-	if e == nil && (table == "accounts" || table == "groups") {
-		a.notifyAvailable()
-	}
-	return e
+	return db.Exec("UPDATE "+table+" SET "+strings.Join(sets, ",")+" WHERE "+idcol+"=?", args...)
 }

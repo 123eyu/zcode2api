@@ -8,48 +8,33 @@ function claimablePlans(preview) {
 }
 
 let claimCaptchaScript, claimCaptchaSequence = 0;
-const manualClaimConcurrency = 5;
 let claimBrowserVerificationQueue = Promise.resolve();
-const claimBrowserVerifications = new Map();
 const claimJobKey = job => JSON.stringify([job.account_id, job.plan_id]);
 const claimDay = (at = Date.now()) => new Date(Number(at) + 8 * 3600000).toISOString().slice(0, 10);
-let claimVerificationState = { day: '', items: {} };
-function claimNeedsVerification(result) {
-  return result && !result.ok && (result.requires_verification || result.failure_kind === 'account_risk' ||
-    ['3012', 'upstream_risk_blocked', 'captcha_risk_blocked', 'F001'].includes(String(result.code)));
+let claimResults = { day: '', items: new Map() };
+const claimPhaseLabels = {
+  queued: '等待领取…',
+  config: '读取配置…',
+  waiting: '等待验证…',
+  preparing: '准备验证…',
+  verifying: '验证中…',
+  ready: '等待提交…',
+  submitting: '正在提交…',
+};
+const claimNeedsVerification = result => result && !result.ok && result.requires_verification;
+
+function manualClaimResults() {
+  const day = claimDay();
+  if (claimResults.day !== day) claimResults = { day, items: new Map() };
+  return claimResults.items;
 }
+
 function claimResultMessage(result) {
   const code = result.code ?? result.httpStatus;
   const message = result.message || result.error || '领取失败';
-  return `${message}${code !== undefined && code !== null && code !== '' && !String(message).includes(String(code)) ? `（${code}）` : ''}`;
+  return `${message}${code && !String(message).includes(String(code)) ? `（${code}）` : ''}`;
 }
-function claimVerificationRecords() {
-  // Display only this page session's manual results. Historical scheduled
-  // failures must not trigger a dialog or decide how the next click is handled.
-  if (claimVerificationState.day !== claimDay()) claimVerificationState = { day: claimDay(), items: {} };
-  return claimVerificationState.items;
-}
-function updateClaimVerification(job, patch) {
-  const items = claimVerificationRecords(), key = claimJobKey(job);
-  items[key] = { ...items[key], job, ...patch };
-  window.dispatchEvent(new CustomEvent('claim-verification-change', { detail: { job, ...patch } }));
-}
-function pendingClaimVerification(job) {
-  const entry = claimVerificationRecords()[claimJobKey(job)];
-  return entry && !entry.resolved ? entry : null;
-}
-function rememberClaimResult(job, result) {
-  if (result?.ok) updateClaimVerification(job, { resolved: true, result: null });
-  else if (claimNeedsVerification(result)) {
-    updateClaimVerification(job, { resolved: false, result: {
-      ok: false, code: result.code, message: claimResultMessage(result), requires_verification: true,
-      failure_kind: result.failure_kind, manual_verification_failed: result.manual_verification_failed,
-      verification_retry_at: result.verification_retry_at || Date.now() + Math.max(0, Number(result.retry_after_ms) || 0),
-    } });
-  }
-}
-// The SDK requires more than two seconds before verification.
-const claimCaptchaReadyDelay = 2100;
+
 function loadClaimCaptchaScript() {
   if (typeof window.initAliyunCaptcha === 'function') return Promise.resolve();
   if (!claimCaptchaScript) {
@@ -67,262 +52,130 @@ function loadClaimCaptchaScript() {
   return claimCaptchaScript;
 }
 
-async function requestClaimCaptcha(config, label, { isActive = () => true, refreshConfig } = {}) {
+function requestClaimCaptcha(config, signal, { onStart, onFeedback, onDismiss }) {
+  if (signal.aborted) return Promise.resolve(null);
   return new Promise((resolve, reject) => {
     const mountID = `claim-captcha-${++claimCaptchaSequence}`;
-    const form = h(`<div><p class="dialog-intro">${esc(label)} ${infoTip('点击“人工领取”后启动官方验证，需要交互时显示验证码；验证通过后提交一次领取，仍被拒绝时不自动重试。3012 属于账号风控，验证码不保证解除。', '人工验证')}</p><div id="${mountID}"></div><p class="quiet-message" data-captcha-status role="status">${esc(claimResultMessage(config))}</p><div class="modal-actions"><button type="button" class="btn" data-cancel>取消</button><button type="button" class="btn primary" id="${mountID}-start">人工领取</button></div></div>`);
-    const status = $('[data-captcha-status]', form), mount = $(`#${mountID}`, form);
-    let instance, dialog, observer, timeout, readyTimer, initializationTimer, cooldownTimer, sessionTimer;
-    let epoch = 0, settled = false, initializing = false, verifying = false, cooling = false;
-    let startButton = $(`#${mountID}-start`, form);
-    const setVerifying = value => {
-      verifying = value;
-      startButton.classList.toggle('loading', value);
-      startButton.setAttribute('aria-busy', String(value));
-    };
-    const finish = (ticket, error) => {
+    const host = h(`<div><div id="${mountID}"></div><button type="button" id="${mountID}-start" class="visually-hidden" tabindex="-1" aria-hidden="true"></button></div>`);
+    const trigger = $('button', host);
+    document.body.append(host);
+    let instance, settled = false, traceless = false, waitingForChallenge = false, readyTimer, initializationTimer;
+    const validFor = config.expires_at - Date.now() - 1000;
+    const deadline = setTimeout(() => finish(null, new Error(
+      validFor < 120000 ? '验证会话已过期，请重新领取。' : '验证超时，请重新领取。',
+    )), Math.max(0, Math.min(120000, validFor)));
+    const cancel = () => finish(null);
+    function finish(ticket, error) {
       if (settled) return;
       settled = true;
-      epoch++;
-      clearTimeout(timeout);
+      clearTimeout(deadline);
       clearTimeout(readyTimer);
       clearTimeout(initializationTimer);
-      clearInterval(cooldownTimer);
-      clearTimeout(sessionTimer);
-      observer?.disconnect();
+      signal.removeEventListener('abort', cancel);
       window.removeEventListener('pagehide', cancel);
-      try { instance?.destroy?.(); } catch { }
-      dialog?.close();
-      error ? reject(error) : resolve(ticket);
-    };
-    const cancel = () => finish(null);
-    const setDeadline = (wait = 0) => {
-      clearTimeout(timeout);
-      timeout = setTimeout(() => finish(null, new Error('验证超时，请重新点击“领取”。')), Math.min(2147483647, wait + 120000));
-    };
-    const bindStart = () => {
-      // Remove old SDK listeners before binding a fresh session/trigger.
-      const button = startButton.cloneNode(false);
-      startButton.replaceWith(button);
-      startButton = button;
-      startButton.addEventListener('click', event => {
-        if (settled || initializing || verifying || cooling || startButton.disabled) {
-          event.stopImmediatePropagation(); return;
-        }
-        if (!instance) { event.stopImmediatePropagation(); void initialize(); return; }
-        setVerifying(true);
-        status.classList.remove('error');
-        status.textContent = '正在验证，请按官方组件提示操作…';
-      }, { capture: true });
-    };
-    dialog = modal('需要人工验证', form, cancel, { externalFocus: true });
-    observer = new MutationObserver(() => { if (!form.isConnected || !isActive()) finish(null); });
-    observer.observe(document.body, { childList: true, subtree: true });
-    window.addEventListener('pagehide', cancel);
-    $('[data-cancel]', form).addEventListener('click', () => finish(null));
-    const initializationFailed = error => {
+      try { instance?.destroy?.(); } catch {}
+      host.remove();
+      if (error) reject(error);
+      else resolve(ticket);
+    }
+    signal.addEventListener('abort', cancel, { once: true });
+    window.addEventListener('pagehide', cancel, { once: true });
+    window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
+    loadClaimCaptchaScript().then(() => {
       if (settled) return;
-      epoch++;
-      initializing = false;
-      clearTimeout(readyTimer);
-      clearTimeout(initializationTimer);
-      clearTimeout(sessionTimer);
-      try { instance?.destroy?.(); } catch { }
-      instance = null;
-      mount.replaceChildren();
-      bindStart();
-      setVerifying(false);
-      status.textContent = error?.message || '验证组件加载失败，请点击重新验证。';
-      status.classList.add('error');
-      startButton.textContent = '重新验证';
-      startButton.disabled = false;
-    };
-    const waitForCooldown = retryAt => {
-      cooling = true;
-      status.classList.remove('error');
-      setDeadline(Math.max(0, retryAt - Date.now()));
-      const tick = () => {
-        if (settled || !isActive()) { finish(null); return; }
-        const seconds = Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
-        startButton.disabled = seconds > 0;
-        startButton.textContent = seconds ? '冷却中' : '继续验证';
-        status.textContent = seconds ? `风控冷却中，${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} 后可继续。` : '冷却已结束，可继续人工验证。';
-        if (!seconds) { cooling = false; clearInterval(cooldownTimer); }
-      };
-      clearInterval(cooldownTimer);
-      cooldownTimer = setInterval(tick, 1000);
-      tick();
-    };
-    async function initialize() {
-      if (settled || initializing) return;
-      initializing = true;
-      setDeadline();
-      const current = ++epoch;
-      clearTimeout(readyTimer);
-      clearTimeout(initializationTimer);
-      clearTimeout(sessionTimer);
-      try { instance?.destroy?.(); } catch { }
-      instance = null;
-      mount.replaceChildren();
-      bindStart();
-      setVerifying(false);
-      startButton.textContent = '开始验证';
-      startButton.disabled = true;
-      status.classList.remove('error');
-      status.textContent = '正在加载验证…';
-      try {
-        if (!isActive()) { finish(null); return; }
-        if (config?.verification_retry_at > Date.now()) { waitForCooldown(config.verification_retry_at); return; }
-        const fresh = await refreshConfig();
-        if (settled || current !== epoch) return;
-        if (!fresh || !isActive()) { finish(null); return; }
-        config = fresh;
-        if (config.verification_retry_at > Date.now()) { waitForCooldown(config.verification_retry_at); return; }
-        if (!config.enabled || !config.scene_id || !config.verification_session) throw new Error('上游未提供可用验证场景，请稍后处理。');
-        if (config.expires_at) sessionTimer = setTimeout(() => {
-          if (!settled && current === epoch) initializationFailed(new Error('验证会话已过期，请重新加载。'));
-        }, Math.max(0, config.expires_at - Date.now() - 1000));
-        window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
-        await loadClaimCaptchaScript();
-        if (settled || current !== epoch) return;
-        initializationTimer = setTimeout(() => {
-          if (!settled && current === epoch) initializationFailed(new Error('验证组件初始化超时，请重新验证。'));
-        }, 15000);
-        const initialization = window.initAliyunCaptcha({
-          SceneId: config.scene_id,
-          mode: 'popup', language: 'cn', element: `#${mountID}`, button: `#${mountID}-start`, delayBeforeSuccess: false,
-          getInstance(value) {
-            if (settled || current !== epoch) { try { value?.destroy?.(); } catch {} return; }
-            if (!value) { initializationFailed(); return; }
-            clearTimeout(initializationTimer);
-            // A failed interaction can make the SDK replace its own instance.
-            // Keep that replacement without starting another verification.
-            if (instance) { instance = value; return; }
-            instance = value;
-            status.textContent = '准备验证…';
-            readyTimer = setTimeout(() => {
-              if (settled || current !== epoch || !instance) return;
-              if (!isActive()) { finish(null); return; }
-              startButton.disabled = false;
-              // The SDK-bound button starts the scene's actual verification.
-              // show() only controls visual challenges and can do nothing for
-              // traceless scenes, even when the method exists on the instance.
-              startButton.click();
-            }, claimCaptchaReadyDelay);
-          },
-          success(param) {
-            if (settled || current !== epoch) return;
-            if (!isActive()) { finish(null); return; }
-            if (config.expires_at && config.expires_at <= Date.now() + 1000) { initializationFailed(new Error('验证会话已过期，请重新加载。')); return; }
-            if (typeof param !== 'string' || !param.trim()) { initializationFailed(new Error('验证码结果无效，请重试。')); return; }
-            finish({ captcha_verify_param: param, captcha_region: config.region, verification_session: config.verification_session });
-          },
-          fail(value) {
-            if (settled || current !== epoch) return;
-            const result = value?.Result || value?.result || value || {};
-            const code = String(result.VerifyCode || result.verifyCode || value?.verifyCode || '');
-            if (['F008', 'F014', 'F018', 'F019', 'F020'].includes(code)) {
-              initializationFailed(new Error('验证会话已失效，请重新验证。'));
+      initializationTimer = setTimeout(() => finish(null, new Error('验证组件初始化超时，请重试。')), 15000);
+      return window.initAliyunCaptcha({
+        SceneId: config.scene_id,
+        mode: 'popup', language: 'cn', element: `#${mountID}`, button: `#${mountID}-start`, delayBeforeSuccess: false,
+        getInstance(value) {
+          if (settled) { try { value?.destroy?.(); } catch {} return; }
+          if (!value) { finish(null, new Error('验证组件初始化失败，请重试。')); return; }
+          clearTimeout(initializationTimer);
+          const firstInstance = !instance;
+          instance = value;
+          if (!firstInstance) return;
+          traceless = typeof value.startTracelessVerification === 'function';
+          // The SDK needs time to become ready. Its trigger also handles scenes without a challenge.
+          readyTimer = setTimeout(() => {
+            if (settled) return;
+            if (document.hidden) {
+              finish(null, new Error('请回到领卡页面后重试。'));
               return;
             }
-            // F015 means the interaction failed (for example a misplaced
-            // puzzle). The SDK refreshes it; do not destroy the user's retry.
-            setVerifying(false);
-            status.textContent = code === 'F015' ? '验证未通过，请在验证码中重试。' : `验证未通过${/^[FT][0-9]{3}$/.test(code) ? `（${code}）` : ''}，请重试。`;
-            status.classList.add('error');
-            startButton.textContent = '重新验证';
-            startButton.disabled = false;
-          },
-          onError(error) {
-            if (settled || current !== epoch) return;
-            const code = String(error?.code || '');
-            initializationFailed(new Error(`验证组件加载失败${/^[A-Za-z0-9_.-]{1,64}$/.test(code) ? `（${code}）` : ''}，请重新验证。`));
-          },
-          onClose(reason) { if (!settled && current === epoch && reason === 'userDismiss') finish(null); },
-        });
-        Promise.resolve(initialization).catch(() => { if (!settled && current === epoch) initializationFailed(); });
-      } catch (error) { if (!settled && current === epoch) initializationFailed(error); }
-      finally { if (current === epoch) initializing = false; }
-    }
-    // The first dialog only reports the failure. Do not fetch a verification
-    // session or load the SDK until the user explicitly chooses to continue.
-    bindStart();
-    startButton.textContent = '人工领取';
+            onStart();
+            trigger.click();
+          }, 2100);
+        },
+        success(param) {
+          if (settled) return;
+          if (config.expires_at <= Date.now() + 1000) {
+            finish(null, new Error('验证会话已过期，请重新领取。'));
+          } else if (typeof param !== 'string' || !param.trim()) {
+            finish(null, new Error('验证码结果无效，请重试。'));
+          } else {
+            finish({ captcha_verify_param: param, captcha_region: config.region, verification_session: config.verification_session });
+          }
+        },
+        fail(value) {
+          if (settled) return;
+          const result = value?.Result || value?.result || value || {};
+          const code = String(result.VerifyCode || result.verifyCode || value?.verifyCode || '');
+          // The first traceless refusal can lead to the SDK's own interactive challenge.
+          if (code === 'F001' && traceless && !waitingForChallenge) {
+            waitingForChallenge = true;
+            onFeedback('请完成弹出的验证码。');
+            return;
+          }
+          if (code === 'F015') {
+            onFeedback('验证未通过，请在验证码中重试。', true);
+            return;
+          }
+          const expired = ['F008', 'F014', 'F018', 'F019', 'F020'].includes(code);
+          const suffix = /^[FT][0-9]{3}$/.test(code) ? `（${code}）` : '';
+          finish(null, new Error(expired ? '验证会话已失效，请重新领取。' : `安全验证未通过${suffix}，请重试。`));
+        },
+        onError(error) {
+          if (settled) return;
+          const code = String(error?.code || '');
+          finish(null, new Error(`验证组件出错${/^[A-Za-z0-9_.-]{1,64}$/.test(code) ? `（${code}）` : ''}，请重试。`));
+        },
+        onClose(reason) {
+          if (settled || reason !== 'userDismiss') return;
+          onDismiss();
+          cancel();
+        },
+      });
+    }).catch(error => finish(null, error));
   });
 }
 
-async function submitClaim(job, label, isActive = () => true) {
-  if (!isActive()) return null;
-  // Each click gets its own result first. Neither a scheduled failure nor a
-  // previous canceled dialog can send the user straight to verification.
-  const result = await api('/api/claims/claim', { method: 'POST', body: job });
-  rememberClaimResult(job, result);
-  if (!isActive()) return null;
-  if (!claimNeedsVerification(result)) return result;
-  return queueClaimBrowserVerification(job, label, isActive, result);
-}
-
-function queueClaimBrowserVerification(job, label, isActive, failure) {
-  const key = claimJobKey(job), day = claimDay();
-  if (claimBrowserVerifications.has(key)) return claimBrowserVerifications.get(key).promise;
-  // The page SDK has shared configuration and a shared modal surface. Queue
-  // only human verification; obtain short-lived sessions inside the dialog.
-  const verify = async () => {
-    if (!isActive() || claimDay() !== day) return null;
-    if (document.hidden || document.querySelector('.modal-bg:not(.closing)')) return null;
-    const result = await submitClaimWithBrowser(job, label, () => isActive() && claimDay() === day, failure);
-    if (claimDay() === day) rememberClaimResult(job, result);
-    return result;
+function queueClaimBrowserVerification(signal, verify) {
+  const run = () => {
+    if (signal.aborted) return null;
+    return navigator.locks?.request
+      ? navigator.locks.request('z2a-claim-verification', { signal }, verify)
+      : verify();
   };
-  // Coordinate tabs too, while retaining the in-memory queue on older browsers.
-  const run = () => navigator.locks?.request
-    ? navigator.locks.request('z2a-claim-verification', verify)
-    : verify();
-  const pending = claimBrowserVerificationQueue.then(run, run).finally(() => {
-    claimBrowserVerifications.delete(key);
-    window.dispatchEvent(new CustomEvent('claim-verification-change'));
-  });
-  claimBrowserVerifications.set(key, { job, promise: pending });
-  window.dispatchEvent(new CustomEvent('claim-verification-change'));
+  const pending = claimBrowserVerificationQueue.then(run, run);
   claimBrowserVerificationQueue = pending.catch(() => {});
-  return pending;
-}
-
-async function submitClaimWithBrowser(job, label, isActive, result) {
-  if (!isActive()) return null;
-  let config, closed = false;
-  const releaseConfig = value => {
-    if (value?.verification_session) void api('/api/claims/verification/cancel', { method: 'POST', body: { verification_session: value.verification_session } }).catch(() => {});
-  };
-  const refreshConfig = async () => {
-    releaseConfig(config);
-    config = null;
-    const fresh = await api('/api/claims/verification?account_id=' + encodeURIComponent(job.account_id) + '&plan_id=' + encodeURIComponent(job.plan_id));
-    if (closed || !isActive()) { releaseConfig(fresh); return null; }
-    config = fresh;
-    if (fresh.verification_retry_at) updateClaimVerification(job, { result: { ...result, verification_retry_at: fresh.verification_retry_at } });
-    return config;
-  };
-  try {
-    const verification = await requestClaimCaptcha(result, label, { isActive, refreshConfig });
-    if (!verification || !isActive()) return null;
-    // One upstream submission per dialog, even if the verified ticket is refused.
-    return await api('/api/claims/claim', { method: 'POST', body: { ...job, ...verification } });
-  } finally {
-    closed = true;
-    releaseConfig(config);
-  }
+  // A skipped job can settle while it is still waiting for another tab or account.
+  return new Promise((resolve, reject) => {
+    const cancel = () => resolve(null);
+    if (signal.aborted) cancel();
+    else signal.addEventListener('abort', cancel, { once: true });
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', cancel));
+  });
 }
 
 function claimAccountMarkup(preview, account = {}) {
   return claimablePlans(preview).map(plan => {
-    const pending = pendingClaimVerification({ account_id: preview.account_id, plan_id: plan.plan_id });
-    const result = pending?.result;
-    const details = [preview.stale ? `本次查询未更新，保留上次仍有效的卡片。${preview.error || ''}` : '', ...(result ? [claimResultMessage(result), result.manual_verification_failed ? '人工验证后仍未领取成功，可稍后重新点击“领取”。' : '再次点击“领取”时，将根据本次结果决定是否需要人工验证。', result.verification_retry_at > Date.now() ? `冷却至 ${new Date(result.verification_retry_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}（北京时间）。` : ''] : [])].filter(Boolean).join('\n');
-    return `<div class="daily-claim-row${pending ? ' needs-verification' : ''}${preview.stale ? ' query-stale' : ''}">
+    const name = account.platform_name || account.label || '当前账号';
+    const details = preview.stale ? `本次查询未更新，保留上次仍有效的卡片。${preview.error || ''}` : '';
+    return `<div class="daily-claim-row${preview.stale ? ' query-stale' : ''}">
     ${accountNameMarkup({ ...account, id: preview.account_id }, 'claim-account')}
     <div class="daily-claim-grants">${(plan.entitlements || []).map(entitlement => `<div><strong title="${esc(fmtInt(entitlement.grant_units))} ${esc(entitlement.unit_type || 'Token')}">${fmtQuota(entitlement.grant_units)}<small> ${esc(entitlement.unit_type || 'Token')}</small></strong><span>${esc(entitlement.show_name || entitlement.meter || '')}</span></div>`).join('') || '<span class="muted">额度以 ZCode 为准</span>'}</div>
-    <div class="daily-claim-action">${details ? infoTip(details, '领取待处理') : ''}<button type="button" class="btn primary" data-claim="${esc(preview.account_id)}" data-plan="${esc(plan.plan_id)}" aria-label="领取 ${esc(account.platform_name || '当前账号')} 的每日免费 Token">领取</button></div>
+    <div class="daily-claim-action">${details ? infoTip(details, '查询状态') : ''}<button type="button" class="btn" data-claim-skip aria-label="取消 ${esc(name)} 的验证" hidden>取消验证</button><button type="button" class="btn primary" data-claim="${esc(preview.account_id)}" data-plan="${esc(plan.plan_id)}" aria-label="领取 ${esc(name)} 的每日免费 Token">领取</button></div>
+    <p class="daily-claim-feedback" role="status"></p>
   </div>`;
   }).join('');
 }
@@ -448,34 +301,41 @@ function setupTimeField(main, hooks) {
 }
 
 async function pageClaims(main) {
+  const requestConcurrency = RUNTIME?.account_operation_concurrency ?? 3;
   let previews = [], accounts = [], accountsError = '', batchRunning = false, loading = false, page = 1;
   let schedule = null, scheduleSaving = false, scheduleError = '';
   let discoveryError = '', loadController;
   const pendingClaims = new Map(), claimQueue = [], runningAccounts = new Set();
+  const requestQueue = [];
+  let runningRequests = 0;
   const claimKey = claimJobKey;
   const pageSize = 8;
   main.innerHTML = `${pagehead('领卡中心', '', '<button type="button" class="btn" id="claims-refresh">' + icon('refresh', 14) + '刷新</button>')}
     <section class="daily-claim-card fade-up" aria-labelledby="daily-claim-title">
-      <header class="daily-claim-header"><div class="daily-claim-title"><span class="daily-claim-icon">${icon('gift', 22)}</span><div><h2 id="daily-claim-title">每日免费 Token</h2><span>每日 19:00 开放 · 北京时间</span></div></div><div class="daily-claim-actions"><div class="daily-claim-schedule"><span class="time-field control-compact" id="claims-time-field"><input id="claims-time" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="5" value="19:02" disabled aria-label="每日浏览器定时领取时间（北京时间）"><button type="button" class="time-field-trigger" id="claims-time-trigger" aria-label="选择定时领取时间" aria-expanded="false" aria-haspopup="dialog" aria-controls="claims-time-pop" disabled>${icon('timer', 13)}</button><span class="time-field-pop control-compact" id="claims-time-pop" hidden role="dialog" aria-label="选择定时领取时间"><span class="time-field-col" data-unit="hour" role="group" aria-label="小时"></span><span class="time-field-col" data-unit="minute" role="group" aria-label="分钟"></span></span></span><label for="claims-schedule">浏览器定时领取<input id="claims-schedule" type="checkbox" role="switch" disabled></label><span id="claims-schedule-info">${infoTip('定时领卡固定使用服务端真实浏览器，需在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖。服务需保持运行，网页可关闭。“领取”和“全部领取”使用手动领卡设置。', '定时领取')}</span></div><button type="button" class="btn primary" id="claims-all" disabled>全部领取</button></div></header>
+      <header class="daily-claim-header"><div class="daily-claim-title"><span class="daily-claim-icon">${icon('gift', 22)}</span><div><h2 id="daily-claim-title">每日免费 Token</h2><span>每日 19:00 开放 · 北京时间</span></div></div><div class="daily-claim-actions"><div class="daily-claim-schedule"><span class="time-field control-compact" id="claims-time-field"><input id="claims-time" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" maxlength="5" value="19:02" disabled aria-label="每日浏览器定时领取时间（北京时间）"><button type="button" class="time-field-trigger" id="claims-time-trigger" aria-label="选择定时领取时间" aria-expanded="false" aria-haspopup="dialog" aria-controls="claims-time-pop" disabled>${icon('timer', 13)}</button><span class="time-field-pop control-compact" id="claims-time-pop" hidden role="dialog" aria-label="选择定时领取时间"><span class="time-field-col" data-unit="hour" role="group" aria-label="小时"></span><span class="time-field-col" data-unit="minute" role="group" aria-label="分钟"></span></span></span><label for="claims-schedule">浏览器定时领取<input id="claims-schedule" type="checkbox" role="switch" disabled></label><span id="claims-schedule-info">${infoTip('定时领卡固定使用服务端真实浏览器，需在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖。服务需保持运行，网页可关闭。', '定时领取')}</span></div><button type="button" class="btn" id="claims-stop" hidden>停止剩余领取</button><button type="button" class="btn primary" id="claims-all" disabled>全部领取</button></div></header>
       <div id="claims-content" aria-busy="true"><div class="skeleton-block"></div></div>
-      <footer class="daily-claim-footer"><span id="claims-update" class="result-count" aria-live="polite">正在查询…</span><div id="claims-notice"></div><nav class="pager" id="claims-pages" aria-label="可领取账号分页" hidden></nav></footer>
+      <footer class="daily-claim-footer"><span id="claims-update" class="result-count" aria-live="polite">正在查询…</span><span id="claims-summary" class="result-count" role="status"></span><div id="claims-notice"></div><nav class="pager" id="claims-pages" aria-label="可领取账号分页" hidden></nav></footer>
     </section>`;
   const content = $('#claims-content', main);
   const token = TOKEN;
   const active = () => main.contains(content) && TOKEN === token && !$('#app-view').classList.contains('hidden');
   const visiblePreviews = () => {
-    const records = claimVerificationRecords();
+    const records = manualClaimResults();
     // A historical failure is not evidence that a card is still claimable.
-    return previews.map(preview => ({ ...preview, plans: (preview.plans || []).filter(plan => !records[claimKey({ account_id: preview.account_id, plan_id: plan.plan_id })]?.resolved) }));
+    return previews.map(preview => ({ ...preview, plans: (preview.plans || []).filter(plan => !records.get(claimKey({ account_id: preview.account_id, plan_id: plan.plan_id }))?.ok) }));
   };
   const jobs = () => visiblePreviews().flatMap(preview => claimablePlans(preview).map(plan => ({ account_id: preview.account_id, plan_id: plan.plan_id })));
+  const batchJobs = () => {
+    const results = manualClaimResults();
+    return jobs().filter(job => !claimNeedsVerification(results.get(claimKey(job))));
+  };
   const accountFor = id => accounts.find(account => account.id === id) || { label: previews.find(preview => preview.account_id === id)?.label };
   const syncBusy = () => {
     if (!active()) return;
-    const busy = batchRunning || pendingClaims.size > 0 || claimBrowserVerifications.size > 0;
+    const busy = batchRunning || pendingClaims.size > 0;
     const pendingAccounts = new Set([...pendingClaims.values()].map(entry => entry.job.account_id));
-    for (const entry of claimBrowserVerifications.values()) pendingAccounts.add(entry.job.account_id);
-    const total = jobs().length;
+    const results = manualClaimResults();
+    const total = busy ? 0 : batchJobs().length;
     const refreshButton = $('#claims-refresh', main);
     refreshButton.disabled = busy || loading || scheduleSaving;
     refreshButton.classList.toggle('loading', loading);
@@ -485,13 +345,30 @@ async function pageClaims(main) {
     $('#claims-time-trigger', main).disabled = busy || loading || scheduleSaving || !schedule;
     const allButton = $('#claims-all', main);
     allButton.disabled = busy || loading || scheduleSaving || !total;
-    allButton.textContent = claimBrowserVerifications.size ? '等待人工验证' : busy ? `正在领取（剩余 ${pendingClaims.size}）` : total ? `全部领取（${total}）` : '全部领取';
+    allButton.textContent = busy ? `正在领取（剩余 ${pendingClaims.size}）` : total ? `全部领取（${total}）` : '全部领取';
+    const stop = $('#claims-stop', main);
+    stop.hidden = !batchRunning;
+    stop.disabled = ![...pendingClaims.values()].some(entry => !entry.controller.signal.aborted && entry.phase !== 'submitting');
     $$('button[data-claim]', content).forEach(button => {
-      const job = { account_id: button.dataset.claim, plan_id: button.dataset.plan }, key = claimKey(job);
+      const accountID = button.dataset.claim, key = claimKey({ account_id: accountID, plan_id: button.dataset.plan });
       const entry = pendingClaims.get(key);
-      button.disabled = loading || scheduleSaving || batchRunning || pendingAccounts.has(button.dataset.claim);
-      button.textContent = claimBrowserVerifications.has(key) ? '等待验证…' : entry ? entry.running ? '正在领取…' : '等待领取…' : '领取';
-      button.setAttribute('aria-busy', String(!!entry?.running || claimBrowserVerifications.has(key)));
+      const result = results.get(key);
+      const needsVerification = claimNeedsVerification(result);
+      const row = button.closest('.daily-claim-row'), feedback = $('.daily-claim-feedback', row), skip = $('[data-claim-skip]', row);
+      const phase = entry?.controller.signal.aborted ? '正在停止…' : claimPhaseLabels[entry?.phase];
+      const account = accountFor(accountID);
+      const name = account.platform_name || account.label || '当前账号';
+      const label = phase || (needsVerification ? '人工验证' : result && !result.canceled ? '重试' : '领取');
+      button.disabled = loading || scheduleSaving || batchRunning || pendingAccounts.has(accountID);
+      button.textContent = label;
+      button.setAttribute('aria-label', `${label} · ${name}`);
+      button.setAttribute('aria-busy', String(!!entry));
+      skip.hidden = !entry || entry.controller.signal.aborted || !['waiting', 'preparing', 'verifying'].includes(entry.phase);
+      const message = entry ? entry.feedback : needsVerification ? result.message || '需要人工验证' : result && !result.ok ? claimResultMessage(result) : '';
+      const showError = entry ? entry.feedbackError : !result?.canceled && (!needsVerification || result?.manualVerificationFailed);
+      if (feedback.textContent !== message) feedback.textContent = message;
+      row.classList.toggle('needs-verification', !!needsVerification);
+      feedback.classList.toggle('error', Boolean(message && showError));
     });
   };
   function paintSchedule() {
@@ -500,11 +377,11 @@ async function pageClaims(main) {
     const time = schedule?.time || '19:02';
     $('#claims-time', main).value = time;
     timeField.highlight();
-    const details = [`每日北京时间 ${time} 固定使用服务端真实浏览器领取；服务需保持运行，网页可关闭。请在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖。`, '定时任务独立在后台执行，可重试的失败在计划时间起 10 分钟内恢复一次。点击“领取”或“全部领取”后，本次领取遇到风控会提示需要人工验证；再点击“人工领取”才打开验证码。验证后仍失败不自动重试。'];
+    const details = [`每日北京时间 ${time} 固定使用服务端真实浏览器领取；服务需保持运行，网页可关闭。请在“设置 → 上游安全验证 → 领卡验证”配置浏览器依赖。`, '定时任务独立在后台执行，可重试的失败在计划时间起 10 分钟内恢复一次。'];
     if (schedule?.browser_window) {
       const window = schedule.browser_window;
       const clock = value => new Date(value).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit' });
-      details.push(`浏览器窗口：${clock(window.start_at)}–${clock(window.end_at)}，任务完成后提前退出；手动领取选择浏览器时按需启动，空闲 ${window.idle_seconds} 秒退出。`);
+      details.push(`浏览器窗口：${clock(window.start_at)}–${clock(window.end_at)}，任务完成后提前退出。`);
     }
     if (scheduleError) details.push('设置读取失败：' + scheduleError);
     if (schedule?.next_run_at) details.push('下次执行：' + new Date(schedule.next_run_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) + '。');
@@ -530,8 +407,6 @@ async function pageClaims(main) {
       : loading ? '<div class="skeleton-block"></div>'
       : '<div class="daily-claim-empty">' + icon('gift', 28) + `<p${discoveryError || failures.length ? ' role="alert"' : ''}>${discoveryError || failures.length ? '查询未完成，请刷新重试' : '暂无可领取的每日免费卡'}</p></div>`;
     const notices = [];
-    const verificationCount = ready.reduce((count, preview) => count + claimablePlans(preview).filter(plan => pendingClaimVerification({ account_id: preview.account_id, plan_id: plan.plan_id })).length, 0);
-    if (verificationCount) notices.push(`<span>${verificationCount} 张待人工验证</span>`);
     if (failures.length) notices.push(`<span class="warn-text">${failures.length} 个账号未更新</span>${infoTip(failures.map(preview => `${accountFor(preview.account_id).platform_name || preview.label || '账号'}：${preview.error}${preview.stale ? '（保留上次有效结果）' : ''}`).join('\n'), '账号查询失败')}`);
     if (discoveryError) notices.push(infoTip(discoveryError, '查询失败'));
     if (accountsError) notices.push(infoTip('官方账号信息暂不可用：' + accountsError, '账号信息'));
@@ -542,7 +417,7 @@ async function pageClaims(main) {
     syncBusy();
   }
   async function load() {
-    if (!active() || loading || batchRunning || pendingClaims.size || claimBrowserVerifications.size || scheduleSaving) return;
+    if (!active() || loading || batchRunning || pendingClaims.size || scheduleSaving) return;
     loadController?.abort();
     const controller = new AbortController();
     loadController = controller;
@@ -612,67 +487,163 @@ async function pageClaims(main) {
       }
     }
   }
-  function enqueueClaim(job) {
-    if (!active() || loading || scheduleSaving) return Promise.resolve(null);
+  const claimActive = entry => active() && !entry.controller.signal.aborted && entry.day === claimDay();
+
+  function setClaimPhase(entry, phase, feedback = '', feedbackError = false) {
+    entry.phase = phase;
+    entry.feedback = feedback;
+    entry.feedbackError = feedbackError;
+    syncBusy();
+  }
+
+  function enqueueClaim(job, batch = false) {
     const key = claimKey(job);
-    if (pendingClaims.has(key)) return pendingClaims.get(key).promise;
-    const entry = { job, key, running: false };
-    entry.promise = new Promise((resolve, reject) => { entry.resolve = resolve; entry.reject = reject; });
+    const existing = pendingClaims.get(key);
+    if (existing) return existing.promise;
+    const entry = { job, key, batch, day: claimDay(), phase: 'queued', feedback: '', controller: new AbortController() };
+    entry.promise = new Promise(resolve => { entry.resolve = resolve; });
     pendingClaims.set(key, entry);
     claimQueue.push(entry);
     pumpClaims();
     return entry.promise;
   }
+
+  function recordClaimResult(entry, result) {
+    if (!result || TOKEN !== token || entry.day !== claimDay()) return;
+    const results = manualClaimResults();
+    if (result.canceled && claimNeedsVerification(results.get(entry.key))) return;
+    results.set(entry.key, result);
+  }
+
+  function cancelResult(entry) {
+    return entry.cancelMessage ? { ok: false, canceled: true, message: entry.cancelMessage } : null;
+  }
+
   function pumpClaims() {
-    if (!active()) {
-      for (const entry of claimQueue.splice(0)) {
+    // Keep one job per account active, even while it waits for verification.
+    for (let index = 0; index < claimQueue.length;) {
+      const entry = claimQueue[index];
+      if (!claimActive(entry)) {
+        claimQueue.splice(index, 1);
+        const result = cancelResult(entry);
+        recordClaimResult(entry, result);
         pendingClaims.delete(entry.key);
-        entry.resolve(null);
+        entry.resolve(result);
+      } else if (runningAccounts.has(entry.job.account_id)) {
+        index++;
+      } else {
+        claimQueue.splice(index, 1);
+        runningAccounts.add(entry.job.account_id);
+        void runClaim(entry);
       }
-      return;
-    }
-    while (runningAccounts.size < manualClaimConcurrency) {
-      const index = claimQueue.findIndex(entry => !runningAccounts.has(entry.job.account_id));
-      if (index < 0) break;
-      const [entry] = claimQueue.splice(index, 1);
-      entry.running = true;
-      runningAccounts.add(entry.job.account_id);
-      void runClaim(entry);
     }
     syncBusy();
   }
-  async function runClaim(entry) {
-    try {
-      const result = await submitClaim(entry.job, accountFor(entry.job.account_id).platform_name || '当前账号', active);
-      if (result?.ok) removeClaimed(entry.job);
-      if (!result || (!result.ok && (result.requires_verification || result.retry_after_ms > 0 || ['auth', 'account_risk', 'network', 'rate_limit'].includes(result.failure_kind)))) {
-        cancelAccountQueue(entry.job.account_id);
-      }
-      entry.resolve(result);
-    } catch (error) {
-      cancelAccountQueue(entry.job.account_id);
-      entry.reject(error);
+
+  function requestClaim(entry, send, priority = false) {
+    return new Promise((resolve, reject) => {
+      const request = { entry, send, resolve, reject };
+      if (priority) requestQueue.unshift(request);
+      else requestQueue.push(request);
+      pumpClaimRequests();
+    });
+  }
+
+  function pumpClaimRequests() {
+    while (runningRequests < requestConcurrency && requestQueue.length) {
+      const { entry, send, resolve, reject } = requestQueue.shift();
+      if (!claimActive(entry)) { resolve(null); continue; }
+      runningRequests++;
+      Promise.resolve().then(() => claimActive(entry) ? send() : null).then(resolve, reject).finally(() => {
+        runningRequests--;
+        pumpClaimRequests();
+      });
     }
-    finally {
-      runningAccounts.delete(entry.job.account_id);
+  }
+
+  function cancelClaimEntries(matches, message) {
+    for (const entry of pendingClaims.values()) {
+      if (!matches(entry) || entry.phase === 'submitting' || entry.controller.signal.aborted) continue;
+      entry.cancelMessage = message;
+      entry.controller.abort();
+    }
+    pumpClaims();
+    pumpClaimRequests();
+  }
+
+  async function runClaim(entry) {
+    const { job, controller: { signal } } = entry;
+    let config, result;
+    const releaseConfig = (value = config) => {
+      if (value === config) config = null;
+      const session = value?.verification_session;
+      if (session) void api('/api/claims/verification/cancel', { method: 'POST', body: { verification_session: session } }).catch(() => {});
+    };
+    const readConfig = async forVerification => {
+      const query = new URLSearchParams(job);
+      if (!forVerification) query.set('config_only', '1');
+      const fresh = await requestClaim(entry, () => {
+        setClaimPhase(entry, forVerification ? 'preparing' : 'config');
+        return api('/api/claims/verification?' + query, { cache: 'no-store' });
+      }, forVerification);
+      if (!claimActive(entry)) { releaseConfig(fresh); return; }
+      config = fresh;
+      if (typeof config?.enabled !== 'boolean') throw new Error('上游未返回有效的安全验证配置，请重试。');
+    };
+
+    try {
+      await readConfig(false);
+      if (!claimActive(entry)) return;
+      let ticket = {};
+      if (config.enabled && !entry.batch) {
+        setClaimPhase(entry, 'waiting');
+        ticket = await queueClaimBrowserVerification(signal, async () => {
+          if (!claimActive(entry)) return null;
+          if (document.hidden || document.querySelector('.modal-bg:not(.closing)')) {
+            throw new Error('请保持领卡页面在前台并关闭其他弹层，然后重试。');
+          }
+          await readConfig(true);
+          if (!claimActive(entry)) return null;
+          if (!config.enabled) return {};
+          if (!config.scene_id || !config.verification_session || !Number.isFinite(config.expires_at)) {
+            throw new Error('上游未提供有效的验证会话，请重试。');
+          }
+          return requestClaimCaptcha(config, signal, {
+            onStart: () => setClaimPhase(entry, 'verifying'),
+            onFeedback: (message, isError) => setClaimPhase(entry, 'verifying', message, isError),
+            onDismiss: () => { entry.cancelMessage = '已取消验证'; },
+          });
+        });
+      }
+      if (!ticket || !claimActive(entry)) return;
+      setClaimPhase(entry, 'ready');
+      result = await requestClaim(entry, () => {
+        setClaimPhase(entry, 'submitting');
+        const body = entry.batch ? { ...job, auto_verify: true } : { ...job, ...ticket };
+        return api('/api/claims/claim', { method: 'POST', body });
+      }, true);
+      if (result && !result.ok && ticket.captcha_verify_param && result.httpStatus > 0) {
+        result = { ...result, message: 'ZCode 领取失败：' + claimResultMessage(result), manualVerificationFailed: true };
+      }
+      if (result && !result.ok && ((!entry.batch && claimNeedsVerification(result)) || result.retry_after_ms > 0 || ['auth', 'account_risk', 'network', 'rate_limit'].includes(result.failure_kind))) {
+        cancelClaimEntries(other => other !== entry && other.job.account_id === job.account_id, '等待重新领取');
+      }
+    } catch (error) {
+      if (claimActive(entry)) {
+        const requiresVerification = claimNeedsVerification(manualClaimResults().get(entry.key));
+        result = { ok: false, message: error.message, requires_verification: requiresVerification, manualVerificationFailed: !entry.batch };
+      }
+    } finally {
+      releaseConfig();
+      result ||= cancelResult(entry);
+      recordClaimResult(entry, result);
+      runningAccounts.delete(job.account_id);
       pendingClaims.delete(entry.key);
+      entry.resolve(result);
+      if (result?.ok) window.dispatchEvent(new Event('manual-claim-completed'));
       pumpClaims();
     }
   }
-  function cancelAccountQueue(accountID) {
-    for (let index = claimQueue.length - 1; index >= 0; index--) {
-      if (claimQueue[index].job.account_id !== accountID) continue;
-      const [entry] = claimQueue.splice(index, 1);
-      pendingClaims.delete(entry.key);
-      entry.resolve(null);
-    }
-  }
-  function removeClaimed(job) {
-    const preview = previews.find(item => item.account_id === job.account_id);
-    if (preview) preview.plans = (preview.plans || []).filter(plan => plan.plan_id !== job.plan_id);
-    if (active()) paint();
-  }
-  const resultMessage = claimResultMessage;
   $('#claims-refresh', main).addEventListener('click', load);
   $('#claims-schedule', main).addEventListener('change', async event => {
     if (!schedule || scheduleSaving || batchRunning || pendingClaims.size) return;
@@ -709,50 +680,53 @@ async function pageClaims(main) {
   content.addEventListener('click', event => {
     const accountLink = event.target.closest('[data-act="claim-account"]');
     if (accountLink) { viewAccount(accountLink.dataset.id); return; }
-    const button = event.target.closest('[data-claim]');
-    if (!button || button.disabled) return;
+    const skip = event.target.closest('[data-claim-skip]');
+    const button = skip ? $('[data-claim]', skip.closest('.daily-claim-row')) : event.target.closest('[data-claim]');
+    if (!button) return;
     const job = { account_id: button.dataset.claim, plan_id: button.dataset.plan };
+    if (skip) {
+      cancelClaimEntries(entry => entry.key === claimKey(job), '已取消验证');
+      return;
+    }
+    if (button.disabled) return;
     void enqueueClaim(job).then(result => {
-      if (!active() || !result) return;
-      toast(result.ok ? '每日免费卡已领取' : resultMessage(result), result.ok ? 'ok' : 'err');
-    }).catch(error => { if (active()) toast(error.message, 'err'); });
+      if (active() && result?.ok) toast(result.already_claimed ? '该账号已领取过' : '每日免费卡已领取', 'ok');
+    });
+  });
+  $('#claims-stop', main).addEventListener('click', () => {
+    cancelClaimEntries(() => true, '已停止领取');
   });
   $('#claims-all', main).addEventListener('click', async () => {
     if (batchRunning || pendingClaims.size || loading || scheduleSaving) return;
-    const pending = jobs();
-    batchRunning = true; syncBusy();
+    const summary = $('#claims-summary', main);
+    summary.textContent = '';
+    batchRunning = true;
     try {
-      const outcomes = await Promise.allSettled(pending.map(enqueueClaim));
+      const outcomes = await Promise.all(batchJobs().map(job => enqueueClaim(job, true)));
       if (!active()) return;
-      let claimed = 0, failed = 0, canceled = 0, verification = 0;
-      for (const [index, outcome] of outcomes.entries()) {
-        if (outcome.status === 'fulfilled' && !outcome.value) {
-          if (pendingClaimVerification(pending[index])) verification++; else canceled++;
-          continue;
-        }
-        if (outcome.status === 'fulfilled' && outcome.value.ok) { claimed++; continue; }
-        if (outcome.status === 'fulfilled' && claimNeedsVerification(outcome.value)) { verification++; continue; }
-        failed++;
-        const message = outcome.status === 'rejected' ? outcome.reason.message : resultMessage(outcome.value);
-        toast(`${accountFor(pending[index].account_id).platform_name || '账号'}：${message}`, 'err');
+      let claimed = 0, alreadyClaimed = 0, needsVerification = 0, failed = 0, canceled = 0;
+      for (const result of outcomes) {
+        if (!result || result.canceled) canceled++;
+        else if (result.already_claimed) alreadyClaimed++;
+        else if (result.ok) claimed++;
+        else if (claimNeedsVerification(result)) needsVerification++;
+        else failed++;
       }
-      toast(`已领取 ${claimed} 张${verification ? `，${verification} 张待人工验证` : ''}${failed ? `，${failed} 张失败` : ''}${canceled ? `，${canceled} 张未继续` : ''}`, failed ? 'err' : verification ? '' : 'ok');
+      summary.textContent = `本次领取 ${claimed} 张${alreadyClaimed ? `，${alreadyClaimed} 张此前已领` : ''}${needsVerification ? `，${needsVerification} 张需人工验证` : ''}${failed ? `，${failed} 张失败` : ''}${canceled ? `，${canceled} 张未继续` : ''}`;
     } finally {
-      batchRunning = false; syncBusy();
+      batchRunning = false;
+      syncBusy();
     }
   });
-  const onVerificationChange = event => {
-    if (event.detail?.resolved) removeClaimed(event.detail.job);
-    else if (event.detail?.result) paint();
-    else syncBusy();
-  };
-  window.addEventListener('claim-verification-change', onVerificationChange);
+  window.addEventListener('manual-claim-completed', paint);
   const removalObserver = new MutationObserver(() => {
     if (active()) return;
     loadController?.abort();
-    window.removeEventListener('claim-verification-change', onVerificationChange);
+    window.removeEventListener('manual-claim-completed', paint);
     removalObserver.disconnect();
+    cancelClaimEntries(() => true, '');
   });
   removalObserver.observe(main, { childList: true, subtree: true });
+  removalObserver.observe($('#app-view'), { attributes: true, attributeFilter: ['class'] });
   await load();
 }

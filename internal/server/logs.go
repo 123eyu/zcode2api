@@ -5,17 +5,62 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"zcode2api/internal/server/fault"
 	"zcode2api/internal/server/shared"
 )
 
 const logPageSize = 20
 
+func (a *App) startUsageLogCleanup() {
+	a.background(func() {
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		for {
+			a.pruneUsageLogs()
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-ticker.C:
+			case <-a.usageLogCleanupWake:
+			}
+		}
+	})
+}
+
+func (a *App) pruneUsageLogs() {
+	const batchSize = 1000
+	for a.ctx.Err() == nil {
+		// Keep each batch consistent with any concurrent retention change.
+		a.configMu.RLock()
+		days := shared.Integer(a.cfg["usage_log_retention_days"])
+		cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour).UnixMilli()
+		result, err := a.db.ExecContext(a.ctx, `DELETE FROM usage_log WHERE id IN (
+			SELECT id FROM usage_log WHERE ts<? ORDER BY ts LIMIT ?
+		)`, cutoff, batchSize)
+		a.configMu.RUnlock()
+		if err != nil {
+			if a.ctx.Err() == nil {
+				a.log.Printf("调用记录清理失败: %v", err)
+			}
+			return
+		}
+		deleted, err := result.RowsAffected()
+		if err != nil || deleted < batchSize {
+			return
+		}
+	}
+}
+
 func publicUsageLogs(rows []any) []any {
 	for _, v := range rows {
 		m := shared.Obj(v)
 		m["timings"] = shared.Parse(m["timings"], nil)
 		m["error_detail"] = shared.Parse(m["error_detail"], nil)
+		if m["status"] == "success" && shared.Str(m["error_code"]) == "" && shared.Str(m["error_message"]) == "" &&
+			m["ttft_ms"] != nil && m["tokens_in"] != nil && m["tokens_out"] != nil && shared.Num(m["tokens_in"]) == 0 && shared.Num(m["tokens_out"]) == 0 {
+			m["error_message"] = "已收到内容，但日志记录的 Token 用量为 0"
+		}
 		if shared.Str(m["error_message"]) != "" {
 			if m["error_detail"] == nil {
 				m["error_detail"] = shared.M{"message": m["error_message"]}
@@ -65,16 +110,9 @@ func logChoice(rows []any, value, label string) []any {
 	return choices
 }
 
-func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
-	table, alias := "usage_log", "u"
-	from := "usage_log u LEFT JOIN keys k ON k.id=u.key_id LEFT JOIN accounts a ON a.id=u.account_id"
-	columns := "u.*,k.name key_name,a.label account_label"
-	if kind == "sched" {
-		table, alias, from, columns = "schedule_log", "s", "schedule_log s LEFT JOIN accounts a ON a.id=s.picked", "s.*,a.label account_label"
-	}
-	if kind == "audit" {
-		table, alias, from, columns = "audit_log", "d", "audit_log d", "d.*"
-	}
+func (a *App) pagedUsageLogs(r *http.Request) (any, int, error) {
+	const from = "usage_log u LEFT JOIN keys k ON k.id=u.key_id LEFT JOIN accounts a ON a.id=u.account_id"
+	const columns = "u.*,k.name key_name,a.label account_label"
 	q := r.URL.Query()
 	bad := func(err error) (any, int, error) { return adminError(400, err.Error()) }
 	snapshot, err := logInteger(r, "snapshot", 0)
@@ -82,7 +120,7 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		return bad(err)
 	}
 	if q.Get("snapshot") == "" {
-		snapshot = shared.Integer(a.row("SELECT COALESCE(MAX(id),0) n FROM " + table)["n"])
+		snapshot = shared.Integer(a.row("SELECT COALESCE(MAX(id),0) n FROM usage_log")["n"])
 	}
 	asOf, err := logInteger(r, "as_of", shared.NowMS())
 	if err != nil {
@@ -107,12 +145,12 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		since = max(since, asOf-n*3600000)
 	}
 	s := logSelection{}
-	s.add(alias+".id<=?", snapshot)
+	s.add("u.id<=?", snapshot)
 	if since > 0 {
-		s.add(alias+".ts>=?", since)
+		s.add("u.ts>=?", since)
 	}
 	if until > 0 {
-		s.add(alias+".ts<=?", until)
+		s.add("u.ts<=?", until)
 	}
 	exact := func(name, column string) {
 		if value := q.Get(name); value != "" && value != "all" {
@@ -120,78 +158,49 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 		}
 	}
 	choices := shared.M{}
-	if kind == "logs" {
-		switch status := q.Get("status"); status {
-		case "", "all":
-		case "failed", "error":
-			s.add("COALESCE(u.status,'') NOT IN ('success','busy','canceled')")
-		case "non_success":
-			s.add("COALESCE(u.status,'')<>'success'")
-		case "success", "busy", "canceled":
-			s.add("u.status=?", status)
-		default:
-			return bad(fmt.Errorf("调用状态无效"))
-		}
-		exact("model", "u.model")
-		exact("account", "u.account_id")
-		exact("key", "u.key_id")
-		if code := q.Get("error_code"); code != "" && code != "all" {
-			if code == "__uncoded__" {
-				s.add("COALESCE(u.error_code,'')='' AND COALESCE(u.status,'')<>'success'")
-			} else {
-				s.add("u.error_code=?", code)
-			}
-		}
-		choices["models"] = logChoice(a.rows("SELECT DISTINCT model FROM usage_log WHERE id<=? AND COALESCE(model,'')<>'' ORDER BY model", snapshot), "model", "model")
-		choices["accounts"] = logChoice(a.rows("SELECT DISTINCT u.account_id,a.label FROM usage_log u LEFT JOIN accounts a ON a.id=u.account_id WHERE u.id<=? ORDER BY COALESCE(a.label,u.account_id)", snapshot), "account_id", "label")
-		choices["keys"] = logChoice(a.rows("SELECT DISTINCT u.key_id,k.name FROM usage_log u LEFT JOIN keys k ON k.id=u.key_id WHERE u.id<=? ORDER BY COALESCE(k.name,u.key_id)", snapshot), "key_id", "name")
-		errors := []any{}
-		for _, v := range a.rows("SELECT COALESCE(error_code,'') code,MAX(error_message) message FROM usage_log WHERE id<=? AND COALESCE(status,'')<>'success' GROUP BY COALESCE(error_code,'') ORDER BY code", snapshot) {
-			r := shared.Obj(v)
-			code := shared.Str(r["code"])
-			label := fault.ConciseFailureMessage(&fault.Failure{Code: code, Message: shared.Str(r["message"])})
-			value := code
-			if value == "" {
-				value, label = "__uncoded__", "未提供错误码"
-			} else {
-				label += "（" + code + "）"
-			}
-			errors = append(errors, shared.M{"value": value, "label": label})
-		}
-		choices["errors"] = errors
-	} else if kind == "sched" {
-		exact("policy", "s.policy")
-		exact("account", "s.picked")
-		switch q.Get("outcome") {
-		case "", "all":
-		case "picked":
-			s.add("COALESCE(s.picked,'')<>''")
-		case "unpicked":
-			s.add("COALESCE(s.picked,'')=''")
-		default:
-			return bad(fmt.Errorf("调度结果无效"))
-		}
-		choices["policies"] = logChoice(a.rows("SELECT DISTINCT policy FROM schedule_log WHERE id<=? ORDER BY policy", snapshot), "policy", "policy")
-		choices["accounts"] = logChoice(a.rows("SELECT DISTINCT s.picked,a.label FROM schedule_log s LEFT JOIN accounts a ON a.id=s.picked WHERE s.id<=? ORDER BY COALESCE(a.label,s.picked)", snapshot), "picked", "label")
-	} else {
-		exact("actor", "d.actor")
-		exact("action", "d.action")
-		exact("ip", "d.ip")
-		choices["actors"] = logChoice(a.rows("SELECT DISTINCT actor FROM audit_log WHERE id<=? ORDER BY actor", snapshot), "actor", "actor")
-		choices["actions"] = logChoice(a.rows("SELECT DISTINCT action FROM audit_log WHERE id<=? ORDER BY action", snapshot), "action", "action")
-		choices["ips"] = logChoice(a.rows("SELECT DISTINCT ip FROM audit_log WHERE id<=? ORDER BY ip", snapshot), "ip", "ip")
+	switch status := q.Get("status"); status {
+	case "", "all":
+	case "failed", "error":
+		s.add("COALESCE(u.status,'') NOT IN ('success','busy','canceled')")
+	case "non_success":
+		s.add("(COALESCE(u.status,'')<>'success' OR COALESCE(u.error_code,'')<>'')")
+	case "success", "busy", "canceled":
+		s.add("u.status=?", status)
+	default:
+		return bad(fmt.Errorf("调用状态无效"))
 	}
+	exact("model", "u.model")
+	exact("account", "u.account_id")
+	exact("key", "u.key_id")
+	if code := q.Get("error_code"); code != "" && code != "all" {
+		if code == "__uncoded__" {
+			s.add("COALESCE(u.error_code,'')='' AND COALESCE(u.status,'')<>'success'")
+		} else {
+			s.add("u.error_code=?", code)
+		}
+	}
+	choices["models"] = logChoice(a.rows("SELECT DISTINCT model FROM usage_log WHERE id<=? AND COALESCE(model,'')<>'' ORDER BY model", snapshot), "model", "model")
+	choices["accounts"] = logChoice(a.rows("SELECT DISTINCT u.account_id,a.label FROM usage_log u LEFT JOIN accounts a ON a.id=u.account_id WHERE u.id<=? ORDER BY COALESCE(a.label,u.account_id)", snapshot), "account_id", "label")
+	choices["keys"] = logChoice(a.rows("SELECT DISTINCT u.key_id,k.name FROM usage_log u LEFT JOIN keys k ON k.id=u.key_id WHERE u.id<=? ORDER BY COALESCE(k.name,u.key_id)", snapshot), "key_id", "name")
+	errors := []any{}
+	for _, v := range a.rows("SELECT COALESCE(error_code,'') code,MAX(error_message) message FROM usage_log WHERE id<=? AND (COALESCE(status,'')<>'success' OR COALESCE(error_code,'')<>'') GROUP BY COALESCE(error_code,'') ORDER BY code", snapshot) {
+		r := shared.Obj(v)
+		code := shared.Str(r["code"])
+		label := fault.ConciseFailureMessage(&fault.Failure{Code: code, Message: shared.Str(r["message"])})
+		value := code
+		if value == "" {
+			value, label = "__uncoded__", "未提供错误码"
+		} else {
+			label += "（" + code + "）"
+		}
+		errors = append(errors, shared.M{"value": value, "label": label})
+	}
+	choices["errors"] = errors
 	if term := strings.TrimSpace(q.Get("q")); term != "" {
 		if len([]rune(term)) > 200 {
 			return bad(fmt.Errorf("搜索内容最多 200 个字符"))
 		}
 		fields := []string{"u.request_id", "u.trace_id", "u.model", "u.account_id", "a.label", "u.key_id", "k.name", "u.client_ip", "u.error_code", "u.error_message", "u.error_detail", "u.status"}
-		if kind == "sched" {
-			fields = []string{"s.request_id", "s.picked", "a.label", "s.policy", "s.candidates", "s.chain"}
-		}
-		if kind == "audit" {
-			fields = []string{"d.actor", "d.action", "d.detail", "d.ip"}
-		}
 		parts := []string{}
 		args := []any{}
 		for _, field := range fields {
@@ -199,25 +208,17 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 			args = append(args, term)
 		}
 		// Search current short summaries as well as the raw text of old records.
-		if kind == "logs" {
-			for _, choice := range shared.Arr(choices["errors"]) {
-				c := shared.Obj(choice)
-				if strings.Contains(strings.ToLower(shared.Str(c["label"])), strings.ToLower(term)) {
-					if c["value"] == "__uncoded__" {
-						continue
-					}
-					parts = append(parts, "u.error_code=?")
-					args = append(args, c["value"])
-				}
+		for _, choice := range errors {
+			c := shared.Obj(choice)
+			if c["value"] != "__uncoded__" && strings.Contains(strings.ToLower(shared.Str(c["label"])), strings.ToLower(term)) {
+				parts = append(parts, "u.error_code=?")
+				args = append(args, c["value"])
 			}
 		}
 		s.add("("+strings.Join(parts, " OR ")+")", args...)
 	}
 	where := s.where()
-	aggregate := "COUNT(*) total"
-	if kind == "logs" {
-		aggregate += ",COALESCE(SUM(u.status='success'),0) success,COALESCE(SUM(u.status='busy'),0) busy,COALESCE(SUM(u.status='canceled'),0) canceled,COALESCE(SUM(COALESCE(u.status,'') NOT IN ('success','busy','canceled')),0) failed,COALESCE(SUM(COALESCE(u.tokens_in,0)+COALESCE(u.tokens_out,0)),0) tokens,COUNT(u.ttft_ms) ttft_count"
-	}
+	const aggregate = "COUNT(*) total,COALESCE(SUM(u.status='success'),0) success,COALESCE(SUM(u.status='busy'),0) busy,COALESCE(SUM(u.status='canceled'),0) canceled,COALESCE(SUM(COALESCE(u.status,'') NOT IN ('success','busy','canceled')),0) failed,COALESCE(SUM(COALESCE(u.tokens_in,0)+COALESCE(u.tokens_out,0)),0) tokens,COUNT(u.ttft_ms) ttft_count"
 	summary := a.row("SELECT "+aggregate+" FROM "+from+where, s.args...)
 	total := shared.Integer(summary["total"])
 	page, err := logInteger(r, "page", 1)
@@ -227,17 +228,14 @@ func (a *App) pagedLogs(r *http.Request, kind string) (any, int, error) {
 	pages := max(int64(1), (total+logPageSize-1)/logPageSize)
 	page = min(max(int64(1), page), pages)
 	args := append(append([]any{}, s.args...), logPageSize, (page-1)*logPageSize)
-	items := a.rows("SELECT "+columns+" FROM "+from+where+" ORDER BY "+alias+".ts DESC,"+alias+".id DESC LIMIT ? OFFSET ?", args...)
+	items := a.rows("SELECT "+columns+" FROM "+from+where+" ORDER BY u.ts DESC,u.id DESC LIMIT ? OFFSET ?", args...)
 	if items == nil {
 		items = []any{}
 	}
-	if kind == "logs" {
-		items = publicUsageLogs(items)
-		n := shared.Integer(summary["ttft_count"])
-		if n > 0 {
-			args := append(append([]any{}, s.args...), n/2)
-			summary["p50"] = a.row("SELECT u.ttft_ms value FROM "+from+where+" AND u.ttft_ms IS NOT NULL ORDER BY u.ttft_ms LIMIT 1 OFFSET ?", args...)["value"]
-		}
+	items = publicUsageLogs(items)
+	if n := shared.Integer(summary["ttft_count"]); n > 0 {
+		args := append(append([]any{}, s.args...), n/2)
+		summary["p50"] = a.row("SELECT u.ttft_ms value FROM "+from+where+" AND u.ttft_ms IS NOT NULL ORDER BY u.ttft_ms LIMIT 1 OFFSET ?", args...)["value"]
 	}
 	return shared.M{"items": items, "total": total, "page": page, "pages": pages, "page_size": logPageSize, "snapshot": snapshot, "as_of": asOf, "summary": summary, "filters": choices}, 200, nil
 }

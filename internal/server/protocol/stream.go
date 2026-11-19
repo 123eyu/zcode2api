@@ -35,6 +35,7 @@ type Stream struct {
 	created             int64
 	sequence, index     int
 	includeUsage        bool
+	started             bool
 	terminal            bool
 	block               *streamBlock
 	tools               map[int]*streamTool
@@ -49,16 +50,24 @@ func NewStream(w http.ResponseWriter, r *http.Request, protocol, id, model strin
 	s := &Stream{w: w, Ctx: ctx, cancel: cancel, protocol: protocol, id: id, model: model, created: time.Now().Unix(), index: -1, includeUsage: include, tools: map[int]*streamTool{}, output: []any{}}
 	s.toolCatalog = tools
 	s.writer = http.NewResponseController(w)
-	h := w.Header()
+	w.Header().Set("X-Request-Id", id)
+	return s
+}
+
+func (s *Stream) start() {
+	if s.started {
+		return
+	}
+	s.started = true
+	h := s.w.Header()
 	h.Set("Content-Type", "text/event-stream; charset=utf-8")
 	h.Set("Cache-Control", "no-cache, no-transform")
 	h.Set("X-Accel-Buffering", "no")
-	h.Set("X-Request-Id", id)
-	w.WriteHeader(200)
-	if protocol == "chat" {
+	s.w.WriteHeader(http.StatusOK)
+	if s.protocol == "chat" {
 		s.chunk(shared.M{"role": "assistant", "content": ""}, nil)
-	} else if protocol == "responses" {
-		response := shared.M{"id": id, "object": "response", "created_at": s.created, "status": "in_progress", "model": model, "output": []any{}}
+	} else if s.protocol == "responses" {
+		response := shared.M{"id": s.id, "object": "response", "created_at": s.created, "status": "in_progress", "model": s.model, "output": []any{}}
 		s.event("response.created", shared.M{"response": response})
 		s.event("response.in_progress", shared.M{"response": response})
 	}
@@ -67,7 +76,7 @@ func NewStream(w http.ResponseWriter, r *http.Request, protocol, id, model strin
 		defer t.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-s.Ctx.Done():
 				return
 			case <-t.C:
 				s.mu.Lock()
@@ -78,7 +87,6 @@ func NewStream(w http.ResponseWriter, r *http.Request, protocol, id, model strin
 			}
 		}
 	})
-	return s
 }
 
 func (s *Stream) write(v string) {
@@ -165,6 +173,12 @@ func (s *Stream) OnEvent(e Event) error {
 	if s.terminal {
 		return nil
 	}
+	if !s.started {
+		if !e.StartsStream(s.protocol) {
+			return nil
+		}
+		s.start()
+	}
 	if s.protocol == "anthropic" {
 		if e.Type == "native_event" {
 			s.write(e.Frame.Raw)
@@ -177,7 +191,7 @@ func (s *Stream) OnEvent(e Event) error {
 		}
 		return s.writeError
 	}
-	if (e.Type != "text_delta" && e.Type != "reasoning_delta") || e.Text == "" {
+	if !e.HasText() {
 		return nil
 	}
 	reason := e.Type == "reasoning_delta"
@@ -269,6 +283,7 @@ func (s *Stream) toolEvent(e Event) error {
 func (s *Stream) Complete(r *Result) shared.M {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.start()
 	s.terminal = true
 	if s.protocol == "anthropic" {
 		return nil
@@ -297,11 +312,15 @@ func (s *Stream) completedOutput() []any {
 	return out
 }
 
-func (s *Stream) Fail(f *fault.Failure) {
+// Fail reports whether the error belongs to an already-open SSE stream.
+func (s *Stream) Fail(f *fault.Failure) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.started {
+		return false
+	}
 	if s.terminal {
-		return
+		return true
 	}
 	_, shape := ErrorShape(f, s.protocol)
 	switch s.protocol {
@@ -314,10 +333,13 @@ func (s *Stream) Fail(f *fault.Failure) {
 		s.event("response.failed", shared.M{"response": shared.M{"id": s.id, "object": "response", "created_at": s.created, "model": s.model, "status": "failed", "output": s.completedOutput(), "error": shape}})
 	}
 	s.terminal = true
+	return true
 }
 
 func (s *Stream) End() {
 	s.cancel()
 	s.worker.Wait()
-	_ = s.writer.SetWriteDeadline(time.Time{})
+	if s.started {
+		_ = s.writer.SetWriteDeadline(time.Time{})
+	}
 }

@@ -29,6 +29,7 @@ func CaptchaTicketTTL(options shared.M) time.Duration {
 const (
 	CaptchaPurposeInference      = "inference"
 	CaptchaPurposeClaim          = "claim"
+	CaptchaPurposeBatchClaim     = "batch_claim"
 	CaptchaPurposeScheduledClaim = "scheduled_claim"
 	CaptchaPrefetchDemandWindow  = 30 * time.Second
 	MaxCaptchaPools              = 128

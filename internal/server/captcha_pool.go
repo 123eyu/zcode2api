@@ -126,7 +126,12 @@ func validateCaptchaRequestToken(verification captchaVerification, account share
 }
 
 func (a *App) captchaScope(ctx context.Context, account shared.M, purpose string, scene shared.M) (captchaTicketScope, *fault.Failure) {
-	if shared.Str(account["id"]) == "" || (purpose != captchasdk.CaptchaPurposeInference && purpose != captchasdk.CaptchaPurposeClaim && purpose != captchasdk.CaptchaPurposeScheduledClaim) {
+	switch purpose {
+	case captchasdk.CaptchaPurposeInference, captchasdk.CaptchaPurposeClaim, captchasdk.CaptchaPurposeBatchClaim, captchasdk.CaptchaPurposeScheduledClaim:
+	default:
+		return captchaTicketScope{}, captchasdk.CaptchaScopeChanged()
+	}
+	if shared.Str(account["id"]) == "" {
 		return captchaTicketScope{}, captchasdk.CaptchaScopeChanged()
 	}
 	scope := captchaTicketScope{sceneKey: a.captchaSceneKey(ctx), accountID: shared.Str(account["id"]), accountVersion: a.captchaAccountVersion(account), purpose: purpose, guard: a.captchaRequestScope(ctx, account, scene), accountDevice: a.upstreamScope(ctx, account, a.origin, true).device}

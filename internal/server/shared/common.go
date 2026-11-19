@@ -19,6 +19,8 @@ import (
 
 type M = map[string]any
 
+const AccountOperationConcurrency = 3
+
 func Wake(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:

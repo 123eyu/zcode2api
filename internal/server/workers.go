@@ -20,6 +20,8 @@ func (a *App) startWorkers() {
 	a.startDailyClaims()
 	a.startProxyHealthProbes()
 	a.startBalanceSnapshotCleanup()
+	a.startUsageLogCleanup()
+	a.startUpdateBackupCleanup()
 	a.background(func() {
 		t := time.NewTimer(0)
 		defer t.Stop()

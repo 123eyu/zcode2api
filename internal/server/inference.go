@@ -119,13 +119,8 @@ func (a *App) infer(ctx context.Context, o inferOptions) (*wire.Result, *fault.F
 			}
 		}
 		start := time.Now()
-		account, busy, candidates, policy, e := a.acquire(ctx, o, skip, max(0, min(busyWait(p), time.Until(deadline))))
+		account, busy, e := a.acquire(ctx, o, skip, max(0, min(busyWait(p), time.Until(deadline))))
 		o.Timing.queue += time.Since(start)
-		var picked any
-		if account != nil {
-			picked = account["id"]
-		}
-		_ = a.exec("INSERT INTO schedule_log(ts,request_id,chain,candidates,policy,picked) VALUES(?,?,?,?,?,?)", shared.NowMS(), o.ID, shared.JSON(a.keyChain(o.Key)), shared.JSON(candidates), policy, picked)
 		if e != nil {
 			if f, ok := e.(*fault.Failure); ok {
 				return fail(f)
@@ -298,6 +293,15 @@ func (a *App) logUsage(o inferOptions, r *wire.Result, f *fault.Failure, account
 	if r != nil {
 		u = r.Usage
 		trace = r.TraceID
+		logCode := r.UsageWarning
+		if r.FinishReason == "refusal" {
+			status = "failed"
+			logCode = "upstream_content_refusal"
+			detail = shared.JSON(shared.M{"stop_reason": r.FinishReason})
+		}
+		if logCode != "" {
+			code, message = logCode, fault.ConciseFailureMessage(&fault.Failure{Code: logCode})
+		}
 	}
 	if f != nil {
 		status = "failed"

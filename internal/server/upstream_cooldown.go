@@ -175,6 +175,10 @@ func (a *App) beginUpstreamRequest(ctx context.Context, scope upstreamRequestSco
 	if ctx.Err() != nil {
 		return ctx, func(*fault.Failure) {}, &fault.Failure{Kind: "canceled", Code: "canceled", Message: "请求已取消"}
 	}
+	// User-initiated claims surface each upstream result directly.
+	if ctx.Value(manualClaimContextKey{}) == true {
+		return ctx, func(*fault.Failure) {}, nil
+	}
 	baseDelay := min(15*time.Minute, max(time.Second, shared.Ms(shared.Fallback(a.retryParams()["rate_limit_retry_interval_ms"], 1000))))
 	parent, _ := ctx.Value(upstreamAdmissionKey{}).(upstreamAdmission)
 	admitted := upstreamAdmission{app: a, generations: map[string]uint64{}, inference: scope.inference}

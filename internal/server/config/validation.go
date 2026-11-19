@@ -3,7 +3,10 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
+	"strings"
+	"time"
 	captchasdk "zcode2api/internal/server/captcha"
 	wire "zcode2api/internal/server/protocol"
 	routing "zcode2api/internal/server/proxy"
@@ -12,7 +15,37 @@ import (
 
 var VersionPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
+const MaxUsageLogRetentionDays = (1<<63 - 1) / int64(24*time.Hour)
+
+func ValidUsageLogRetentionDays(value any) bool {
+	return shared.IntegerInRange(value, 1, float64(MaxUsageLogRetentionDays))
+}
+
+func GitHubUpdateMirror(value any) (string, error) {
+	base, ok := value.(string)
+	if ok {
+		base = strings.TrimSpace(base)
+		if base == "" {
+			return "", nil
+		}
+		u, err := url.Parse(base)
+		if err == nil && len(base) <= 2048 && u.Scheme == "https" && u.Hostname() != "" &&
+			u.User == nil && !u.ForceQuery && !strings.ContainsAny(base, "?#") {
+			return strings.TrimRight(u.String(), "/"), nil
+		}
+	}
+	return "", fmt.Errorf("GitHub 镜像基址须为 HTTPS URL，可留空，基址中请勿填写凭据、查询参数或片段")
+}
+
 func ValidateSettings(b shared.M) error {
+	if value, present := b["github_update_mirror"]; present {
+		if _, err := GitHubUpdateMirror(value); err != nil {
+			return err
+		}
+	}
+	if value, present := b["usage_log_retention_days"]; present && !ValidUsageLogRetentionDays(value) {
+		return fmt.Errorf("调用记录保留天数须为 1 到 %d 之间的整数", MaxUsageLogRetentionDays)
+	}
 	if value, present := b["zcode_template_mode"]; present {
 		mode, ok := value.(string)
 		if !ok || (mode != wire.TemplateMain && mode != wire.TemplateSubagent) {
@@ -81,10 +114,11 @@ func ValidateSettings(b shared.M) error {
 			}
 		}
 	}
-	for _, k := range []string{"poll_interval_sec", "poll_concurrency"} {
-		if v, ok := b[k]; ok && shared.Num(v) < 1 {
-			return fmt.Errorf("%s 必须大于等于 1", k)
-		}
+	if v, ok := b["poll_interval_sec"]; ok && shared.Num(v) < 1 {
+		return fmt.Errorf("poll_interval_sec 必须大于等于 1")
+	}
+	if v, ok := b["poll_concurrency"]; ok && !shared.IntegerInRange(v, 1, shared.AccountOperationConcurrency) {
+		return fmt.Errorf("poll_concurrency 必须是 1 到 %d 的整数", shared.AccountOperationConcurrency)
 	}
 	if enabled, present := b["daily_claim_enabled"]; present {
 		if _, ok := enabled.(bool); !ok {

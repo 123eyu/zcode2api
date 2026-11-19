@@ -63,8 +63,7 @@ var CaptchaBrowserRuntime []byte
 //go:embed captcha_native.cjs
 var CaptchaNativeRuntime []byte
 
-// The configured runtime applies only to manual claims. Scheduled claims
-// always use Chromium and have their own ticket scope.
+// Batch and scheduled claims use separate Chromium verification scopes.
 func CaptchaUsesBrowser(purpose string, options shared.M) bool {
-	return purpose == CaptchaPurposeScheduledClaim || (purpose == CaptchaPurposeClaim && options["claim_runtime"] == "browser")
+	return purpose == CaptchaPurposeBatchClaim || purpose == CaptchaPurposeScheduledClaim || (purpose == CaptchaPurposeClaim && options["claim_runtime"] == "browser")
 }

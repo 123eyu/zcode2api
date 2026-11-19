@@ -12,8 +12,9 @@ import (
 )
 
 type claimCaptchaDiagnosticKey struct{}
+type manualClaimContextKey struct{}
 
-func (a *App) claimVerification(ctx context.Context, id, plan string) (shared.M, error) {
+func (a *App) claimVerification(ctx context.Context, id, plan string, configOnly bool) (shared.M, error) {
 	if strings.TrimSpace(plan) == "" {
 		return nil, fault.Invalid("缺少 plan_id")
 	}
@@ -21,48 +22,27 @@ func (a *App) claimVerification(ctx context.Context, id, plan string) (shared.M,
 	if account == nil {
 		return nil, fmt.Errorf("账号不存在")
 	}
+	if shared.Str(a.tokens(id)["zcode_jwt"]) == "" {
+		return nil, fault.Invalid("该账号无 zcode_jwt，无法领取")
+	}
+	ctx = context.WithValue(ctx, manualClaimContextKey{}, true)
 	ctx, release, err := a.pinClaimOutboundProxy(ctx, account)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	// Check the ordinary account/device/exit guard before loading scene data.
-	// A browser dialog must wait just like an automatic claim does.
-	cooldownResult := func(guard upstreamRequestScope) shared.M {
-		var retryAt time.Time
-		a.mu.Lock()
-		for _, key := range guard.keys() {
-			if cooldown := a.upstreamCooldowns[key]; cooldown != nil {
-				retryAt = shared.MaxTime(retryAt, cooldown.until)
-				if cooldown.probing {
-					retryAt = shared.MaxTime(retryAt, time.Now().Add(time.Second))
-				}
-			}
-		}
-		a.mu.Unlock()
-		if time.Now().Before(retryAt) {
-			return shared.M{"enabled": true, "verification_retry_at": retryAt.UnixMilli()}
-		}
-		return nil
-	}
-	if waiting := cooldownResult(a.upstreamScope(ctx, account, a.origin, true)); waiting != nil {
-		return waiting, nil
-	}
 	a.prepareCaptchaChallenge(ctx)
 	scene, failure := a.captchaScene(ctx, account)
 	if failure != nil {
 		return nil, failure
 	}
-	if !shared.Truth(scene["enabled"]) {
-		return shared.M{"enabled": false}, nil
+	enabled := shared.Truth(scene["enabled"])
+	if configOnly || !enabled {
+		return shared.M{"enabled": enabled}, nil
 	}
 	scope, failure := a.captchaScope(ctx, account, captchasdk.CaptchaPurposeClaim, scene)
 	if failure != nil {
 		return nil, failure
-	}
-	// Scene-specific SDK cooldowns also apply before issuing a short-lived session.
-	if waiting := cooldownResult(scope.guard); waiting != nil {
-		return waiting, nil
 	}
 	token, failure := a.newClaimCaptchaSession(ctx, scope, plan, shared.Str(scene["region"]))
 	if failure != nil {
@@ -194,32 +174,30 @@ func (a *App) claimVerificationContext(parent context.Context, account shared.M,
 	return ctx, session.release, nil
 }
 
-const manualClaimConcurrency = 5
+const manualClaimConcurrency = shared.AccountOperationConcurrency
 
 type manualClaimWorkerKey struct{}
 
-// Lease a verification worker for the entire manual claim, so multiple tabs
-// and batch requests share the same bound. Account locks still prevent two
-// simultaneous submissions for the same account.
-func (a *App) acquireManualClaimWorker(ctx context.Context) (context.Context, func(), error) {
+// Manual and scheduled submissions share the same worker budget.
+func (a *App) acquireClaimWorker(ctx context.Context) (int, func(), error) {
 	a.mu.Lock()
-	if a.manualClaimSlots == nil {
-		a.manualClaimSlots = make(chan int, manualClaimConcurrency)
-		for worker := range manualClaimConcurrency {
-			a.manualClaimSlots <- worker
+	if a.claimWorkerSlots == nil {
+		a.claimWorkerSlots = make(chan int, shared.AccountOperationConcurrency)
+		for worker := range shared.AccountOperationConcurrency {
+			a.claimWorkerSlots <- worker
 		}
 	}
-	slots := a.manualClaimSlots
+	slots := a.claimWorkerSlots
 	a.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return ctx, nil, err
+		return 0, nil, err
 	}
 	select {
 	case worker := <-slots:
-		return context.WithValue(ctx, manualClaimWorkerKey{}, worker), func() { slots <- worker }, nil
+		return worker, func() { slots <- worker }, nil
 	case <-ctx.Done():
-		return ctx, nil, ctx.Err()
+		return 0, nil, ctx.Err()
 	case <-a.ctx.Done():
-		return ctx, nil, a.ctx.Err()
+		return 0, nil, a.ctx.Err()
 	}
 }

@@ -148,6 +148,9 @@ func (a *App) captchaRuntimeParameters(ctx context.Context, options, scene share
 	if captchasdk.CaptchaUsesBrowser(scope.purpose, options) {
 		parameters["session_key"] = scope.key()
 	}
+	if scope.purpose == captchasdk.CaptchaPurposeBatchClaim {
+		parameters["headless_only"] = true
+	}
 	pool := a.captchaPool(scope)
 	a.captcha.mu.Lock()
 	parameters["state"] = shared.Clone(pool.runtimeState)
@@ -290,7 +293,7 @@ func (a *App) captchaScene(ctx context.Context, account shared.M) (shared.M, *fa
 		}
 		if cached && time.Now().Before(entry.Expires) {
 			a.captcha.mu.Unlock()
-			if time.Until(entry.Expires) < captchaSceneRefreshLead {
+			if ctx.Value(manualClaimContextKey{}) != true && time.Until(entry.Expires) < captchaSceneRefreshLead {
 				a.refreshCaptchaScene(key, routing.SelectedProxy(ctx))
 			}
 			return entry.Value, nil

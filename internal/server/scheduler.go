@@ -16,11 +16,9 @@ const accountConcurrencyLimit = 3
 const maxQueuedRequests = 1024
 
 type accountAssignment struct {
-	account    shared.M
-	busy       bool
-	candidates []any
-	policy     string
-	failure    *fault.Failure
+	account shared.M
+	busy    bool
+	failure *fault.Failure
 }
 
 type accountWaiter struct {
@@ -70,30 +68,22 @@ func (a *App) schedulingPools(key shared.M) []schedulingPool {
 	}
 	query += " ORDER BY g.created_at,g.id,a.created_at,a.id"
 	pools := map[string]*schedulingPool{}
-	order := []string{}
+	order := []any{}
 	for _, v := range a.rows(query, args...) {
 		r := shared.Obj(v)
 		gid := shared.Str(r["_gid"])
 		pool := pools[gid]
 		if pool == nil {
-			pool = &schedulingPool{group: shared.M{"id": gid, "name": r["_name"], "role": r["_role"], "policy": r["_policy"], "family_filter": r["_family"], "urgent_window_min": r["_urgent"]}}
+			pool = &schedulingPool{group: shared.M{"id": gid, "name": r["_name"], "role": r["_role"], "policy": r["_policy"], "family_filter": r["_family"], "urgent_window_min": r["_urgent"], "enabled": 1}}
 			pools[gid] = pool
-			order = append(order, gid)
+			order = append(order, pool.group)
 		}
 		if r["id"] != nil {
 			pool.accounts = append(pool.accounts, schedulingCandidate{row: r})
 		}
 	}
 	if !explicit {
-		chain = []any{}
-		for _, role := range []string{"primary", "backup"} {
-			for _, id := range order {
-				if shared.Str(pools[id].group["role"]) == role {
-					chain = append(chain, id)
-					break
-				}
-			}
-		}
+		chain = defaultGroupChain(order)
 	}
 	out := make([]schedulingPool, 0, len(chain))
 	seen := map[string]bool{}
@@ -107,7 +97,7 @@ func (a *App) schedulingPools(key shared.M) []schedulingPool {
 	return out
 }
 
-func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M, bool, []any, string, *fault.Failure) {
+func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (account shared.M, busy, upstreamBusy bool, failure *fault.Failure) {
 	params := a.retryParams()
 	now := shared.NowMS()
 	minWindow := int64(shared.Num(shared.Fallback(params["min_request_window_sec"], 60)) * 1000)
@@ -162,20 +152,9 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 	if o.Recovery != nil && o.Recovery.key != poolKey {
 		a.releasePoolRecoveryLocked(o.Recovery)
 	}
-	candidates := []any{}
-	busy := false
 	var cooling *fault.Failure
 	if poolCooldown != nil && (time.Now().Before(poolCooldown.until) || poolCooldown.probing && (poolCooldown.recovery == nil || poolCooldown.recovery.owner != o.Recovery)) {
-		for _, pool := range pools {
-			for _, c := range pool.accounts {
-				reason := c.skip
-				if reason == "" {
-					reason = "account_pool_cooling"
-				}
-				candidates = append(candidates, shared.M{"account": c.row["id"], "label": c.row["label"], "skip": reason, "picked": false})
-			}
-		}
-		return nil, false, candidates, "", poolCooldown.refusal()
+		return nil, false, false, poolCooldown.refusal()
 	}
 	if poolCooldown != nil {
 		if poolCooldown.recovery == nil {
@@ -200,7 +179,7 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 			}
 		}
 		if a.completePoolRecoveryLocked(poolKey, poolCooldown) {
-			return nil, false, candidates, "risk_probe", poolCooldown.refusal()
+			return nil, false, false, poolCooldown.refusal()
 		}
 		round.owner, poolCooldown.probing = o.Recovery, true
 		if o.Recovery != nil {
@@ -240,10 +219,9 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 				s := a.state(id)
 				if s.BusyUntil > now || s.BusyUntil != 0 && (s.BusyProbe || s.Inflight > 0) {
 					reason = "upstream_busy"
-					busy = true
+					busy, upstreamBusy = true, true
 				}
 			}
-			candidates = append(candidates, shared.M{"account": id, "label": c.row["label"], "skip": shared.Nullable(reason), "picked": false})
 			if reason == "" {
 				usable = append(usable, c)
 			}
@@ -308,18 +286,13 @@ func (a *App) selectAccount(o inferOptions, excluded map[string]bool) (shared.M,
 			if a.state(id).BusyUntil != 0 {
 				a.state(id).BusyProbe = true
 			}
-			for _, v := range candidates {
-				if m := shared.Obj(v); shared.Str(m["account"]) == id {
-					m["picked"] = true
-				}
-			}
-			return picked.row, busy, candidates, policy, nil
+			return picked.row, busy, upstreamBusy, nil
 		}
 	}
 	if busy {
 		cooling = nil
 	}
-	return nil, busy, candidates, "", cooling
+	return nil, busy, upstreamBusy, cooling
 }
 
 func (a *App) accountCooldownKey(id string) string { return "account|" + a.origin + "|" + id }
@@ -454,9 +427,9 @@ func (a *App) notifyAvailableLocked() {
 
 func (a *App) notifyAvailable() { a.mu.Lock(); a.notifyAvailableLocked(); a.mu.Unlock() }
 
-func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool, limit time.Duration) (shared.M, bool, []any, string, error) {
+func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool, limit time.Duration) (shared.M, bool, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, false, nil, "", err
+		return nil, false, err
 	}
 	w := &accountWaiter{ctx: ctx, o: o, skip: skip, result: make(chan accountAssignment, 1)}
 	if limit >= 0 {
@@ -465,7 +438,7 @@ func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool,
 	a.scheduleMu.Lock()
 	if len(a.waiters) >= maxQueuedRequests {
 		a.scheduleMu.Unlock()
-		return nil, false, nil, "", &fault.Failure{Kind: "busy", Code: "queue_full", Message: "请求等待队列已满", RetryAfter: time.Second}
+		return nil, false, &fault.Failure{Kind: "busy", Code: "queue_full", Message: "请求等待队列已满", RetryAfter: time.Second}
 	}
 	a.waiters = append(a.waiters, w)
 	a.scheduleMu.Unlock()
@@ -493,14 +466,14 @@ func (a *App) acquire(ctx context.Context, o inferOptions, skip map[string]bool,
 	}()
 	select {
 	case <-ctx.Done():
-		return nil, false, nil, "", ctx.Err()
+		return nil, false, ctx.Err()
 	case <-a.ctx.Done():
-		return nil, false, nil, "", a.ctx.Err()
+		return nil, false, a.ctx.Err()
 	case assigned := <-w.result:
 		if assigned.failure != nil {
-			return nil, assigned.busy, assigned.candidates, assigned.policy, assigned.failure
+			return nil, assigned.busy, assigned.failure
 		}
-		return assigned.account, assigned.busy, assigned.candidates, assigned.policy, nil
+		return assigned.account, assigned.busy, nil
 	}
 }
 
@@ -547,21 +520,16 @@ func (a *App) dispatchAccounts() {
 		if w.ctx.Err() != nil {
 			continue
 		}
-		account, busy, candidates, policy, failure := a.selectAccount(w.o, w.skip)
-		if account == nil {
-			for _, candidate := range candidates {
-				if shared.Obj(candidate)["skip"] == "upstream_busy" {
-					w.deadline = time.Time{}
-					break
-				}
-			}
+		account, busy, upstreamBusy, failure := a.selectAccount(w.o, w.skip)
+		if account == nil && upstreamBusy {
+			w.deadline = time.Time{}
 		}
 		// Unlike the ordinary busy wait, a throttle recheck cannot be waived
 		// by upstream concurrency. Return to infer so it can rebuild the skips.
 		now := time.Now()
 		recheck := !w.o.RecheckAt.IsZero() && !now.Before(w.o.RecheckAt)
 		if account != nil || !busy || recheck || !w.deadline.IsZero() && !now.Before(w.deadline) {
-			w.result <- accountAssignment{account, busy, candidates, policy, failure}
+			w.result <- accountAssignment{account: account, busy: busy, failure: failure}
 		} else {
 			pending = append(pending, w)
 		}

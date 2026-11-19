@@ -1,0 +1,7 @@
+services:
+  zcode2api:
+    build: !reset null
+    image: ${ZCODE2API_DOCKER_IMAGE:-ghcr.io/7sen1ot/zcode2api:latest}
+    stop_grace_period: 30s
+    environment:
+      ZCODE2API_DOCKER_UPDATES: "1"

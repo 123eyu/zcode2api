@@ -366,9 +366,7 @@ func (a *App) handleInference(w http.ResponseWriter, r *http.Request, body, k sh
 	}
 	result, f := a.infer(ctx, o)
 	if f != nil {
-		if stream != nil {
-			stream.Fail(f)
-		} else {
+		if stream == nil || !stream.Fail(f) {
 			a.sendFailure(w, f, protocol)
 		}
 		return
